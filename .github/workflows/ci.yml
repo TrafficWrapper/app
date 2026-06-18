@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - name: Test transport core
+        working-directory: core
+        run: go test ./...
+
+  android-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Lightweight lint
+        run: |
+          set -euo pipefail
+          test -x client/gradlew
+          test -f client/app/build.gradle.kts
+          private_root='/root/Traffic''Wrapper'
+          ! grep -R "$private_root" -n README.md README.ru.md core client build
+          ! git ls-files | grep -E '(^|/)(.*\.jks|.*\.keystore|.*\.apk|update\.key|.*\.minisign\.key)$'
