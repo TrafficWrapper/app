@@ -17,8 +17,8 @@ TrafficWrapper разделён на три репозитория:
 Обычный workflow: развернуть orchestrator, enroll'ить workers, собрать/установить
 это приложение и импортировать bootstrap payload из orchestrator.
 
-Архитектура и threat model описаны в [ARCHITECTURE.md](ARCHITECTURE.md) и
-[THREAT_MODEL.md](THREAT_MODEL.md).
+Архитектура и threat model описаны в [ARCHITECTURE.md](ARCHITECTURE.ru.md) и
+[THREAT_MODEL.md](THREAT_MODEL.ru.md).
 
 ## Troubleshooting
 

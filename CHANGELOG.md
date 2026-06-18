@@ -12,7 +12,7 @@ for public releases.
 
 ### Added
 
-- Repository CODEOWNERS and secret-scan workflow.
+- Secret-scan workflow.
 - Link from the app README to the canonical orchestrator troubleshooting guide.
 
 ## [0.1.10] - 2026-06-18
