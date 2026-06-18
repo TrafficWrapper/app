@@ -1,5 +1,7 @@
 # TrafficWrapper App
 
+[![CI](https://github.com/TrafficWrapper/app/actions/workflows/ci.yml/badge.svg)](https://github.com/TrafficWrapper/app/actions/workflows/ci.yml)
+
 [English](README.md)
 
 Android public client платформы TrafficWrapper. Приложение не является Android
@@ -14,6 +16,9 @@ TrafficWrapper разделён на три репозитория:
 
 Обычный workflow: развернуть orchestrator, enroll'ить workers, собрать/установить
 это приложение и импортировать bootstrap payload из orchestrator.
+
+Архитектура и threat model описаны в [ARCHITECTURE.md](ARCHITECTURE.md) и
+[THREAT_MODEL.md](THREAT_MODEL.md).
 
 ## Что внутри
 
