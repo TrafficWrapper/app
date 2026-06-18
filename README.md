@@ -146,7 +146,7 @@ The public APK is available on GitHub Releases:
 
 - Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.9>
 - File: `TrafficWrapper-app-v0.1.9.apk`
-- APK SHA-256: `88a70a2aab4f00ca1e7d6b09e7fc27e53b5ba85958b891fc69b2ae69fbcd3f2b`
+- APK SHA-256: `899f687d74e7a8a321d0e12646d031738b53f1754b6b73d6741132e21788d6dc`
 - Signing certificate SHA-256: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
 - Application ID: `org.trafficwrapper.app`
 - Version: `0.1.9` (`versionCode=10`)
