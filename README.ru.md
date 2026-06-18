@@ -20,6 +20,15 @@ TrafficWrapper разделён на три репозитория:
 Архитектура и threat model описаны в [ARCHITECTURE.md](ARCHITECTURE.md) и
 [THREAT_MODEL.md](THREAT_MODEL.md).
 
+## Troubleshooting
+
+Канонический end-to-end troubleshooting guide находится в репозитории
+orchestrator:
+<https://github.com/TrafficWrapper/orchestrator/blob/master/TROUBLESHOOTING.ru.md>.
+Для app-specific failures проверьте bootstrap confirmation, signed client
+config, route availability, worker health, reachability `/tw/` distributor и
+APK update signature/certificate pins.
+
 ## Что внутри
 
 - `client/` — Android application, public flavor.
