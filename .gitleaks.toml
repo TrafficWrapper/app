@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Public Xray asset checksum in the sample environment file"
+paths = [
+  '''^\.env\.example$''',
+]
+regexes = [
+  '''TW_XRAY_SHA256=[0-9a-fA-F]{64}''',
+]
