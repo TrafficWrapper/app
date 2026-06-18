@@ -3458,13 +3458,15 @@ class AutoTransportService : Service() {
         private val reality2TxCounter: AtomicLong,
     ) {
         private val active = AtomicBoolean(false)
-        private val ioPool = Executors.newFixedThreadPool(SOCKS_IO_THREADS)
+        private val ioPool = Executors.newCachedThreadPool()
         private val activeSessionCount = AtomicLong(0)
         private val sessions = Collections.synchronizedMap(mutableMapOf<Socket, TrackedSocket>())
         private val nextSessionID = AtomicLong(1)
 
         @Volatile
         private var serverSocket: ServerSocket? = null
+        @Volatile
+        private var acceptThread: Thread? = null
 
         fun start() {
             if (!active.compareAndSet(false, true)) return
@@ -3473,7 +3475,7 @@ class AutoTransportService : Service() {
                 bind(InetSocketAddress(InetAddress.getByName(host), port))
             }
             serverSocket = server
-            ioPool.execute {
+            acceptThread = Thread {
                 while (active.get()) {
                     try {
                         val client = server.accept()
@@ -3500,6 +3502,10 @@ class AutoTransportService : Service() {
                         }
                     }
                 }
+            }.apply {
+                name = "tw-socks-accept"
+                isDaemon = true
+                start()
             }
         }
 
@@ -3526,8 +3532,10 @@ class AutoTransportService : Service() {
         fun stop() {
             active.set(false)
             runCatching { serverSocket?.close() }
+            runCatching { acceptThread?.interrupt() }
             closeSessions()
             ioPool.shutdownNow()
+            runCatching { acceptThread?.join(SOCKS_STOP_DRAIN_TIMEOUT_MS) }
             runCatching { ioPool.awaitTermination(SOCKS_STOP_DRAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS) }
         }
 
@@ -3794,8 +3802,7 @@ class AutoTransportService : Service() {
 
         private companion object {
             private const val PROXY_BUFFER_BYTES = 64 * 1024
-            private const val SOCKS_IO_THREADS = 8
-            private const val SOCKS_MAX_SESSIONS = 32L
+            private const val SOCKS_MAX_SESSIONS = 256L
             private const val SOCKS_STOP_DRAIN_TIMEOUT_MS = 2_000L
         }
     }

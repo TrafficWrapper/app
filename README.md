@@ -144,12 +144,12 @@ These variables are read by Gradle or the scripts in `build/`:
 
 The public APK is available on GitHub Releases:
 
-- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.8>
-- File: `TrafficWrapper-app-v0.1.8.apk`
-- APK SHA-256: `d47c6e400820510d6079973820555dd18fe876a97526e52ee4e24360d2292a9c`
+- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.9>
+- File: `TrafficWrapper-app-v0.1.9.apk`
+- APK SHA-256: `88a70a2aab4f00ca1e7d6b09e7fc27e53b5ba85958b891fc69b2ae69fbcd3f2b`
 - Signing certificate SHA-256: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
 - Application ID: `org.trafficwrapper.app`
-- Version: `0.1.8` (`versionCode=9`)
+- Version: `0.1.9` (`versionCode=10`)
 
 To install it, download the APK on the phone, allow installation from unknown
 sources for your browser or file manager, open the downloaded file, and confirm
