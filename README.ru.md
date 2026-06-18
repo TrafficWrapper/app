@@ -155,12 +155,12 @@ export TW_PUBLIC_SIGNING_CERT_SHA256=<your-release-cert-sha256>
 
 Публичный APK доступен в GitHub Releases:
 
-- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.10>
-- Файл: `TrafficWrapper-app-v0.1.10.apk`
-- APK SHA-256: `03142f70961328c391daac1edb91a4a49bd5372d10d8bcc218f8a432ec9d1d72`
+- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.11>
+- Файл: `TrafficWrapper-app-v0.1.11.apk`
+- APK SHA-256: `22f38d3953aba9d0f7f1880d7df435a41c529a247fb1c5b83ae8000296619125`
 - SHA-256 signing certificate: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
 - Application ID: `org.trafficwrapper.app`
-- Версия: `0.1.10` (`versionCode=11`)
+- Версия: `0.1.11` (`versionCode=12`)
 
 Чтобы установить APK: скачайте файл на телефон, разрешите установку из
 неизвестных источников для браузера или файлового менеджера, откройте
