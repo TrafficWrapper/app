@@ -6,7 +6,6 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.PowerManager
 import android.os.SystemClock
-import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import org.json.JSONArray
@@ -241,10 +240,10 @@ object Telemetry {
     }
 
     private fun buildBody(context: Context, events: List<QueuedEvent>): JSONObject {
-        val androidID = androidID(context)
+        val deviceID = telemetryDeviceID(context)
         return JSONObject()
             .put("v", 1)
-            .put("did", androidID)
+            .put("did", deviceID)
             .put("boot", bootID)
             .put("seq", nextSequence(context))
             .put("sent_at", System.currentTimeMillis())
@@ -412,22 +411,22 @@ object Telemetry {
             .putBooleanIfNotNull("restricted", snapshot.batteryHintRestricted)
 
     private fun signedTelemetryHeaders(context: Context, bodyBytes: ByteArray): Map<String, String> {
-        val androidID = androidID(context)
+        val store = SecureIdentityStore(context)
+        val publicKey = store.deviceIdentityPublicKey()
+        val deviceID = telemetryDeviceIDForPublicKey(publicKey)
         val ts = System.currentTimeMillis().toString()
         val nonce = randomNonce()
         val bodyHash = sha256Hex(bodyBytes)
         val canonical = listOf(
             TELEMETRY_SIGNATURE_DOMAIN,
-            androidID,
+            deviceID,
             ts,
             nonce,
             bodyHash,
         ).joinToString("\n")
-        val store = SecureIdentityStore(context)
         val signature = store.signTelemetry(canonical)
-        val publicKey = store.deviceIdentityPublicKey()
         return linkedMapOf(
-            "X-TW-Device" to androidID,
+            "X-TW-Device" to deviceID,
             "X-TW-Pub" to publicKey,
             "X-TW-KeyType" to "ecdsa-p256-sha256",
             "X-TW-Ts" to ts,
@@ -612,10 +611,11 @@ object Telemetry {
         return next
     }
 
-    private fun androidID(context: Context): String =
-        runCatching {
-            Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
-        }.getOrDefault("").ifBlank { "unknown" }
+    private fun telemetryDeviceID(context: Context): String =
+        telemetryDeviceIDForPublicKey(SecureIdentityStore(context).deviceIdentityPublicKey())
+
+    internal fun telemetryDeviceIDForPublicKey(publicKey: String): String =
+        "twpk_" + sha256Hex(publicKey.toByteArray(Charsets.UTF_8)).take(32)
 
     private fun networkSnapshot(context: Context): NetworkSnapshot =
         runCatching {
