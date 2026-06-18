@@ -30,7 +30,7 @@ TrafficWrapper разделён на три репозитория:
 
 ## Требования
 
-- Docker или локальные Go 1.23+, Android SDK, JDK 17 и gomobile.
+- Docker или локальные Go 1.24+, Android SDK, JDK 17 и gomobile.
 - Собственный Android release keystore.
 - Собственный update minisign key для update manifests.
 - Только для runtime orchestrator/worker может хватить 1 CPU и 1 GB RAM со swap.
@@ -146,12 +146,12 @@ export TW_PUBLIC_SIGNING_CERT_SHA256=<your-release-cert-sha256>
 
 Публичный APK доступен в GitHub Releases:
 
-- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.9>
-- Файл: `TrafficWrapper-app-v0.1.9.apk`
-- APK SHA-256: `899f687d74e7a8a321d0e12646d031738b53f1754b6b73d6741132e21788d6dc`
+- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.10>
+- Файл: `TrafficWrapper-app-v0.1.10.apk`
+- APK SHA-256: `03142f70961328c391daac1edb91a4a49bd5372d10d8bcc218f8a432ec9d1d72`
 - SHA-256 signing certificate: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
 - Application ID: `org.trafficwrapper.app`
-- Версия: `0.1.9` (`versionCode=10`)
+- Версия: `0.1.10` (`versionCode=11`)
 
 Чтобы установить APK: скачайте файл на телефон, разрешите установку из
 неизвестных источников для браузера или файлового менеджера, откройте

@@ -31,7 +31,7 @@ repository.
 
 ## Requirements
 
-- Docker, or local Go 1.23+, Android SDK, JDK 17, and gomobile.
+- Docker, or local Go 1.24+, Android SDK, JDK 17, and gomobile.
 - Your own Android release keystore.
 - Your own update minisign key for update manifests.
 - For running orchestrator/worker only, 1 CPU and 1 GB RAM with swap can be
@@ -149,12 +149,12 @@ These variables are read by Gradle or the scripts in `build/`:
 
 The public APK is available on GitHub Releases:
 
-- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.9>
-- File: `TrafficWrapper-app-v0.1.9.apk`
-- APK SHA-256: `899f687d74e7a8a321d0e12646d031738b53f1754b6b73d6741132e21788d6dc`
+- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.10>
+- File: `TrafficWrapper-app-v0.1.10.apk`
+- APK SHA-256: `03142f70961328c391daac1edb91a4a49bd5372d10d8bcc218f8a432ec9d1d72`
 - Signing certificate SHA-256: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
 - Application ID: `org.trafficwrapper.app`
-- Version: `0.1.9` (`versionCode=10`)
+- Version: `0.1.10` (`versionCode=11`)
 
 To install it, download the APK on the phone, allow installation from unknown
 sources for your browser or file manager, open the downloaded file, and confirm

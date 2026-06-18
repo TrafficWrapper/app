@@ -29,7 +29,6 @@ docker run --rm \
     set -euo pipefail
     export CGO_LDFLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 ${CGO_LDFLAGS:-}"
     go mod download
-    /workspace/build/patch-awg-netstack.sh
     gomobile init
     gomobile bind -v \
       -target=android/arm64 \

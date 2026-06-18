@@ -1,4 +1,4 @@
-FROM golang:1.23.12-bookworm AS go-toolchain
+FROM golang:1.24-bookworm AS go-toolchain
 
 FROM eclipse-temurin:17-jdk-jammy
 

@@ -5,8 +5,8 @@ Go transport core used by the TrafficWrapper Android client.
 Build and test from this `core/` directory:
 
 ```sh
-docker run --rm -v "$PWD":/src -w /src golang:1.23-bookworm go test ./...
-docker run --rm -v "$PWD":/src -w /src golang:1.23-bookworm go build ./...
+docker run --rm -v "$PWD":/src -w /src golang:1.24-bookworm go test ./...
+docker run --rm -v "$PWD":/src -w /src golang:1.24-bookworm go build ./...
 ```
 
 For the Android AAR used by the app, run `build/build-transport-aar.sh` from the
@@ -19,7 +19,7 @@ same `device` package are taken from `github.com/amnezia-vpn/amneziawg-go` tag
 
 Imported packages `conn`, `tun`, `ipc`, `ratelimiter`, `tai64n`, and `rwcancel`
 come from the dependency `github.com/amnezia-vpn/amneziawg-go` pseudo-version
-`v0.2.13-0.20250210181458-c97b5b76158f`, commit
-`c97b5b76158fd85b1d461c9937ba5ff9186912d9`. This is the latest untagged commit
-before that fork moved to Go 1.24; it requires `go 1.23.6` and builds in the
-`golang:1.23-bookworm` image (`go1.23.12`).
+`v0.2.13-0.20250623202557-6a7c878409f3`, commit
+`6a7c878409f32dc39a82bc597766c81304ab9840`. This revision removes the obsolete
+`PacketBuffer.IsNil()` call and builds natively with gVisor
+`v0.0.0-20250503011706-39ed1f5ac29c` using Go 1.24.
