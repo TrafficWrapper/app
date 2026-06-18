@@ -1,5 +1,7 @@
 # Android client
 
+[Русский](README.ru.md)
+
 This export contains only the public platform client flavor plus shared main
 code. Private/play flavors, keystores, generated AARs, and generated native
 libraries are intentionally not included.

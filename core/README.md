@@ -1,5 +1,7 @@
 # TrafficWrapper core
 
+[Русский](README.ru.md)
+
 Go transport core used by the TrafficWrapper Android client.
 
 Build and test from this `core/` directory:

@@ -1,5 +1,7 @@
 # Build scripts
 
+[Русский](README.ru.md)
+
 Clean public build helpers:
 
 - `build-transport-aar.sh` builds the gomobile transport AAR from `core/`.
