@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.TrafficWrapper" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#2458D3</item>
+    </style>
+</resources>

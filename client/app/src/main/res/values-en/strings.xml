@@ -1,0 +1,14 @@
+<resources>
+    <string name="public_bootstrap_body">Scan the QR from the orchestrator web admin, or import the one-time bootstrap as Base64/JSON. The app will verify expiry and the config key.</string>
+    <string name="public_bootstrap_input_label">Bootstrap JSON or Base64</string>
+    <string name="public_bootstrap_import">Import bootstrap</string>
+    <string name="public_bootstrap_scan_qr">Scan QR</string>
+    <string name="public_bootstrap_scan_title">QR scanning</string>
+    <string name="public_bootstrap_scan_hint">Point the camera at the bootstrap QR code in the orchestrator web admin.</string>
+    <string name="public_bootstrap_scan_cancel">Cancel</string>
+    <string name="public_bootstrap_camera_rationale">The camera is used only to scan the connection QR.</string>
+    <string name="public_bootstrap_camera_denied">Allow camera access to scan the connection QR</string>
+    <string name="public_bootstrap_camera_error">Could not open the camera for QR scanning</string>
+    <string name="public_bootstrap_import_file">Open bootstrap file</string>
+    <string name="public_bootstrap_invalid">Bootstrap string is invalid or expired</string>
+</resources>
