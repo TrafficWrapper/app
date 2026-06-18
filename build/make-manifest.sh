@@ -64,6 +64,8 @@ cp -f "${APK_ABS}" "${RELEASE_DIR}/${APK_NAME}"
 APK_SIZE="$(stat -c%s "${RELEASE_DIR}/${APK_NAME}")"
 APK_SHA256="$(sha256sum "${RELEASE_DIR}/${APK_NAME}" | awk '{print $1}')"
 ISSUED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+TTL_DAYS="${TW_UPDATE_TTL_DAYS:-30}"
+EXPIRES_AT="${TW_UPDATE_EXPIRES_AT:-$(date -u -d "+${TTL_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)}"
 MANIFEST_PATH="${RELEASE_DIR}/update-manifest.json"
 MINISIG_PATH="${RELEASE_DIR}/update-manifest.json.minisig"
 MIN_VERSION="${TW_MIN_SUPPORTED_VERSION:-1}"
@@ -73,7 +75,7 @@ SEQ="${TW_UPDATE_SEQ:-${VERSION_CODE}}"
 
 python3 - "${MANIFEST_PATH}" \
   "${SEQ}" "${VERSION_CODE}" "${VERSION_NAME}" "${APK_NAME}" "${APK_SIZE}" "${APK_SHA256}" \
-  "${TW_PUBLIC_SIGNING_CERT_SHA256}" "${MIN_VERSION}" "${MANDATORY}" "${NOTES}" "${ISSUED_AT}" <<'PY'
+  "${TW_PUBLIC_SIGNING_CERT_SHA256}" "${MIN_VERSION}" "${MANDATORY}" "${NOTES}" "${ISSUED_AT}" "${EXPIRES_AT}" <<'PY'
 import json
 import sys
 
@@ -90,6 +92,7 @@ import sys
     mandatory,
     notes,
     issued_at,
+    expires_at,
 ) = sys.argv[1:]
 
 manifest = {
@@ -106,6 +109,7 @@ manifest = {
     "mandatory": mandatory == "true",
     "notes": notes,
     "issued_at": issued_at,
+    "expires_at": expires_at,
 }
 with open(path, "w", encoding="utf-8") as f:
     json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -125,3 +129,5 @@ echo "apk=${RELEASE_DIR}/${APK_NAME}"
 echo "versionCode=${VERSION_CODE}"
 echo "versionName=${VERSION_NAME}"
 echo "apkSha256=${APK_SHA256}"
+echo "issuedAt=${ISSUED_AT}"
+echo "expiresAt=${EXPIRES_AT}"

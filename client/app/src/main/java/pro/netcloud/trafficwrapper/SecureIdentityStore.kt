@@ -53,6 +53,8 @@ data class StoredPublicPlatformState(
     val updatePubkeyPin: String = "",
     val maxSeenConfigSeq: Long = 0,
     val maxSeenUpdateSeq: Long = 0,
+    val trustedWallTimeMs: Long = 0,
+    val trustedElapsedRealtimeMs: Long = 0,
     val clientConfigJson: String = "",
     val clientBundleJson: String = "",
     val deviceID: String = "",
@@ -212,6 +214,8 @@ class SecureIdentityStore(context: Context) {
             updatePubkeyPin = root.optString(JSON_UPDATE_PUBKEY_PIN),
             maxSeenConfigSeq = root.optLong(JSON_MAX_SEEN_CONFIG_SEQ, 0),
             maxSeenUpdateSeq = root.optLong(JSON_MAX_SEEN_UPDATE_SEQ, 0),
+            trustedWallTimeMs = root.optLong(JSON_TRUSTED_WALL_TIME_MS, 0),
+            trustedElapsedRealtimeMs = root.optLong(JSON_TRUSTED_ELAPSED_REALTIME_MS, 0),
             clientConfigJson = root.optString(JSON_CLIENT_CONFIG_JSON),
             clientBundleJson = root.optString(JSON_CLIENT_BUNDLE_JSON),
             deviceID = root.optString(JSON_DEVICE_ID),
@@ -233,6 +237,8 @@ class SecureIdentityStore(context: Context) {
             .put(JSON_UPDATE_PUBKEY_PIN, state.updatePubkeyPin)
             .put(JSON_MAX_SEEN_CONFIG_SEQ, state.maxSeenConfigSeq)
             .put(JSON_MAX_SEEN_UPDATE_SEQ, state.maxSeenUpdateSeq)
+            .put(JSON_TRUSTED_WALL_TIME_MS, state.trustedWallTimeMs)
+            .put(JSON_TRUSTED_ELAPSED_REALTIME_MS, state.trustedElapsedRealtimeMs)
             .put(JSON_CLIENT_CONFIG_JSON, state.clientConfigJson)
             .put(JSON_CLIENT_BUNDLE_JSON, state.clientBundleJson)
             .put(JSON_DEVICE_ID, state.deviceID)

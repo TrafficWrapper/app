@@ -1,12 +1,30 @@
 package pro.netcloud.trafficwrapper
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import com.android.apksig.ApkVerifier
 import org.json.JSONObject
 import pro.netcloud.trafficwrapper.go.transport.Transport
 import java.io.File
 import java.security.MessageDigest
+import java.time.Instant
+import kotlin.math.max
+import kotlin.math.min
+
+internal const val UPDATE_MAX_FUTURE_TIMESTAMP_MS = 24 * 60 * 60 * 1000L
+
+internal fun selectTrustedUpdateTime(
+    monotonic: TrustedTimeResult?,
+    sntp: TrustedTimeResult?,
+    maxSntpForwardMs: Long = UPDATE_MAX_FUTURE_TIMESTAMP_MS,
+): TrustedTimeResult? {
+    if (sntp == null) return monotonic
+    if (monotonic == null) return sntp
+    if (sntp.wallTimeMs <= monotonic.wallTimeMs) return monotonic
+    val clampedWallTimeMs = min(sntp.wallTimeMs, monotonic.wallTimeMs + maxSntpForwardMs)
+    return sntp.copy(wallTimeMs = clampedWallTimeMs)
+}
 
 class UpdateVerifier(private val context: Context) {
     private val store = SecureIdentityStore(context)
@@ -32,6 +50,17 @@ class UpdateVerifier(private val context: Context) {
             Log.w(TAG, "public update rejected: signing cert ${manifest.signingCertSha256.take(12)}")
             throw UpdateVerificationException(R.string.update_error_signer)
         }
+        val trustedTime = trustedNow(stored)
+        val manifestTimestampMs = parseInstant(manifest.timestamp)
+        val expiresAtMs = parseInstant(manifest.expiresAt)
+        if (manifestTimestampMs > trustedTime.wallTimeMs + UPDATE_MAX_FUTURE_TIMESTAMP_MS) {
+            Log.w(TAG, "public update rejected: future timestamp ${manifest.timestamp}")
+            throw UpdateVerificationException(R.string.update_error_time_untrusted)
+        }
+        if (expiresAtMs <= trustedTime.wallTimeMs) {
+            Log.w(TAG, "public update rejected: expired at ${manifest.expiresAt}")
+            throw UpdateVerificationException(R.string.update_error_expired)
+        }
         if (manifest.versionCode < BuildConfig.VERSION_CODE.toLong()) {
             Log.w(TAG, "public update rejected: downgrade vc=${manifest.versionCode} current=${BuildConfig.VERSION_CODE}")
             throw UpdateVerificationException(R.string.update_error_downgrade)
@@ -40,9 +69,13 @@ class UpdateVerifier(private val context: Context) {
             Log.w(TAG, "public update rejected: rollback seq=${manifest.seq} maxSeen=${stored.maxSeenUpdateSeq}")
             throw UpdateVerificationException(R.string.update_error_downgrade)
         }
-        if (manifest.seq > stored.maxSeenUpdateSeq) {
-            store.writePublicPlatformState(stored.copy(maxSeenUpdateSeq = manifest.seq))
-        }
+        store.writePublicPlatformState(
+            stored.copy(
+                maxSeenUpdateSeq = max(stored.maxSeenUpdateSeq, manifest.seq),
+                trustedWallTimeMs = maxOf(stored.trustedWallTimeMs, trustedTime.wallTimeMs, manifestTimestampMs),
+                trustedElapsedRealtimeMs = trustedTime.elapsedRealtimeMs,
+            ),
+        )
         return if (manifest.versionCode <= BuildConfig.VERSION_CODE.toLong()) {
             ManifestDecision.Latest(manifest)
         } else {
@@ -115,14 +148,51 @@ class UpdateVerifier(private val context: Context) {
                 changelogRu = root.optString(JSON_NOTES).ifBlank {
                     root.optJSONObject(JSON_CHANGELOG)?.optString(JSON_RU).orEmpty()
                 },
-                releasedAt = root.optString(JSON_ISSUED_AT),
-                timestamp = root.optString(JSON_ISSUED_AT),
-                expiresAt = "9999-12-31T23:59:59Z",
+                releasedAt = root.optString(JSON_RELEASED_AT).ifBlank {
+                    root.optString(JSON_ISSUED_AT)
+                },
+                timestamp = root.optString(JSON_TIMESTAMP).ifBlank {
+                    root.optString(JSON_ISSUED_AT)
+                },
+                expiresAt = root.optString(JSON_EXPIRES_AT).ifBlank {
+                    root.getString(JSON_EXPIRES_AT_CAMEL)
+                },
             )
         } catch (_: Throwable) {
             throw UpdateVerificationException(R.string.update_error_manifest)
         }
     }
+
+    private fun trustedNow(stored: StoredPublicPlatformState): TrustedTimeResult {
+        val monotonic = monotonicTime(stored)
+        val sntp = runCatching { ClockDiagnostics.trustedTime() }
+            .onFailure { Log.w(TAG, "public update trusted SNTP unavailable", it) }
+            .getOrNull()
+        return selectTrustedUpdateTime(monotonic, sntp)
+            ?: TrustedTimeResult(
+                wallTimeMs = System.currentTimeMillis(),
+                elapsedRealtimeMs = SystemClock.elapsedRealtime(),
+                sntpAvailable = false,
+            )
+    }
+
+    private fun monotonicTime(stored: StoredPublicPlatformState): TrustedTimeResult? {
+        if (stored.trustedWallTimeMs <= 0 || stored.trustedElapsedRealtimeMs <= 0) return null
+        val elapsed = SystemClock.elapsedRealtime()
+        if (elapsed < stored.trustedElapsedRealtimeMs) return null
+        return TrustedTimeResult(
+            wallTimeMs = stored.trustedWallTimeMs + (elapsed - stored.trustedElapsedRealtimeMs),
+            elapsedRealtimeMs = elapsed,
+            sntpAvailable = false,
+        )
+    }
+
+    private fun parseInstant(value: String): Long =
+        try {
+            Instant.parse(value).toEpochMilli()
+        } catch (_: Throwable) {
+            throw UpdateVerificationException(R.string.update_error_manifest)
+        }
 
     private fun sha256File(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -165,6 +235,10 @@ class UpdateVerifier(private val context: Context) {
         private const val JSON_CHANGELOG = "changelog"
         private const val JSON_RU = "ru"
         private const val JSON_ISSUED_AT = "issued_at"
+        private const val JSON_RELEASED_AT = "releasedAt"
+        private const val JSON_TIMESTAMP = "timestamp"
+        private const val JSON_EXPIRES_AT = "expires_at"
+        private const val JSON_EXPIRES_AT_CAMEL = "expiresAt"
         private const val HASH_BUFFER_BYTES = 64 * 1024
         private const val TAG = "TWPublicUpdate"
     }

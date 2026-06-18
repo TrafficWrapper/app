@@ -55,6 +55,7 @@ class UpdateRepository(private val context: Context) {
         }
         return try {
             var lastError: Throwable? = null
+            var degradedOutcome: UpdateCheckOutcome? = null
             for (endpoint in updateEndpoints()) {
                 val verified = runCatching { fetchVerifiedBundle(endpoint) }
                     .onFailure {
@@ -74,9 +75,30 @@ class UpdateRepository(private val context: Context) {
                         val apk = try {
                             UpdateDownloader(verified.bundle.socksListen, verified.bundle.baseUrl, verified.bundle.source)
                                 .downloadApk(decision.manifest, updateCacheDir(), onProgress)
+                        } catch (error: UpdateVerificationException) {
+                            lastError = error
+                            Log.w(TAG, "public update APK download failed via ${verified.bundle.baseUrl}", error)
+                            if (
+                                error.textRes == R.string.update_error_download &&
+                                decision.manifest.requiresInstalledUpdate()
+                            ) {
+                                degradedOutcome = mandatoryDegradedOutcome(
+                                    verified.bundle,
+                                    decision.manifest,
+                                    verified.bundle.baseUrl,
+                                )
+                            }
+                            continue
                         } catch (error: Throwable) {
                             lastError = error
                             Log.w(TAG, "public update APK download failed via ${verified.bundle.baseUrl}", error)
+                            if (decision.manifest.requiresInstalledUpdate()) {
+                                degradedOutcome = mandatoryDegradedOutcome(
+                                    verified.bundle,
+                                    decision.manifest,
+                                    verified.bundle.baseUrl,
+                                )
+                            }
                             continue
                         }
                         verifier.verifyApk(apk, decision.manifest)
@@ -92,7 +114,7 @@ class UpdateRepository(private val context: Context) {
                     }
                 }
             }
-            throw lastError ?: UpdateVerificationException(R.string.update_error_network)
+            degradedOutcome ?: throw (lastError ?: UpdateVerificationException(R.string.update_error_network))
         } catch (error: UpdateVerificationException) {
             Log.w(TAG, "public update download rejected: ${context.getString(error.textRes)}")
             UpdateCheckOutcome(status = UpdateCheckStatus.ERROR, errorTextRes = error.textRes)
@@ -131,6 +153,20 @@ class UpdateRepository(private val context: Context) {
 
     private fun updateCacheDir(): File =
         File(context.cacheDir, "updates").apply { mkdirs() }
+
+    private fun mandatoryDegradedOutcome(
+        bundle: ManifestBundle,
+        manifest: UpdateManifest,
+        baseUrl: String,
+    ): UpdateCheckOutcome =
+        UpdateCheckOutcome(
+            status = UpdateCheckStatus.ERROR,
+            manifest = manifest,
+            source = bundle.source,
+            baseUrl = baseUrl,
+            mandatoryDegraded = true,
+            errorTextRes = R.string.update_error_mandatory_degraded,
+        )
 
     private data class UpdateEndpoint(
         val baseUrl: String,

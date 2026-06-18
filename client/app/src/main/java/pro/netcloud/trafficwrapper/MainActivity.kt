@@ -125,6 +125,9 @@ class MainActivity : ComponentActivity() {
         }
         handleBatteryHintIntent(intent)
         DistributionChannel.schedule(applicationContext)
+        if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
+            UpdateCheckWorker.schedule(applicationContext)
+        }
         loadInstalledApps()
         if (!DeploymentConfig.IS_PUBLIC_PLATFORM) {
             startDeviceEnrollment(applicationContext)
