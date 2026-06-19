@@ -5,7 +5,7 @@
 [English](README.md)
 
 Android public client для TrafficWrapper — open-source self-hosted платформы
-private transport для небольших operator deployments и anti-censorship transport
+private transport для небольших operator deployments и transport-obfuscation
 research. Приложение не является Android VPN: оно поднимает local SOCKS
 front-end и гонит traffic выбранных apps через signed deployment config и
 user-space transports.
