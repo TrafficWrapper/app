@@ -4,9 +4,15 @@
 
 [English](README.md)
 
-Android public client платформы TrafficWrapper. Приложение не является Android
-VPN: оно поднимает локальный SOCKS front-end и гонит трафик выбранных приложений
-через платформенные user-space transports.
+Android public client для TrafficWrapper — open-source self-hosted платформы
+private transport для небольших operator deployments и anti-censorship transport
+research. Приложение не является Android VPN: оно поднимает local SOCKS
+front-end и гонит traffic выбранных apps через signed deployment config и
+user-space transports.
+
+Оператор владеет deployment keys, worker endpoints, bootstrap payloads и update
+channel. Public app проверяет minisign-signed config и update manifests, pin'ит
+APK signing certificate и может быть пересобран из исходников для local audit.
 
 TrafficWrapper разделён на три репозитория:
 
@@ -170,6 +176,34 @@ export TW_PUBLIC_SIGNING_CERT_SHA256=<your-release-cert-sha256>
 Для полного self-trust соберите APK самостоятельно своим release key по разделу
 [Сборка](#сборка). Orchestrator может опубликовать через платформенный канал
 обновлений как этот готовый APK, так и ваш собственный APK.
+
+## Как проверить release build
+
+Используйте минимальный verifier `build/verify-release.sh` для локальных release
+artifacts. Он проверяет APK SHA-256, SHA-256 signing certificate APK, optional
+minisign подпись manifest и optional rebuild из git tag.
+
+```sh
+APK=TrafficWrapper-app-v0.1.11.apk \
+EXPECTED_APK_SHA256=22f38d3953aba9d0f7f1880d7df435a41c529a247fb1c5b83ae8000296619125 \
+EXPECTED_CERT_SHA256=bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8 \
+./build/verify-release.sh
+```
+
+Если у вас также есть update manifest и public update key:
+
+```sh
+APK=TrafficWrapper-app-v0.1.11.apk \
+MANIFEST=update-manifest.json \
+MINISIG=update-manifest.json.minisig \
+MINISIGN_PUBKEY=<update.pub line> \
+./build/verify-release.sh
+```
+
+Byte-for-byte сравнение APK после `TAG=<release-tag>` требует тот же keystore и
+build inputs, которые использовались для этого APK. Операторы со своим keystore
+могут использовать script для reproducible verification собственного release
+channel.
 
 ## Bootstrap
 

@@ -4,9 +4,16 @@
 
 [Русский](README.ru.md)
 
-Android public client for the TrafficWrapper platform. The app is not an Android
-VPN: it exposes a local SOCKS front-end and routes selected app traffic through
-the platform using user-space transports.
+Android public client for TrafficWrapper, an open-source self-hosted private
+transport platform for small operator deployments and anti-censorship transport
+research. The app is not an Android VPN: it exposes a local SOCKS front-end and
+routes selected app traffic through signed deployment config and user-space
+transports.
+
+The operator owns the deployment keys, worker endpoints, bootstrap payloads, and
+update channel. The public app verifies minisign-signed config and update
+manifests, pins the APK signing certificate, and can be rebuilt from source for
+local audit.
 
 TrafficWrapper is split into three repositories:
 
@@ -172,6 +179,33 @@ it is needed for the foreground tunnel service.
 For full self-trust, build the APK yourself with your own release key using the
 [Build](#build) section above. The orchestrator can publish either this
 prebuilt APK or your own APK through the platform update channel.
+
+## How to Verify a Release Build
+
+Use the minimal verifier in `build/verify-release.sh` for local release assets.
+It checks the APK SHA-256, APK signing certificate SHA-256, optional minisign
+manifest signature, and optional rebuild from a git tag.
+
+```sh
+APK=TrafficWrapper-app-v0.1.11.apk \
+EXPECTED_APK_SHA256=22f38d3953aba9d0f7f1880d7df435a41c529a247fb1c5b83ae8000296619125 \
+EXPECTED_CERT_SHA256=bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8 \
+./build/verify-release.sh
+```
+
+If you also have an update manifest and public update key:
+
+```sh
+APK=TrafficWrapper-app-v0.1.11.apk \
+MANIFEST=update-manifest.json \
+MINISIG=update-manifest.json.minisig \
+MINISIGN_PUBKEY=<update.pub line> \
+./build/verify-release.sh
+```
+
+Byte-for-byte APK comparison after `TAG=<release-tag>` requires the same
+keystore and build inputs used for that APK. Operators using their own keystore
+can use the script to verify their own release channel reproducibly.
 
 ## Bootstrap
 

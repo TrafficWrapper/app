@@ -11,6 +11,8 @@ Clean public build helpers:
 - `build-release.sh` builds and signs a public release APK with your keystore.
 - `make-manifest.sh` creates a signed `apk-update-v1` manifest for upload to the
   orchestrator.
+- `verify-release.sh` verifies a local release APK hash/certificate, optional
+  minisign manifest, and optional rebuild from a git tag.
 
 No script contains deployment secrets. Provide signing material through
 environment variables and keep keys outside the repository.
