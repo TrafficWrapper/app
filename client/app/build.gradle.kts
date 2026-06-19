@@ -7,7 +7,7 @@ fun String.asBuildConfigString(): String =
     "\"" + replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
 
 android {
-    namespace = "pro.netcloud.trafficwrapper"
+    namespace = "pro.trafficwrapper"
     compileSdk = 36
 
     defaultConfig {

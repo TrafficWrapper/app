@@ -33,7 +33,7 @@ docker run --rm \
     gomobile bind -v \
       -target=android/arm64 \
       -androidapi=26 \
-      -javapkg=pro.netcloud.trafficwrapper.go \
+      -javapkg=pro.trafficwrapper.go \
       -o /workspace/client/app/libs/transport.aar \
       ./transport
   '

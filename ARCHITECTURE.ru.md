@@ -9,7 +9,7 @@
 
 - `core/transport/public_platform.go` выполняет public device enrollment через
   orchestrator Noise_XK HTTPS envelope, pinned по `orch_noise_public`.
-- `client/app/src/main/java/pro/netcloud/trafficwrapper/MainActivity.kt`
+- `client/app/src/main/java/pro/trafficwrapper/MainActivity.kt`
   импортирует QR/Base64/JSON bootstrap payloads, требует user confirmation для
   external imports и запускает enrollment.
 - `PublicPlatformConfig.kt` проверяет signed `client-config-v1` через minisign

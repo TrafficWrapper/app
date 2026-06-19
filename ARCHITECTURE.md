@@ -9,7 +9,7 @@ This repository implements the Android public client:
 
 - `core/transport/public_platform.go` performs public device enrollment over
   the orchestrator Noise_XK HTTPS envelope pinned by `orch_noise_public`.
-- `client/app/src/main/java/pro/netcloud/trafficwrapper/MainActivity.kt`
+- `client/app/src/main/java/pro/trafficwrapper/MainActivity.kt`
   imports QR/Base64/JSON bootstrap payloads, requires user confirmation for
   external imports, and starts enrollment.
 - `PublicPlatformConfig.kt` verifies signed `client-config-v1` with minisign

@@ -6,7 +6,7 @@
             android:name=".UpdateInstallReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="pro.netcloud.trafficwrapper.action.UPDATE_INSTALL_RESULT" />
+                <action android:name="pro.trafficwrapper.action.UPDATE_INSTALL_RESULT" />
             </intent-filter>
         </receiver>
     </application>
