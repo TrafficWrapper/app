@@ -243,6 +243,42 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
+    fun readinessGateRequiresListenerFirstThenFreshProbe() {
+        assertTrue(
+            shouldCommitReadyRoute(
+                routeAvailable = true,
+                listenerReady = true,
+                probeReady = false,
+                requireProbeReady = false,
+            ),
+        )
+        assertFalse(
+            shouldCommitReadyRoute(
+                routeAvailable = true,
+                listenerReady = true,
+                probeReady = false,
+                requireProbeReady = true,
+            ),
+        )
+        assertTrue(
+            shouldCommitReadyRoute(
+                routeAvailable = true,
+                listenerReady = true,
+                probeReady = true,
+                requireProbeReady = true,
+            ),
+        )
+        assertFalse(
+            shouldCommitReadyRoute(
+                routeAvailable = false,
+                listenerReady = true,
+                probeReady = true,
+                requireProbeReady = true,
+            ),
+        )
+    }
+
+    @Test
     fun flappingPriorityRouteDoesNotPromoteBeforeStableDwell() {
         val nowMs = 100_000L
 

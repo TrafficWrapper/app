@@ -261,6 +261,14 @@ internal fun shouldRestartInactiveTcpSidecarAfterStall(
 internal fun shouldAcceptRouteGeneration(callbackGeneration: Long, currentGeneration: Long): Boolean =
     callbackGeneration == currentGeneration
 
+internal fun shouldCommitReadyRoute(
+    routeAvailable: Boolean,
+    listenerReady: Boolean,
+    probeReady: Boolean,
+    requireProbeReady: Boolean,
+): Boolean =
+    routeAvailable && if (requireProbeReady) probeReady else listenerReady
+
 internal fun shouldPromoteRecoveredPriorityRoute(
     inactiveHealthySinceMs: Long,
     lastHealthLostAtMs: Long,
@@ -994,16 +1002,39 @@ class AutoTransportService : Service() {
                     realityConfig = realityConfig,
                     reality2Config = reality2Config,
                 )
-                activeRoute = setRoute(
-                    route = activeRoute,
-                    mode = requestedMode,
-                    awgRuStarted = awgRuStarted,
-                    awgStarted = awgStarted,
-                    realityStarted = xrayStarted,
-                    reality2Started = xray2Started,
-                    realityConfig = realityConfig,
-                    reality2Config = reality2Config,
+                if (activeRoute.isTcpSidecarRoute()) {
+                    prepareXrayRoute(
+                        route = activeRoute,
+                        cfg = routeConfig(activeRoute, realityConfig, reality2Config),
+                        atMs = startNowMs,
+                        allowCachedReady = true,
+                        runEgressProbe = false,
+                    )
+                }
+                val initialRouteReady = routeCommitReady(
+                    activeRoute,
+                    awgRuStarted,
+                    awgStarted,
+                    xrayStarted,
+                    xray2Started,
+                    realityConfig,
+                    reality2Config,
+                    requireProbeReady = false,
                 )
+                if (initialRouteReady) {
+                    activeRoute = setRoute(
+                        route = activeRoute,
+                        mode = requestedMode,
+                        awgRuStarted = awgRuStarted,
+                        awgStarted = awgStarted,
+                        realityStarted = xrayStarted,
+                        reality2Started = xray2Started,
+                        realityConfig = realityConfig,
+                        reality2Config = reality2Config,
+                        routeReady = { route -> routeListenerReadyForTraffic(route) },
+                    )
+                    markRouteActive(activeRoute, startNowMs, probeReady = false)
+                }
                 if (
                     requestedMode == TransportChoice.AUTO &&
                     activeRoute != Route.AWG_RU &&
@@ -1017,7 +1048,7 @@ class AutoTransportService : Service() {
                         "awgru_retry_s" to awgRetryDelaySeconds(Route.AWG_RU, startNowMs),
                     )
                 }
-                if (routeAvailable(activeRoute, awgRuStarted, awgStarted, xrayStarted, xray2Started, realityConfig, reality2Config)) {
+                if (initialRouteReady) {
                     router = startSocksRouter()
                     startHttpProxyIfEnabled()
                 } else {
@@ -1284,8 +1315,18 @@ class AutoTransportService : Service() {
                             reality2Started = xray2Started,
                             realityConfig = realityConfig,
                             reality2Config = reality2Config,
+                            routeReady = { route -> routeListenerReadyForTraffic(route) },
                         )
-                        if (routeAvailable(guardedStartupRoute, awgRuStarted, awgStarted, xrayStarted, xray2Started, realityConfig, reality2Config)) {
+                        if (guardedStartupRoute.isTcpSidecarRoute()) {
+                            prepareXrayRoute(
+                                route = guardedStartupRoute,
+                                cfg = routeConfig(guardedStartupRoute, realityConfig, reality2Config),
+                                atMs = nowMs,
+                                allowCachedReady = true,
+                                runEgressProbe = false,
+                            )
+                        }
+                        if (routeCommitReady(guardedStartupRoute, awgRuStarted, awgStarted, xrayStarted, xray2Started, realityConfig, reality2Config, requireProbeReady = false)) {
                             activeRoute = setRoute(
                                 route = guardedStartupRoute,
                                 mode = mode,
@@ -1295,7 +1336,9 @@ class AutoTransportService : Service() {
                                 reality2Started = xray2Started,
                                 realityConfig = realityConfig,
                                 reality2Config = reality2Config,
+                                routeReady = { route -> routeListenerReadyForTraffic(route) },
                             )
+                            markRouteActive(activeRoute, nowMs, probeReady = false)
                             router = startSocksRouter()
                             telemetryEvent("route_guard",
                                 "rsn" to "router_started",
@@ -1493,7 +1536,11 @@ class AutoTransportService : Service() {
                             localRxFresh = isRecent(nowMs, lastRealityRxProgressAtMs, REALITY_LOCAL_RX_FRESH_MS),
                         )
                     ) {
-                        cachedRealityProbe = probeReality(Route.REALITY, realityConfig)
+                        cachedRealityProbe = prepareXrayRoute(
+                            route = Route.REALITY,
+                            cfg = realityConfig,
+                            atMs = nowMs,
+                        )
                         lastRealityProbeAtMs = nowMs
                     }
                     val realityProbe = if (xrayStarted) cachedRealityProbe else RealityProbeResult(false)
@@ -1506,7 +1553,11 @@ class AutoTransportService : Service() {
                             localRxFresh = isRecent(nowMs, lastReality2RxProgressAtMs, REALITY_LOCAL_RX_FRESH_MS),
                         )
                     ) {
-                        cachedReality2Probe = probeReality(Route.REALITY2, reality2Config)
+                        cachedReality2Probe = prepareXrayRoute(
+                            route = Route.REALITY2,
+                            cfg = reality2Config,
+                            atMs = nowMs,
+                        )
                         lastReality2ProbeAtMs = nowMs
                     }
                     val reality2Probe = if (xray2Started) cachedReality2Probe else RealityProbeResult(false)
@@ -1519,8 +1570,14 @@ class AutoTransportService : Service() {
                     }
                     val realityForcedUnhealthy = isTcpRouteForcedUnhealthy(Route.REALITY, nowMs)
                     val reality2ForcedUnhealthy = isTcpRouteForcedUnhealthy(Route.REALITY2, nowMs)
-                    val reality2Healthy = xray2Started && reality2Probe.healthy && !reality2RxStalled && !reality2ForcedUnhealthy
-                    val realityHealthy = xrayStarted && realityProbe.healthy && !realityRxStalled && !realityForcedUnhealthy
+                    val reality2ProbeHealthy = xray2Started &&
+                        reality2Probe.healthy &&
+                        routeReadyForTraffic(Route.REALITY2, XRAY_READY_PROBE_MAX_AGE_MS, nowMs)
+                    val realityProbeHealthy = xrayStarted &&
+                        realityProbe.healthy &&
+                        routeReadyForTraffic(Route.REALITY, XRAY_READY_PROBE_MAX_AGE_MS, nowMs)
+                    val reality2Healthy = reality2ProbeHealthy && !reality2RxStalled && !reality2ForcedUnhealthy
+                    val realityHealthy = realityProbeHealthy && !realityRxStalled && !realityForcedUnhealthy
                     if (activeRoute == Route.REALITY && realityHealthy) {
                         outboundIp = realityProbe.outboundIp
                         lastTrafficAtMs = nowMs
@@ -2095,6 +2152,26 @@ class AutoTransportService : Service() {
                         val switchReason = guardedReason.ifBlank {
                             "${routeLabel(previousRoute)}_to_${routeLabel(guardedRoute)}"
                         }
+                        val requireProbeReady = stableSinceElapsedRealtimeMs != null
+                        if (guardedRoute.isTcpSidecarRoute()) {
+                            prepareXrayRoute(
+                                route = guardedRoute,
+                                cfg = routeConfig(guardedRoute, realityConfig, reality2Config),
+                                atMs = nowMs,
+                                allowCachedReady = true,
+                                runEgressProbe = requireProbeReady,
+                            )
+                        }
+                        if (!routeCommitReady(guardedRoute, awgRuStarted, awgStarted, xrayStarted, xray2Started, realityConfig, reality2Config, requireProbeReady)) {
+                            telemetryEvent(
+                                "route_state",
+                                "rsn" to "candidate_not_ready",
+                                "route" to routeLabel(guardedRoute),
+                                "generation" to routeGeneration(guardedRoute),
+                                "route_state" to routeRuntime(guardedRoute).processState.name.lowercase(),
+                            )
+                            continue
+                        }
                         var demotion: AwgDemotion? = null
                         if (
                             mode == TransportChoice.AUTO &&
@@ -2113,13 +2190,12 @@ class AutoTransportService : Service() {
                         ) {
                             demoteRoute(previousRoute, nowMs, guardedReason)
                         }
-                        activeRoute = guardedRoute
                         lastRouteSwitchAtMs = nowMs
                         if (guardedReason == ROUTE_REASON_PRIORITY_RECOVERED) {
                             lastPriorityRecoveredSwitchAtMs = nowMs
                         }
                         activeRoute = setRoute(
-                            route = activeRoute,
+                            route = guardedRoute,
                             mode = mode,
                             awgRuStarted = awgRuStarted,
                             awgStarted = awgStarted,
@@ -2127,7 +2203,15 @@ class AutoTransportService : Service() {
                             reality2Started = xray2Started,
                             realityConfig = realityConfig,
                             reality2Config = reality2Config,
+                            routeReady = { route ->
+                                if (requireProbeReady) {
+                                    routeReadyForTraffic(route, XRAY_READY_PROBE_MAX_AGE_MS)
+                                } else {
+                                    routeListenerReadyForTraffic(route)
+                                }
+                            },
                         )
+                        markRouteActive(activeRoute, nowMs, probeReady = requireProbeReady)
                         Log.i(LOG_TAG, "route switch is non-destructive rsn=$switchReason")
                         outboundIp = when (activeRoute) {
                             Route.REALITY -> realityProbe.outboundIp.takeIf { realityHealthy }.orEmpty()
@@ -2951,6 +3035,13 @@ class AutoTransportService : Service() {
         )
     }
 
+    private fun routeConfig(route: Route, realityConfig: RealityUiConfig?, reality2Config: RealityUiConfig?): RealityUiConfig? =
+        when (route) {
+            Route.REALITY -> realityConfig
+            Route.REALITY2 -> reality2Config
+            Route.AWG_RU, Route.AWG -> null
+        }
+
     private fun startXraySidecar(
         cfg: RealityUiConfig,
         route: Route,
@@ -2982,7 +3073,6 @@ class AutoTransportService : Service() {
                 .start()
             setXrayProcess(route, process)
             drainProcessOutput(route, generation, process)
-            Thread.sleep(XRAY_WARMUP_MS)
             if (process.isAlive) {
                 markRouteProcessStarted(route, generation, started = true)
                 XrayStartResult(started = true)
@@ -3126,6 +3216,59 @@ class AutoTransportService : Service() {
         Log.i(LOG_TAG, "route_state route=${routeLabel(route)} gen=${runtime.generation} state=Draining")
     }
 
+    private fun routeReadyForTraffic(
+        route: Route,
+        maxProbeAgeMs: Long? = null,
+        nowMs: Long = SystemClock.elapsedRealtime(),
+    ): Boolean {
+        if (!route.isTcpSidecarRoute()) return true
+        val runtime = routeRuntime(route)
+        val ready = xrayProcess(route)?.isAlive == true &&
+            runtime.listenerReadyAtMs > 0L &&
+            runtime.probeReadyAtMs > 0L &&
+            runtime.processState in setOf(RouteProcessState.READY, RouteProcessState.ACTIVE)
+        return ready && (
+            maxProbeAgeMs == null ||
+                nowMs - runtime.probeReadyAtMs in 0..maxProbeAgeMs
+            )
+    }
+
+    private fun routeListenerReadyForTraffic(
+        route: Route,
+        nowMs: Long = SystemClock.elapsedRealtime(),
+        maxListenerAgeMs: Long? = null,
+    ): Boolean {
+        if (!route.isTcpSidecarRoute()) return true
+        val runtime = routeRuntime(route)
+        val ready = xrayProcess(route)?.isAlive == true &&
+            runtime.listenerReadyAtMs > 0L &&
+            runtime.processState in setOf(
+                RouteProcessState.STARTED,
+                RouteProcessState.READY,
+                RouteProcessState.ACTIVE,
+            )
+        return ready && (
+            maxListenerAgeMs == null ||
+                nowMs - runtime.listenerReadyAtMs in 0..maxListenerAgeMs
+            )
+    }
+
+    private fun waitForLocalListener(route: Route, timeoutMs: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        do {
+            if (connectLocalListener(routePort(route), XRAY_LISTENER_CONNECT_TIMEOUT_MS)) return true
+            runCatching { Thread.sleep(XRAY_LISTENER_POLL_MS) }
+        } while (SystemClock.elapsedRealtime() < deadline)
+        return false
+    }
+
+    private fun connectLocalListener(port: Int, timeoutMs: Int): Boolean =
+        runCatching {
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(InetAddress.getByName(REALITY_HOST), port), timeoutMs)
+            }
+        }.isSuccess
+
     private fun setAppliedReality2Uuid(uuid: String) {
         val normalized = uuid.trim()
         appliedReality2Uuid = normalized
@@ -3254,6 +3397,7 @@ class AutoTransportService : Service() {
         reality2Started: Boolean,
         realityConfig: RealityUiConfig?,
         reality2Config: RealityUiConfig?,
+        routeReady: (Route) -> Boolean = { true },
     ): Route {
         return selectRouteWithFallbackPolicy(mode = mode, preferred = preferred) {
             val candidates = candidateRoutes(preferred)
@@ -3266,7 +3410,7 @@ class AutoTransportService : Service() {
                     reality2Started = reality2Started,
                     realityConfig = realityConfig,
                     reality2Config = reality2Config,
-                )
+                ) && routeReady(route)
             } ?: preferred
         }
     }
@@ -3325,6 +3469,33 @@ class AutoTransportService : Service() {
                 reality2Config?.isComplete() == true &&
                 xrayProcess(Route.REALITY2)?.isAlive == true
         }
+
+    private fun routeCommitReady(
+        route: Route,
+        awgRuStarted: Boolean,
+        awgStarted: Boolean,
+        realityStarted: Boolean,
+        reality2Started: Boolean,
+        realityConfig: RealityUiConfig?,
+        reality2Config: RealityUiConfig?,
+        requireProbeReady: Boolean,
+    ): Boolean {
+        val available = routeAvailable(
+            route = route,
+            awgRuStarted = awgRuStarted,
+            awgStarted = awgStarted,
+            realityStarted = realityStarted,
+            reality2Started = reality2Started,
+            realityConfig = realityConfig,
+            reality2Config = reality2Config,
+        )
+        return shouldCommitReadyRoute(
+            routeAvailable = available,
+            listenerReady = routeListenerReadyForTraffic(route),
+            probeReady = routeReadyForTraffic(route, XRAY_READY_PROBE_MAX_AGE_MS),
+            requireProbeReady = requireProbeReady,
+        )
+    }
 
     private fun chooseRoute(
         mode: TransportChoice,
@@ -3421,6 +3592,7 @@ class AutoTransportService : Service() {
         reality2Started: Boolean,
         realityConfig: RealityUiConfig?,
         reality2Config: RealityUiConfig?,
+        routeReady: (Route) -> Boolean = { true },
     ): Route {
         val selected = selectAvailableRoute(
             mode = mode,
@@ -3431,6 +3603,7 @@ class AutoTransportService : Service() {
             reality2Started = reality2Started,
             realityConfig = realityConfig,
             reality2Config = reality2Config,
+            routeReady = routeReady,
         )
         if (selected != route) {
             Log.w(LOG_TAG, "route guard fallback from $route to $selected")
@@ -3758,6 +3931,57 @@ class AutoTransportService : Service() {
             if (lastResult.healthy || !shouldRetryRealityProbe(attempt)) return lastResult
         }
         return lastResult
+    }
+
+    private fun prepareXrayRoute(
+        route: Route,
+        cfg: RealityUiConfig?,
+        atMs: Long,
+        allowCachedReady: Boolean = false,
+        runEgressProbe: Boolean = true,
+    ): RealityProbeResult {
+        val generation = routeGeneration(route)
+        if (cfg?.isComplete() != true) {
+            markRouteProbeFailed(route, generation, "config_incomplete")
+            return RealityProbeResult(false, "config_incomplete")
+        }
+        if (xrayProcess(route)?.isAlive != true) {
+            markRouteProbeFailed(route, generation, "process_dead")
+            return RealityProbeResult(false, "process_dead")
+        }
+        if (allowCachedReady && routeReadyForTraffic(route, XRAY_READY_PROBE_MAX_AGE_MS, atMs)) {
+            Log.i(
+                LOG_TAG,
+                "route_state route=${routeLabel(route)} gen=$generation state=WarmReady probe_ms=${routeRuntime(route).elapsedSinceStart(routeRuntime(route).probeReadyAtMs)}",
+            )
+            return RealityProbeResult(healthy = true, outboundIp = expectedRealityIp(route))
+        }
+        if (!connectLocalListener(routePort(route), XRAY_LISTENER_CONNECT_TIMEOUT_MS)) {
+            if (waitForLocalListener(route, XRAY_LISTENER_READY_TIMEOUT_MS)) {
+                markRouteListenerReady(route, generation, SystemClock.elapsedRealtime())
+            } else {
+                markRouteProbeFailed(route, generation, "listener_not_ready")
+                telemetryEvent(
+                    "route_state",
+                    "rsn" to "listener_not_ready",
+                    "route" to routeLabel(route),
+                    "generation" to generation,
+                )
+                return RealityProbeResult(false, "listener_not_ready")
+            }
+        } else {
+            markRouteListenerReady(route, generation, SystemClock.elapsedRealtime())
+        }
+        if (!runEgressProbe) {
+            return RealityProbeResult(healthy = false, tcpError = "listener_ready")
+        }
+        val probe = probeReality(route, cfg)
+        if (probe.healthy) {
+            markRouteProbeReady(route, generation, SystemClock.elapsedRealtime())
+        } else {
+            markRouteProbeFailed(route, generation, probe.tcpError.ifBlank { "probe_failed" })
+        }
+        return probe
     }
 
     private fun localTcpError(host: String, port: Int, timeoutMs: Int): String? =
@@ -4592,8 +4816,11 @@ class AutoTransportService : Service() {
         private const val BACKSTOP_INTERVAL_MS = 10 * 60 * 1000L
         private const val AWG_UNHEALTHY_PROBE_INTERVAL_MS = 75_000L
         private const val OUTBOUND_REFRESH_INTERVAL_MS = 15_000L
-        private const val XRAY_WARMUP_MS = 800L
         private const val XRAY_STOP_GRACE_MS = 1_500L
+        private const val XRAY_LISTENER_READY_TIMEOUT_MS = 2_500L
+        private const val XRAY_LISTENER_CONNECT_TIMEOUT_MS = 250
+        private const val XRAY_LISTENER_POLL_MS = 100L
+        private const val XRAY_READY_PROBE_MAX_AGE_MS = 15_000L
         private const val HEALTH_TIMEOUT_MS = HEALTH_PROBE_TIMEOUT_MS
         private const val OUTBOUND_TIMEOUT_MS = 5_000
         private const val ACTIVE_AWG_STALL_OUTBOUND_TIMEOUT_MS = 2_000
