@@ -72,6 +72,21 @@ data class StoredPublicAWGKeyPair(
     val newlyCreated: Boolean,
 )
 
+internal enum class PublicAWGKeyPairSource {
+    EXISTING,
+    LEGACY,
+    GENERATED,
+}
+
+internal data class PublicAWGKeyPairResolution(
+    val privateKey: String,
+    val publicKey: String,
+    val source: PublicAWGKeyPairSource,
+) {
+    val newlyCreated: Boolean
+        get() = source == PublicAWGKeyPairSource.GENERATED
+}
+
 const val TELEMETRY_SIGNATURE_DOMAIN = "TrafficWrapper telemetry v1"
 
 internal fun requireIdentityCommit(committed: Boolean, label: String) {
@@ -91,6 +106,43 @@ internal fun storedWireGuardKeyPairFromJSON(generatedJSON: String, label: String
         throw IllegalStateException("$label key generation returned empty key")
     }
     return privateKey to publicKey
+}
+
+internal fun nonBlankWireGuardKeyPair(privateKey: String, publicKey: String): Pair<String, String>? {
+    val normalizedPrivate = privateKey.trim()
+    val normalizedPublic = publicKey.trim()
+    return if (normalizedPrivate.isNotBlank() && normalizedPublic.isNotBlank()) {
+        normalizedPrivate to normalizedPublic
+    } else {
+        null
+    }
+}
+
+internal fun resolvePublicAWGKeyPair(
+    existing: Pair<String, String>?,
+    legacy: Pair<String, String>?,
+    generate: () -> Pair<String, String>,
+): PublicAWGKeyPairResolution {
+    existing?.let {
+        return PublicAWGKeyPairResolution(
+            privateKey = it.first,
+            publicKey = it.second,
+            source = PublicAWGKeyPairSource.EXISTING,
+        )
+    }
+    legacy?.let {
+        return PublicAWGKeyPairResolution(
+            privateKey = it.first,
+            publicKey = it.second,
+            source = PublicAWGKeyPairSource.LEGACY,
+        )
+    }
+    val generated = generate()
+    return PublicAWGKeyPairResolution(
+        privateKey = generated.first,
+        publicKey = generated.second,
+        source = PublicAWGKeyPairSource.GENERATED,
+    )
 }
 
 class SecureIdentityStore(context: Context) {
@@ -220,39 +272,44 @@ class SecureIdentityStore(context: Context) {
     fun getOrCreatePublicAWGKeyPair(generateWireGuardKeyPairJson: () -> String): StoredPublicAWGKeyPair {
         val keyState = getOrCreateWrappingKey()
         val sealed = prefs.getString(KEY_PUBLIC_AWG_KEYPAIR, null)
+        var existingKeyPair: Pair<String, String>? = null
         if (sealed != null) {
             val opened = runCatching { open(sealed, keyState.key) }.getOrNull()
             val existing = opened?.let { runCatching { JSONObject(it) }.getOrNull() }
             if (existing != null) {
-                val privateKey = existing.optString(JSON_PRIVATE_KEY)
-                val publicKey = existing.optString(JSON_PUBLIC_KEY)
-                if (privateKey.isNotBlank() && publicKey.isNotBlank()) {
-                    return StoredPublicAWGKeyPair(
-                        privateKey = privateKey,
-                        publicKey = publicKey,
-                        newlyCreated = false,
-                    )
-                }
+                existingKeyPair = nonBlankWireGuardKeyPair(
+                    existing.optString(JSON_PRIVATE_KEY),
+                    existing.optString(JSON_PUBLIC_KEY),
+                )
             }
-            requireIdentityCommit(
-                prefs.edit().remove(KEY_PUBLIC_AWG_KEYPAIR).commit(),
-                "public awg keypair reset",
+            if (existingKeyPair == null) {
+                requireIdentityCommit(
+                    prefs.edit().remove(KEY_PUBLIC_AWG_KEYPAIR).commit(),
+                    "public awg keypair reset",
+                )
+            }
+        }
+        val resolved = resolvePublicAWGKeyPair(
+            existing = existingKeyPair,
+            legacy = readLegacyPublicAWGKeyPair(keyState.key),
+            generate = { storedWireGuardKeyPairFromJSON(generateWireGuardKeyPairJson(), "public awg") },
+        )
+        if (resolved.source != PublicAWGKeyPairSource.EXISTING) {
+            writePublicAWGKeyPair(
+                keyState = keyState,
+                privateKey = resolved.privateKey,
+                publicKey = resolved.publicKey,
+                label = if (resolved.source == PublicAWGKeyPairSource.LEGACY) {
+                    "public awg keypair migration"
+                } else {
+                    "public awg keypair"
+                },
             )
         }
-        val (privateKey, publicKey) = storedWireGuardKeyPairFromJSON(generateWireGuardKeyPairJson(), "public awg")
-        val root = JSONObject()
-            .put(JSON_PRIVATE_KEY, privateKey)
-            .put(JSON_PUBLIC_KEY, publicKey)
-        requireIdentityCommit(
-            prefs.edit()
-                .putString(KEY_PUBLIC_AWG_KEYPAIR, seal(root.toString(), keyState.key))
-                .commit(),
-            "public awg keypair",
-        )
         return StoredPublicAWGKeyPair(
-            privateKey = privateKey,
-            publicKey = publicKey,
-            newlyCreated = true,
+            privateKey = resolved.privateKey,
+            publicKey = resolved.publicKey,
+            newlyCreated = resolved.newlyCreated,
         )
     }
 
@@ -374,6 +431,33 @@ class SecureIdentityStore(context: Context) {
             trustedWallTimeMs = root.optLong(JSON_TRUSTED_WALL_TIME_MS, 0),
             trustedElapsedRealtimeMs = root.optLong(JSON_TRUSTED_ELAPSED_REALTIME_MS, 0),
             lastValidIssuedAtMs = root.optLong(JSON_LAST_VALID_ISSUED_AT_MS, 0),
+        )
+    }
+
+    private fun readLegacyPublicAWGKeyPair(key: SecretKey): Pair<String, String>? {
+        val sealed = prefs.getString(KEY_PUBLIC_PLATFORM_STATE, null) ?: return null
+        val opened = runCatching { open(sealed, key) }.getOrNull() ?: return null
+        val root = runCatching { JSONObject(opened) }.getOrNull() ?: return null
+        return nonBlankWireGuardKeyPair(
+            root.optString(JSON_AWG_PRIVATE_KEY),
+            root.optString(JSON_AWG_PUBLIC_KEY),
+        )
+    }
+
+    private fun writePublicAWGKeyPair(
+        keyState: KeyState,
+        privateKey: String,
+        publicKey: String,
+        label: String,
+    ) {
+        val root = JSONObject()
+            .put(JSON_PRIVATE_KEY, privateKey)
+            .put(JSON_PUBLIC_KEY, publicKey)
+        requireIdentityCommit(
+            prefs.edit()
+                .putString(KEY_PUBLIC_AWG_KEYPAIR, seal(root.toString(), keyState.key))
+                .commit(),
+            label,
         )
     }
 
