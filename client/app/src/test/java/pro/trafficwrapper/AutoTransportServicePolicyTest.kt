@@ -376,24 +376,26 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
-    fun rejectedPreparedCandidateUpdatesThrottleButReadyCandidateDoesNot() {
-        val previousThrottle = 10_000L
-        val nowMs = 30_000L
+    fun rejectedPreparedCandidateSleepsWithoutPollutingSwitchThrottle() {
+        val lastRealSwitchAtMs = 100_000L
+        val rejectedPrepareAtMs = lastRealSwitchAtMs + ROUTE_SWITCH_MIN_INTERVAL_MS + 1_000L
+        val readyAtMs = rejectedPrepareAtMs + PREPARE_RETRY_BACKOFF_MS
 
-        assertEquals(
-            nowMs,
-            candidatePrepareThrottleTimestamp(
-                previousThrottleAtMs = previousThrottle,
-                nowMs = nowMs,
-                rejectedPreparedCandidate = true,
+        assertEquals(PREPARE_RETRY_BACKOFF_MS, prepareRetryDelayMs(rejectedPreparedCandidate = true))
+        assertEquals(0L, prepareRetryDelayMs(rejectedPreparedCandidate = false))
+        assertTrue(PREPARE_RETRY_BACKOFF_MS < ROUTE_SWITCH_MIN_INTERVAL_MS)
+        assertTrue(
+            canSwitchRoutePolicy(
+                nowMs = readyAtMs,
+                lastRouteSwitchAtMs = lastRealSwitchAtMs,
+                reason = "awg_not_carrying",
             ),
         )
-        assertEquals(
-            previousThrottle,
-            candidatePrepareThrottleTimestamp(
-                previousThrottleAtMs = previousThrottle,
-                nowMs = nowMs,
-                rejectedPreparedCandidate = false,
+        assertFalse(
+            canSwitchRoutePolicy(
+                nowMs = readyAtMs,
+                lastRouteSwitchAtMs = rejectedPrepareAtMs,
+                reason = "awg_not_carrying",
             ),
         )
     }

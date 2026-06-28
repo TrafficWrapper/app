@@ -296,12 +296,18 @@ internal fun shouldCloseTargetPreviousGeneration(
 ): Boolean =
     targetIsTcpSidecar && generationBeforeCommit != generationAfterCommit
 
-internal fun candidatePrepareThrottleTimestamp(
-    previousThrottleAtMs: Long,
+internal fun prepareRetryDelayMs(rejectedPreparedCandidate: Boolean, backoffMs: Long = PREPARE_RETRY_BACKOFF_MS): Long =
+    if (rejectedPreparedCandidate) backoffMs else 0L
+
+internal fun canSwitchRoutePolicy(
     nowMs: Long,
-    rejectedPreparedCandidate: Boolean,
-): Long =
-    if (rejectedPreparedCandidate) nowMs else previousThrottleAtMs
+    lastRouteSwitchAtMs: Long,
+    reason: String,
+    switchMinIntervalMs: Long = ROUTE_SWITCH_MIN_INTERVAL_MS,
+): Boolean =
+    lastRouteSwitchAtMs == 0L ||
+        nowMs - lastRouteSwitchAtMs >= switchMinIntervalMs ||
+        reason == ROUTE_REASON_ACTIVE_UNHEALTHY
 
 internal fun shouldPromoteRecoveredPriorityRoute(
     inactiveHealthySinceMs: Long,
@@ -391,6 +397,9 @@ internal const val TCP_ROUTE_FLAP_THRESHOLD = 3
 internal const val TCP_ROUTE_FLAP_DEMOTE_BASE_MS = 60_000L
 internal const val TCP_ROUTE_FLAP_DEMOTE_MAX_MS = 5 * 60 * 1000L
 internal const val TCP_ROUTE_FLAP_DEMOTE_MAX_SHIFT = 4
+internal const val ROUTE_SWITCH_MIN_INTERVAL_MS = 10_000L
+internal const val PREPARE_RETRY_BACKOFF_MS = 1_250L
+internal const val ROUTE_REASON_ACTIVE_UNHEALTHY = "active_unhealthy"
 internal const val SOCKS5_VERSION = 5
 internal const val SOCKS5_ATYP_IPV4 = 1
 internal const val SOCKS5_ATYP_DOMAIN = 3
@@ -2214,11 +2223,7 @@ class AutoTransportService : Service() {
                                 "generation" to routeGeneration(guardedRoute),
                                 "route_state" to routeRuntime(guardedRoute).processState.name.lowercase(),
                             )
-                            lastRouteSwitchAtMs = candidatePrepareThrottleTimestamp(
-                                previousThrottleAtMs = lastRouteSwitchAtMs,
-                                nowMs = nowMs,
-                                rejectedPreparedCandidate = true,
-                            )
+                            sleepOrResync(prepareRetryDelayMs(rejectedPreparedCandidate = true))
                             continue
                         }
                         if (!shouldCommitPreparedRoute(
@@ -2234,11 +2239,7 @@ class AutoTransportService : Service() {
                                 LOG_TAG,
                                 "route_state rsn=target_mismatch_drop request=$requestId current_request=${routeSwitchRequestId.get()} mode=${mode.name} current_mode=${requestedMode.name} target=${routeLabel(guardedRoute)}",
                             )
-                            lastRouteSwitchAtMs = candidatePrepareThrottleTimestamp(
-                                previousThrottleAtMs = lastRouteSwitchAtMs,
-                                nowMs = nowMs,
-                                rejectedPreparedCandidate = true,
-                            )
+                            sleepOrResync(prepareRetryDelayMs(rejectedPreparedCandidate = true))
                             continue
                         }
                         var demotion: AwgDemotion? = null
@@ -4010,9 +4011,11 @@ class AutoTransportService : Service() {
         }
 
     private fun canSwitchRoute(nowMs: Long, lastRouteSwitchAtMs: Long, reason: String): Boolean =
-        lastRouteSwitchAtMs == 0L ||
-            nowMs - lastRouteSwitchAtMs >= ROUTE_SWITCH_MIN_INTERVAL_MS ||
-            reason == ROUTE_REASON_ACTIVE_UNHEALTHY
+        canSwitchRoutePolicy(
+            nowMs = nowMs,
+            lastRouteSwitchAtMs = lastRouteSwitchAtMs,
+            reason = reason,
+        )
 
     private fun isRecent(nowMs: Long, timestampMs: Long, maxAgeMs: Long): Boolean =
         isRecentTimestamp(nowMs, timestampMs, maxAgeMs)
@@ -4967,7 +4970,6 @@ class AutoTransportService : Service() {
         private const val ROUTE_DWELL_MS = 30_000L
         private const val ACTIVE_STABLE_RETRY_SUPPRESS_MS = 30_000L
         private const val ROUTE_LOSS_RESET_GRACE_MS = 15_000L
-        private const val ROUTE_SWITCH_MIN_INTERVAL_MS = 10_000L
         private const val RESYNC_SESSION_GRACE_MS = 5_000L
         private const val AUTO_REVIVE_DEBOUNCE_MS = 45_000L
         private const val PRIORITY_RECOVERY_ACTIVE_DWELL_MS = 2 * 60 * 1000L
@@ -4981,7 +4983,6 @@ class AutoTransportService : Service() {
         private const val BACKSTOP_REQUEST_CODE = 1304
         private const val ROUTE_REASON_AWG_NOT_CARRYING = "awg_not_carrying"
         private const val ROUTE_REASON_AWG_UNHEALTHY = "awg_unhealthy"
-        private const val ROUTE_REASON_ACTIVE_UNHEALTHY = "active_unhealthy"
         private const val ROUTE_REASON_HEALTH_LOST = "health_lost"
         private const val ROUTE_REASON_PRIORITY_RECOVERED = "priority_recovered"
         private const val ROUTE_REASON_GUARD_FALLBACK = "route_guard_fallback"
