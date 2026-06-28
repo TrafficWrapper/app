@@ -351,6 +351,54 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
+    fun targetCloseRunsOnlyWhenTargetGenerationChanged() {
+        assertFalse(
+            shouldCloseTargetPreviousGeneration(
+                targetIsTcpSidecar = false,
+                generationBeforeCommit = 0L,
+                generationAfterCommit = 0L,
+            ),
+        )
+        assertFalse(
+            shouldCloseTargetPreviousGeneration(
+                targetIsTcpSidecar = true,
+                generationBeforeCommit = 3L,
+                generationAfterCommit = 3L,
+            ),
+        )
+        assertTrue(
+            shouldCloseTargetPreviousGeneration(
+                targetIsTcpSidecar = true,
+                generationBeforeCommit = 3L,
+                generationAfterCommit = 4L,
+            ),
+        )
+    }
+
+    @Test
+    fun rejectedPreparedCandidateUpdatesThrottleButReadyCandidateDoesNot() {
+        val previousThrottle = 10_000L
+        val nowMs = 30_000L
+
+        assertEquals(
+            nowMs,
+            candidatePrepareThrottleTimestamp(
+                previousThrottleAtMs = previousThrottle,
+                nowMs = nowMs,
+                rejectedPreparedCandidate = true,
+            ),
+        )
+        assertEquals(
+            previousThrottle,
+            candidatePrepareThrottleTimestamp(
+                previousThrottleAtMs = previousThrottle,
+                nowMs = nowMs,
+                rejectedPreparedCandidate = false,
+            ),
+        )
+    }
+
+    @Test
     fun flappingPriorityRouteDoesNotPromoteBeforeStableDwell() {
         val nowMs = 100_000L
 

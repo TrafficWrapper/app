@@ -289,6 +289,20 @@ internal fun shouldCloseSessionForRouteGeneration(
 ): Boolean =
     sessionUpstreamPort == upstreamPort && sessionGeneration == generation
 
+internal fun shouldCloseTargetPreviousGeneration(
+    targetIsTcpSidecar: Boolean,
+    generationBeforeCommit: Long,
+    generationAfterCommit: Long,
+): Boolean =
+    targetIsTcpSidecar && generationBeforeCommit != generationAfterCommit
+
+internal fun candidatePrepareThrottleTimestamp(
+    previousThrottleAtMs: Long,
+    nowMs: Long,
+    rejectedPreparedCandidate: Boolean,
+): Long =
+    if (rejectedPreparedCandidate) nowMs else previousThrottleAtMs
+
 internal fun shouldPromoteRecoveredPriorityRoute(
     inactiveHealthySinceMs: Long,
     lastHealthLostAtMs: Long,
@@ -2200,6 +2214,11 @@ class AutoTransportService : Service() {
                                 "generation" to routeGeneration(guardedRoute),
                                 "route_state" to routeRuntime(guardedRoute).processState.name.lowercase(),
                             )
+                            lastRouteSwitchAtMs = candidatePrepareThrottleTimestamp(
+                                previousThrottleAtMs = lastRouteSwitchAtMs,
+                                nowMs = nowMs,
+                                rejectedPreparedCandidate = true,
+                            )
                             continue
                         }
                         if (!shouldCommitPreparedRoute(
@@ -2214,6 +2233,11 @@ class AutoTransportService : Service() {
                             Log.i(
                                 LOG_TAG,
                                 "route_state rsn=target_mismatch_drop request=$requestId current_request=${routeSwitchRequestId.get()} mode=${mode.name} current_mode=${requestedMode.name} target=${routeLabel(guardedRoute)}",
+                            )
+                            lastRouteSwitchAtMs = candidatePrepareThrottleTimestamp(
+                                previousThrottleAtMs = lastRouteSwitchAtMs,
+                                nowMs = nowMs,
+                                rejectedPreparedCandidate = true,
                             )
                             continue
                         }
@@ -2245,6 +2269,7 @@ class AutoTransportService : Service() {
                         resetTcpStallState(guardedRoute, currentTcpTx(guardedRoute))
                         markRouteDraining(previousRoute, nowMs)
                         bumpRouteCommitGeneration(guardedRoute, nowMs, probeReady = requireProbeReady)
+                        val targetGenerationAfterCommit = routeGeneration(guardedRoute)
                         activeRoute = setRoute(
                             route = guardedRoute,
                             mode = mode,
@@ -2264,7 +2289,14 @@ class AutoTransportService : Service() {
                         )
                         markRouteActive(activeRoute, nowMs, probeReady = requireProbeReady)
                         val closedOldGeneration = router?.closeSessionsForRouteGeneration(routePort(previousRoute), previousGeneration) ?: 0
-                        val closedTargetOldGeneration = if (guardedRoute != previousRoute) {
+                        val closedTargetOldGeneration = if (
+                            guardedRoute != previousRoute &&
+                            shouldCloseTargetPreviousGeneration(
+                                targetIsTcpSidecar = guardedRoute.isTcpSidecarRoute(),
+                                generationBeforeCommit = targetPreviousGeneration,
+                                generationAfterCommit = targetGenerationAfterCommit,
+                            )
+                        ) {
                             router?.closeSessionsForRouteGeneration(routePort(guardedRoute), targetPreviousGeneration) ?: 0
                         } else {
                             0
