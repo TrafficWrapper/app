@@ -1,4 +1,10 @@
 <resources>
+    <string name="http_proxy_title">HTTP proxy (for Wi-Fi)</string>
+    <string name="http_proxy_description">Local HTTP/CONNECT proxy for Android Wi-Fi proxy settings. Disabled by default.</string>
+    <string name="http_proxy_listen">HTTP proxy: %1$s</string>
+    <string name="http_proxy_running">listening</string>
+    <string name="http_proxy_waiting">will start after connection</string>
+    <string name="http_proxy_instruction">Settings → Wi-Fi → your network → Proxy → Manual → host 127.0.0.1, port 18090.</string>
     <string name="public_bootstrap_body">Scan the QR from the orchestrator web admin, or import the one-time bootstrap as Base64/JSON. The app will verify expiry and the config key.</string>
     <string name="public_bootstrap_input_label">Bootstrap JSON or Base64</string>
     <string name="public_bootstrap_import">Import bootstrap</string>

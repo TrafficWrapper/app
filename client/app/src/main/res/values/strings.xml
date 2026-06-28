@@ -111,6 +111,12 @@
     <string name="settings_update_title">Обновления</string>
     <string name="settings_permissions_title">Права и разрешения</string>
     <string name="settings_battery_title">Работа в фоне</string>
+    <string name="http_proxy_title">HTTP-прокси (для Wi-Fi)</string>
+    <string name="http_proxy_description">Локальный HTTP/CONNECT-прокси для системной настройки Wi-Fi. По умолчанию выключен.</string>
+    <string name="http_proxy_listen">HTTP-прокси: %1$s</string>
+    <string name="http_proxy_running">слушает</string>
+    <string name="http_proxy_waiting">запустится после подключения</string>
+    <string name="http_proxy_instruction">Настройки → Wi-Fi → ваша сеть → Прокси → Вручную → хост 127.0.0.1, порт 18090.</string>
     <string name="settings_version">Версия</string>
     <string name="settings_status">Статус</string>
     <string name="settings_alias">Псевдоним</string>

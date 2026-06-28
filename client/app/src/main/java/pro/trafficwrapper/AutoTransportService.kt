@@ -156,6 +156,40 @@ internal fun shouldPromoteRecoveredPriorityRoute(
     return recentHealthLostCount < flapThreshold
 }
 
+internal fun shouldAllowPriorityRecovery(
+    hasRecentUserTraffic: Boolean,
+    nowMs: Long,
+    lastRouteSwitchAtMs: Long,
+    lastPriorityRecoveredSwitchAtMs: Long,
+    activeDwellMs: Long,
+    cooldownMs: Long,
+): Boolean =
+    hasRecentUserTraffic &&
+        (lastRouteSwitchAtMs == 0L || nowMs - lastRouteSwitchAtMs >= activeDwellMs) &&
+        (lastPriorityRecoveredSwitchAtMs == 0L || nowMs - lastPriorityRecoveredSwitchAtMs >= cooldownMs)
+
+internal fun probeLoopSleepMs(
+    stable: Boolean,
+    nowMs: Long,
+    lastTunnelRxProgressAtMs: Long,
+    reconnectBackoffMs: Long,
+): Long {
+    if (!stable) return reconnectBackoffMs
+    val rxIdle = lastTunnelRxProgressAtMs <= 0L || nowMs - lastTunnelRxProgressAtMs >= STABLE_IDLE_RX_AGE_MS
+    return if (rxIdle) STABLE_IDLE_PROBE_INTERVAL_MS else PROBE_INTERVAL_MS
+}
+
+@Suppress("UNUSED_PARAMETER")
+internal fun shouldSkipNonDestructiveForegroundResync(
+    routeHealthy: Boolean,
+    stableSinceElapsedRealtimeMs: Long?,
+    snapshotAgeMs: Long,
+    trafficAgeMs: Long,
+): Boolean =
+    routeHealthy &&
+        stableSinceElapsedRealtimeMs != null &&
+        snapshotAgeMs in 0..STABLE_TRAFFIC_MAX_AGE_MS
+
 internal fun tcpRouteFlapDemotionMs(
     recentHealthLostCount: Int,
     threshold: Int = TCP_ROUTE_FLAP_THRESHOLD,
@@ -181,6 +215,11 @@ internal const val ALL_DEAD_WAKELOCK_MIN_SLEEP_MS = 15_000L
 internal const val HEALTH_PROBE_TIMEOUT_MS = 7_000
 internal const val AWG_CARRYING_EVIDENCE_MAX_AGE_MS = 7_000L
 internal const val REALITY_PROBE_ATTEMPTS = 2
+internal const val PROBE_INTERVAL_MS = 2_500L
+internal const val STABLE_IDLE_PROBE_INTERVAL_MS = 8_000L
+internal const val STABLE_IDLE_RX_AGE_MS = 8_000L
+internal const val STABLE_TRAFFIC_MAX_AGE_SECONDS = 30L
+internal const val STABLE_TRAFFIC_MAX_AGE_MS = STABLE_TRAFFIC_MAX_AGE_SECONDS * 1000L
 internal const val TCP_PRIORITY_PROMOTE_DWELL_MS = 45_000L
 internal const val TCP_ROUTE_FLAP_WINDOW_MS = 2 * 60 * 1000L
 internal const val TCP_ROUTE_FLAP_THRESHOLD = 3
@@ -237,6 +276,9 @@ class AutoTransportService : Service() {
     @Volatile
     private var router: SocksRouter? = null
 
+    @Volatile
+    private var httpProxy: LocalHttpProxy? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -264,6 +306,17 @@ class AutoTransportService : Service() {
         requestedMode = intent?.getStringExtra(EXTRA_MODE)
             ?.let { runCatching { TransportChoice.valueOf(it) }.getOrNull() }
             ?: TransportLifecycleStore.preferredMode(this)
+        if (action == ACTION_HTTP_PROXY_CHANGED) {
+            if (workerActive.get()) {
+                applyHttpProxyPreference()
+                return START_STICKY
+            }
+            if (!TransportLifecycleStore.shouldKeepAlive(this)) {
+                applyHttpProxyPreference()
+                stopSelf()
+                return START_NOT_STICKY
+            }
+        }
         if (action == ACTION_START) {
             TransportLifecycleStore.rememberActiveTransport(this, requestedMode)
         }
@@ -352,6 +405,7 @@ class AutoTransportService : Service() {
             var lastAwgRuEndToEndFailureAtMs = 0L
             var lastAwgEndToEndFailureAtMs = 0L
             var lastRouteSwitchAtMs = 0L
+            var lastPriorityRecoveredSwitchAtMs = 0L
             var cachedAwgRuProbe = AWGProbeResult(false)
             var cachedAwgProbe = AWGProbeResult(false)
             var cachedRealityProbe = RealityProbeResult(false)
@@ -649,6 +703,7 @@ class AutoTransportService : Service() {
                 }
                 if (routeAvailable(activeRoute, awgRuStarted, awgStarted, xrayStarted, xray2Started, realityConfig, reality2Config)) {
                     router = startSocksRouter()
+                    startHttpProxyIfEnabled()
                 } else {
                     telemetryEvent("route_guard",
                         "rsn" to ROUTE_REASON_NO_UPSTREAM,
@@ -1646,6 +1701,16 @@ class AutoTransportService : Service() {
                             }
                             ) &&
                         !isRouteCooldownActive(Route.AWG, nowMs)
+                    val hasRecentUserTraffic =
+                        lastTrafficAtMs?.let { nowMs - it in 0..STABLE_TRAFFIC_MAX_AGE_MS } == true
+                    val priorityRecoveryAllowed = shouldAllowPriorityRecovery(
+                        hasRecentUserTraffic = hasRecentUserTraffic,
+                        nowMs = nowMs,
+                        lastRouteSwitchAtMs = lastRouteSwitchAtMs,
+                        lastPriorityRecoveredSwitchAtMs = lastPriorityRecoveredSwitchAtMs,
+                        activeDwellMs = PRIORITY_RECOVERY_ACTIVE_DWELL_MS,
+                        cooldownMs = PRIORITY_RECOVERY_COOLDOWN_MS,
+                    )
                     val routeDecision = chooseRoute(
                         mode = mode,
                         active = activeRoute,
@@ -1660,6 +1725,7 @@ class AutoTransportService : Service() {
                         realityUsable = realityUsable,
                         reality2Usable = reality2Usable,
                         reality2PriorityPromotable = tcpPriorityPromotable(Route.REALITY2, reality2Healthy, nowMs),
+                        priorityRecoveryAllowed = priorityRecoveryAllowed,
                         activeHealthy = activeRouteHealthyNow,
                     )
                     val guardedRoute = selectAvailableRoute(
@@ -1705,6 +1771,9 @@ class AutoTransportService : Service() {
                         }
                         activeRoute = guardedRoute
                         lastRouteSwitchAtMs = nowMs
+                        if (guardedReason == ROUTE_REASON_PRIORITY_RECOVERED) {
+                            lastPriorityRecoveredSwitchAtMs = nowMs
+                        }
                         activeRoute = setRoute(
                             route = activeRoute,
                             mode = mode,
@@ -1926,7 +1995,18 @@ class AutoTransportService : Service() {
                         }
                         nextPublicConfigPollAtMs = nowMs + PUBLIC_CONFIG_POLL_INTERVAL_MS
                     }
-                    val sleepMs = if (stable) PROBE_INTERVAL_MS else reconnectBackoffMs
+                    val lastTunnelRxProgressAtMs = maxOf(
+                        lastAwgRuRxProgressAtMs,
+                        lastAwgRxProgressAtMs,
+                        lastRealityRxProgressAtMs,
+                        lastReality2RxProgressAtMs,
+                    )
+                    val sleepMs = probeLoopSleepMs(
+                        stable = stable,
+                        nowMs = nowMs,
+                        lastTunnelRxProgressAtMs = lastTunnelRxProgressAtMs,
+                        reconnectBackoffMs = reconnectBackoffMs,
+                    )
                     reconnectBackoffMs = if (stable) {
                         RECONNECT_MIN_BACKOFF_MS
                     } else {
@@ -1977,6 +2057,7 @@ class AutoTransportService : Service() {
             } finally {
                 workerActive.set(false)
                 routeHealthSnapshot.set(null)
+                stopHttpProxy()
                 router?.stop()
                 router = null
                 xrayProcess?.destroy()
@@ -2018,6 +2099,7 @@ class AutoTransportService : Service() {
         }
         unregisterNetworkCallback()
         unregisterScreenReceiver()
+        stopHttpProxy()
         router?.stop()
         router = null
         xrayProcess?.destroy()
@@ -2188,10 +2270,12 @@ class AutoTransportService : Service() {
         val snapshot = routeHealthSnapshot.get() ?: return false
         val snapshotAgeMs = nowMs - snapshot.observedAtMs
         val trafficAgeMs = snapshot.lastTrafficAtMs?.let { nowMs - it } ?: Long.MAX_VALUE
-        return snapshot.routeHealthy &&
-            snapshot.stableSinceElapsedRealtimeMs != null &&
-            snapshotAgeMs in 0..STABLE_TRAFFIC_MAX_AGE_MS &&
-            trafficAgeMs in 0..STABLE_TRAFFIC_MAX_AGE_MS
+        return shouldSkipNonDestructiveForegroundResync(
+            routeHealthy = snapshot.routeHealthy,
+            stableSinceElapsedRealtimeMs = snapshot.stableSinceElapsedRealtimeMs,
+            snapshotAgeMs = snapshotAgeMs,
+            trafficAgeMs = trafficAgeMs,
+        )
     }
 
     @SuppressLint("WakelockTimeout")
@@ -2795,6 +2879,7 @@ class AutoTransportService : Service() {
         realityUsable: Boolean,
         reality2Usable: Boolean,
         reality2PriorityPromotable: Boolean,
+        priorityRecoveryAllowed: Boolean,
         activeHealthy: Boolean,
     ): RouteDecision =
         when (mode) {
@@ -2819,6 +2904,8 @@ class AutoTransportService : Service() {
                     !reality2Usable &&
                     !awgUsable -> RouteDecision(active)
                 awgRuUsable &&
+                    activeHealthy &&
+                    priorityRecoveryAllowed &&
                     routePriority(Route.AWG_RU) < routePriority(active) &&
                     active != Route.AWG_RU -> RouteDecision(Route.AWG_RU, ROUTE_REASON_PRIORITY_RECOVERED)
                 active == Route.AWG_RU &&
@@ -2834,7 +2921,9 @@ class AutoTransportService : Service() {
                         ROUTE_REASON_AWG_UNHEALTHY,
                     )
                 reality2Usable &&
-                    (!activeHealthy || reality2PriorityPromotable) &&
+                    activeHealthy &&
+                    reality2PriorityPromotable &&
+                    priorityRecoveryAllowed &&
                     active != Route.REALITY2 -> RouteDecision(Route.REALITY2, ROUTE_REASON_PRIORITY_RECOVERED)
                 awgUsable &&
                     active != Route.AWG &&
@@ -2920,6 +3009,55 @@ class AutoTransportService : Service() {
             reality2RxCounter = reality2RxBytes,
             reality2TxCounter = reality2TxBytes,
         ).also { it.start() }
+
+    private fun applyHttpProxyPreference() {
+        if (TransportLifecycleStore.httpProxyEnabled(applicationContext) && workerActive.get() && router != null) {
+            startHttpProxyIfEnabled()
+        } else {
+            stopHttpProxy()
+        }
+    }
+
+    private fun startHttpProxyIfEnabled() {
+        if (!TransportLifecycleStore.httpProxyEnabled(applicationContext) || router == null) {
+            stopHttpProxy()
+            return
+        }
+        if (httpProxy?.isRunning == true) {
+            publishHttpProxyState()
+            return
+        }
+        runCatching {
+            LocalHttpProxy(
+                host = LOCAL_HTTP_PROXY_HOST,
+                port = LOCAL_HTTP_PROXY_PORT,
+                socksHost = ROUTER_HOST,
+                socksPort = ROUTER_PORT,
+            ).also { proxy ->
+                proxy.start()
+                httpProxy = proxy
+            }
+        }.onSuccess {
+            Log.i(LOG_TAG, "local HTTP proxy listening on $LOCAL_HTTP_PROXY_LISTEN")
+        }.onFailure { error ->
+            httpProxy = null
+            Log.w(LOG_TAG, "local HTTP proxy start failed: ${error.message}")
+            telemetryEvent(
+                "http_proxy",
+                "err_where" to "http_proxy_start",
+                "err_kind" to Telemetry.errorKind(error),
+                "err_msg" to Telemetry.safeErrorMessage(error),
+            )
+        }
+        publishHttpProxyState()
+    }
+
+    private fun stopHttpProxy() {
+        val current = httpProxy
+        httpProxy = null
+        current?.stop()
+        publishHttpProxyState()
+    }
 
     private fun shouldProbeAWG(
         nowMs: Long,
@@ -3340,8 +3478,24 @@ class AutoTransportService : Service() {
 
     private fun publishState(state: TransportUiState) {
         mainHandler.post {
-            TransportRuntime.state = state
+            TransportRuntime.state = withHttpProxyState(state)
         }
+    }
+
+    private fun publishHttpProxyState() {
+        mainHandler.post {
+            TransportRuntime.state = withHttpProxyState(TransportRuntime.state)
+        }
+    }
+
+    private fun withHttpProxyState(state: TransportUiState): TransportUiState {
+        val enabled = TransportLifecycleStore.httpProxyEnabled(applicationContext)
+        val running = httpProxy?.isRunning == true
+        return state.copy(
+            httpProxyEnabled = enabled,
+            httpProxyRunning = running,
+            httpProxyListen = if (enabled) LOCAL_HTTP_PROXY_LISTEN else "",
+        )
     }
 
     private fun drainProcessOutput(process: Process) {
@@ -3812,6 +3966,7 @@ class AutoTransportService : Service() {
         const val ACTION_STOP = "pro.trafficwrapper.action.AUTO_STOP"
         const val ACTION_RESYNC = "pro.trafficwrapper.action.AUTO_RESYNC"
         const val ACTION_BACKSTOP = "pro.trafficwrapper.action.AUTO_BACKSTOP"
+        const val ACTION_HTTP_PROXY_CHANGED = "pro.trafficwrapper.action.HTTP_PROXY_CHANGED"
         const val EXTRA_MODE = "pro.trafficwrapper.extra.TRANSPORT_MODE"
         const val EXTRA_KEEP_ALIVE_AFTER_STOP = "pro.trafficwrapper.extra.KEEP_ALIVE_AFTER_STOP"
 
@@ -3839,7 +3994,6 @@ class AutoTransportService : Service() {
         private val EXPECTED_REALITY2_IP: String get() = DEFAULT_REALITY2_EGRESS_IP
         private val OUTBOUND_URL: String get() = DeploymentConfig.OUTBOUND_URL.ifBlank { "https://api.ipify.org" }
 
-        private const val PROBE_INTERVAL_MS = 2_500L
         private const val REALITY_INACTIVE_PROBE_INTERVAL_MS = 75_000L
         private const val REALITY_LOCAL_RX_FRESH_MS = 30_000L
         private const val LOCAL_TCP_PROBE_TIMEOUT_MS = 300
@@ -3889,8 +4043,8 @@ class AutoTransportService : Service() {
         private const val ROUTE_SWITCH_MIN_INTERVAL_MS = 10_000L
         private const val RESYNC_SESSION_GRACE_MS = 5_000L
         private const val AUTO_REVIVE_DEBOUNCE_MS = 45_000L
-        private const val STABLE_TRAFFIC_MAX_AGE_SECONDS = 30L
-        private const val STABLE_TRAFFIC_MAX_AGE_MS = STABLE_TRAFFIC_MAX_AGE_SECONDS * 1000L
+        private const val PRIORITY_RECOVERY_ACTIVE_DWELL_MS = 2 * 60 * 1000L
+        private const val PRIORITY_RECOVERY_COOLDOWN_MS = 5 * 60 * 1000L
         private const val TELEMETRY_HEARTBEAT_UNHEALTHY_MS = 60_000L
         private const val TELEMETRY_HEARTBEAT_STABLE_MS = 15 * 60 * 1000L
         private const val TELEMETRY_HEARTBEAT_JITTER_MS = 15_000L

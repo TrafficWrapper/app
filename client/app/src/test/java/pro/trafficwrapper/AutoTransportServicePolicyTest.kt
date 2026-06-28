@@ -96,6 +96,135 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
+    fun priorityRecoveryRequiresUserTrafficDwellAndCooldown() {
+        val nowMs = 600_000L
+        val dwellMs = 120_000L
+        val cooldownMs = 300_000L
+
+        assertFalse(
+            shouldAllowPriorityRecovery(
+                hasRecentUserTraffic = false,
+                nowMs = nowMs,
+                lastRouteSwitchAtMs = 0L,
+                lastPriorityRecoveredSwitchAtMs = 0L,
+                activeDwellMs = dwellMs,
+                cooldownMs = cooldownMs,
+            ),
+        )
+        assertFalse(
+            shouldAllowPriorityRecovery(
+                hasRecentUserTraffic = true,
+                nowMs = nowMs,
+                lastRouteSwitchAtMs = nowMs - dwellMs + 1,
+                lastPriorityRecoveredSwitchAtMs = 0L,
+                activeDwellMs = dwellMs,
+                cooldownMs = cooldownMs,
+            ),
+        )
+        assertFalse(
+            shouldAllowPriorityRecovery(
+                hasRecentUserTraffic = true,
+                nowMs = nowMs,
+                lastRouteSwitchAtMs = nowMs - dwellMs,
+                lastPriorityRecoveredSwitchAtMs = nowMs - cooldownMs + 1,
+                activeDwellMs = dwellMs,
+                cooldownMs = cooldownMs,
+            ),
+        )
+        assertTrue(
+            shouldAllowPriorityRecovery(
+                hasRecentUserTraffic = true,
+                nowMs = nowMs,
+                lastRouteSwitchAtMs = nowMs - dwellMs,
+                lastPriorityRecoveredSwitchAtMs = nowMs - cooldownMs,
+                activeDwellMs = dwellMs,
+                cooldownMs = cooldownMs,
+            ),
+        )
+    }
+
+    @Test
+    fun stableIdleProbeUsesLongerSleepOnlyWhenRxIsIdle() {
+        val nowMs = 100_000L
+
+        assertEquals(
+            STABLE_IDLE_PROBE_INTERVAL_MS,
+            probeLoopSleepMs(
+                stable = true,
+                nowMs = nowMs,
+                lastTunnelRxProgressAtMs = nowMs - STABLE_IDLE_RX_AGE_MS,
+                reconnectBackoffMs = 15_000L,
+            ),
+        )
+        assertEquals(
+            PROBE_INTERVAL_MS,
+            probeLoopSleepMs(
+                stable = true,
+                nowMs = nowMs,
+                lastTunnelRxProgressAtMs = nowMs - 1_000L,
+                reconnectBackoffMs = 15_000L,
+            ),
+        )
+        assertEquals(
+            12_000L,
+            probeLoopSleepMs(
+                stable = false,
+                nowMs = nowMs,
+                lastTunnelRxProgressAtMs = nowMs,
+                reconnectBackoffMs = 12_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun foregroundResyncSkipsForHealthyIdleTunnelWithFreshSnapshot() {
+        assertTrue(
+            shouldSkipNonDestructiveForegroundResync(
+                routeHealthy = true,
+                stableSinceElapsedRealtimeMs = 50_000L,
+                snapshotAgeMs = STABLE_TRAFFIC_MAX_AGE_MS / 2,
+                trafficAgeMs = STABLE_TRAFFIC_MAX_AGE_MS + 10_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun foregroundResyncDoesNotSkipWhenRouteUnhealthy() {
+        assertFalse(
+            shouldSkipNonDestructiveForegroundResync(
+                routeHealthy = false,
+                stableSinceElapsedRealtimeMs = 50_000L,
+                snapshotAgeMs = STABLE_TRAFFIC_MAX_AGE_MS / 2,
+                trafficAgeMs = 0L,
+            ),
+        )
+    }
+
+    @Test
+    fun foregroundResyncDoesNotSkipWhenSnapshotIsStale() {
+        assertFalse(
+            shouldSkipNonDestructiveForegroundResync(
+                routeHealthy = true,
+                stableSinceElapsedRealtimeMs = 50_000L,
+                snapshotAgeMs = STABLE_TRAFFIC_MAX_AGE_MS + 1,
+                trafficAgeMs = 0L,
+            ),
+        )
+    }
+
+    @Test
+    fun foregroundResyncDoesNotSkipBeforeStable() {
+        assertFalse(
+            shouldSkipNonDestructiveForegroundResync(
+                routeHealthy = true,
+                stableSinceElapsedRealtimeMs = null,
+                snapshotAgeMs = STABLE_TRAFFIC_MAX_AGE_MS / 2,
+                trafficAgeMs = 0L,
+            ),
+        )
+    }
+
+    @Test
     fun manualRouteGuardDoesNotFallback() {
         assertEquals(
             "AWG_RU",

@@ -1377,6 +1377,10 @@ private fun SettingsScreen(
         }
     }
 
+    SettingsSection(title = stringResource(R.string.http_proxy_title)) {
+        HttpProxyPanel(context, transport)
+    }
+
     SettingsSection(title = stringResource(R.string.telemetry_title)) {
         TelemetryPanel(context)
     }
@@ -1487,6 +1491,55 @@ private fun TelemetryPanel(context: Context) {
                     Telemetry.flush(context.applicationContext)
                 }
             },
+        )
+    }
+}
+
+@Composable
+private fun HttpProxyPanel(context: Context, transport: TransportUiState) {
+    var proxyOn by remember {
+        mutableStateOf(TransportLifecycleStore.httpProxyEnabled(context.applicationContext))
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = stringResource(R.string.http_proxy_description),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Switch(
+            checked = proxyOn,
+            onCheckedChange = { enabled ->
+                TransportLifecycleStore.setHttpProxyEnabled(context.applicationContext, enabled)
+                proxyOn = TransportLifecycleStore.httpProxyEnabled(context.applicationContext)
+                notifyHttpProxyPreferenceChanged(context.applicationContext)
+            },
+        )
+    }
+    if (proxyOn) {
+        val listen = transport.httpProxyListen.ifBlank { LOCAL_HTTP_PROXY_LISTEN }
+        Text(
+            text = stringResource(R.string.http_proxy_listen, listen),
+            modifier = Modifier.padding(top = 8.dp),
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Text(
+            text = stringResource(
+                if (transport.httpProxyRunning) R.string.http_proxy_running else R.string.http_proxy_waiting,
+            ),
+            modifier = Modifier.padding(top = 4.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = if (transport.httpProxyRunning) Color(0xFF14532D) else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = stringResource(R.string.http_proxy_instruction),
+            modifier = Modifier.padding(top = 8.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -3072,6 +3125,16 @@ private fun requestForegroundResync(context: Context) {
     val intent = Intent(context, AutoTransportService::class.java)
         .setAction(AutoTransportService.ACTION_RESYNC)
         .putExtra(AutoTransportService.EXTRA_MODE, TransportLifecycleStore.preferredMode(context).name)
+    if (Build.VERSION.SDK_INT >= 26) {
+        context.startForegroundService(intent)
+    } else {
+        context.startService(intent)
+    }
+}
+
+private fun notifyHttpProxyPreferenceChanged(context: Context) {
+    val intent = Intent(context, AutoTransportService::class.java)
+        .setAction(AutoTransportService.ACTION_HTTP_PROXY_CHANGED)
     if (Build.VERSION.SDK_INT >= 26) {
         context.startForegroundService(intent)
     } else {

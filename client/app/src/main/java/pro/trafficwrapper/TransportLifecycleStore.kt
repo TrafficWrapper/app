@@ -14,6 +14,7 @@ object TransportLifecycleStore {
     private const val KEY_BATTERY_NOTIFICATION_SHOWN_AT_MS = "battery_notification_shown_at_ms"
     private const val KEY_TELEMETRY = "telemetry"
     private const val KEY_TELEMETRY_REMOTE_OFF = "telemetry_remote_off"
+    private const val KEY_HTTP_PROXY = "http_proxy"
 
     fun rememberActiveTransport(context: Context, mode: TransportChoice) {
         prefs(context).edit()
@@ -128,8 +129,25 @@ object TransportLifecycleStore {
         }
     }
 
+    fun httpProxyEnabled(context: Context): Boolean =
+        httpProxyPreference(
+            if (prefs(context).contains(KEY_HTTP_PROXY)) {
+                prefs(context).getBoolean(KEY_HTTP_PROXY, false)
+            } else {
+                null
+            },
+        )
+
+    fun setHttpProxyEnabled(context: Context, on: Boolean) {
+        prefs(context).edit()
+            .putBoolean(KEY_HTTP_PROXY, on)
+            .apply()
+    }
+
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private const val BATTERY_NOTIFICATION_MIN_INTERVAL_MS = 24L * 60L * 60L * 1000L
 }
+
+internal fun httpProxyPreference(stored: Boolean?): Boolean = stored ?: false
