@@ -66,13 +66,39 @@ data class StoredPublicPlatformState(
     val awgPublicKey: String = "",
 )
 
+data class StoredPublicAWGKeyPair(
+    val privateKey: String,
+    val publicKey: String,
+    val newlyCreated: Boolean,
+)
+
 const val TELEMETRY_SIGNATURE_DOMAIN = "TrafficWrapper telemetry v1"
+
+internal fun requireIdentityCommit(committed: Boolean, label: String) {
+    if (!committed) {
+        throw IllegalStateException("failed to persist $label")
+    }
+}
+
+internal fun storedWireGuardKeyPairFromJSON(generatedJSON: String, label: String): Pair<String, String> {
+    val generated = JSONObject(generatedJSON)
+    if (!generated.optBoolean("ok", false)) {
+        throw IllegalStateException("$label key generation failed: ${generated.optString("error")}")
+    }
+    val privateKey = generated.optString("private_key")
+    val publicKey = generated.optString("public_key")
+    if (privateKey.isBlank() || publicKey.isBlank()) {
+        throw IllegalStateException("$label key generation returned empty key")
+    }
+    return privateKey to publicKey
+}
 
 class SecureIdentityStore(context: Context) {
     private val appContext = context.applicationContext
     private val prefs: SharedPreferences =
         appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    @Synchronized
     fun getOrCreateIdentity(generateIdentityJson: () -> String): StoredIdentity {
         val keyState = getOrCreateWrappingKey()
         val sealed = prefs.getString(KEY_IDENTITY, null)
@@ -87,7 +113,7 @@ class SecureIdentityStore(context: Context) {
                     strongBoxBacked = keyState.strongBoxBacked,
                 )
             }
-            prefs.edit().remove(KEY_IDENTITY).apply()
+            requireIdentityCommit(prefs.edit().remove(KEY_IDENTITY).commit(), "identity reset")
         }
 
         val generated = JSONObject(generateIdentityJson())
@@ -97,9 +123,12 @@ class SecureIdentityStore(context: Context) {
         val identity = JSONObject()
             .put(JSON_PRIVATE_KEY, generated.getString(JSON_PRIVATE_KEY))
             .put(JSON_PUBLIC_KEY, generated.getString(JSON_PUBLIC_KEY))
-        prefs.edit()
-            .putString(KEY_IDENTITY, seal(identity.toString(), keyState.key))
-            .apply()
+        requireIdentityCommit(
+            prefs.edit()
+                .putString(KEY_IDENTITY, seal(identity.toString(), keyState.key))
+                .commit(),
+            "identity",
+        )
         return StoredIdentity(
             privateKey = identity.getString(JSON_PRIVATE_KEY),
             publicKey = identity.getString(JSON_PUBLIC_KEY),
@@ -108,6 +137,7 @@ class SecureIdentityStore(context: Context) {
         )
     }
 
+    @Synchronized
     fun getOrCreateDeviceIdentity(): StoredDeviceIdentity {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
         keyStore.load(null)
@@ -135,7 +165,10 @@ class SecureIdentityStore(context: Context) {
         } else {
             generateDeviceIdentity(strongBoxBacked = false)
         }
-        prefs.edit().putBoolean(KEY_DEVICE_STRONGBOX, generated.strongBoxBacked).apply()
+        requireIdentityCommit(
+            prefs.edit().putBoolean(KEY_DEVICE_STRONGBOX, generated.strongBoxBacked).commit(),
+            "device identity strongbox flag",
+        )
         return generated
     }
 
@@ -164,19 +197,63 @@ class SecureIdentityStore(context: Context) {
     fun deviceIdentityPublicKey(): String =
         getOrCreateDeviceIdentity().publicKey
 
+    @Synchronized
     fun getOrCreateSessionToken(): String {
         val keyState = getOrCreateWrappingKey()
         val sealed = prefs.getString(KEY_SESSION, null)
         if (sealed != null) {
             val opened = runCatching { open(sealed, keyState.key) }.getOrNull()
             if (opened != null) return opened
-            prefs.edit().remove(KEY_SESSION).apply()
+            requireIdentityCommit(prefs.edit().remove(KEY_SESSION).commit(), "session reset")
         }
         val tokenBytes = ByteArray(SESSION_TOKEN_BYTES)
         SecureRandom().nextBytes(tokenBytes)
         val token = Base64.encodeToString(tokenBytes, Base64.NO_WRAP)
-        prefs.edit().putString(KEY_SESSION, seal(token, keyState.key)).apply()
+        requireIdentityCommit(
+            prefs.edit().putString(KEY_SESSION, seal(token, keyState.key)).commit(),
+            "session",
+        )
         return token
+    }
+
+    @Synchronized
+    fun getOrCreatePublicAWGKeyPair(generateWireGuardKeyPairJson: () -> String): StoredPublicAWGKeyPair {
+        val keyState = getOrCreateWrappingKey()
+        val sealed = prefs.getString(KEY_PUBLIC_AWG_KEYPAIR, null)
+        if (sealed != null) {
+            val opened = runCatching { open(sealed, keyState.key) }.getOrNull()
+            val existing = opened?.let { runCatching { JSONObject(it) }.getOrNull() }
+            if (existing != null) {
+                val privateKey = existing.optString(JSON_PRIVATE_KEY)
+                val publicKey = existing.optString(JSON_PUBLIC_KEY)
+                if (privateKey.isNotBlank() && publicKey.isNotBlank()) {
+                    return StoredPublicAWGKeyPair(
+                        privateKey = privateKey,
+                        publicKey = publicKey,
+                        newlyCreated = false,
+                    )
+                }
+            }
+            requireIdentityCommit(
+                prefs.edit().remove(KEY_PUBLIC_AWG_KEYPAIR).commit(),
+                "public awg keypair reset",
+            )
+        }
+        val (privateKey, publicKey) = storedWireGuardKeyPairFromJSON(generateWireGuardKeyPairJson(), "public awg")
+        val root = JSONObject()
+            .put(JSON_PRIVATE_KEY, privateKey)
+            .put(JSON_PUBLIC_KEY, publicKey)
+        requireIdentityCommit(
+            prefs.edit()
+                .putString(KEY_PUBLIC_AWG_KEYPAIR, seal(root.toString(), keyState.key))
+                .commit(),
+            "public awg keypair",
+        )
+        return StoredPublicAWGKeyPair(
+            privateKey = privateKey,
+            publicKey = publicKey,
+            newlyCreated = true,
+        )
     }
 
     fun readReleaseState(): StoredReleaseState {
@@ -300,6 +377,7 @@ class SecureIdentityStore(context: Context) {
         )
     }
 
+    @Synchronized
     private fun getOrCreateWrappingKey(): KeyState {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
         keyStore.load(null)
@@ -320,7 +398,10 @@ class SecureIdentityStore(context: Context) {
         } else {
             generateKey(strongBoxBacked = false)
         }
-        prefs.edit().putBoolean(KEY_STRONGBOX, strongBoxKey.strongBoxBacked).apply()
+        requireIdentityCommit(
+            prefs.edit().putBoolean(KEY_STRONGBOX, strongBoxKey.strongBoxBacked).commit(),
+            "wrapping key strongbox flag",
+        )
         return strongBoxKey
     }
 
@@ -398,6 +479,7 @@ class SecureIdentityStore(context: Context) {
         private const val KEY_RELEASE_STATE = "update_state"
         private const val KEY_RENDEZVOUS_STATE = "rendezvous_state"
         private const val KEY_PUBLIC_PLATFORM_STATE = "public_platform_state"
+        private const val KEY_PUBLIC_AWG_KEYPAIR = "public_awg_keypair"
         private const val KEY_STRONGBOX = "strongbox"
         private const val KEY_DEVICE_STRONGBOX = "device_strongbox"
         private const val AES_GCM = "AES/GCM/NoPadding"

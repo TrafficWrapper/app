@@ -2351,6 +2351,7 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRaw: String =
             val previous = store.readPublicPlatformState()
             val noiseIdentity = store.getOrCreateIdentity { Transport.generateIdentity() }
             val deviceIdentity = store.getOrCreateDeviceIdentity()
+            val awgKeyPair = store.getOrCreatePublicAWGKeyPair { Transport.generateWireGuardKeyPair() }
             val model = deviceModel()
             val nonce = randomNonce()
             val request = JSONObject()
@@ -2366,6 +2367,8 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRaw: String =
                 .put(JSON_IDENTITY_KEY_TYPE, deviceIdentity.keyType)
                 .put(JSON_ENROLLMENT_NONCE, nonce)
                 .put(JSON_CLIENT_VERSION, BuildConfig.VERSION_NAME)
+                .put(JSON_PUBLIC_AWG_PRIVATE_KEY, awgKeyPair.privateKey)
+                .put(JSON_PUBLIC_AWG_PUBLIC_KEY, awgKeyPair.publicKey)
                 .put(JSON_TIMEOUT_SECONDS, PUBLIC_ENROLL_TIMEOUT_SECONDS)
             val response = JSONObject(Transport.publicDeviceEnroll(request.toString()))
             if (!response.optBoolean(JSON_OK, false)) {
@@ -2391,8 +2394,8 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRaw: String =
                 internalIP = response.getString(JSON_INTERNAL_IP),
                 psk2 = response.getString(JSON_PUBLIC_PSK2),
                 serverAWGPublic = response.getString(JSON_PUBLIC_SERVER_AWG_PUBLIC),
-                awgPrivateKey = response.getString(JSON_PUBLIC_AWG_PRIVATE_KEY),
-                awgPublicKey = response.getString(JSON_PUBLIC_AWG_PUBLIC_KEY),
+                awgPrivateKey = response.optString(JSON_PUBLIC_AWG_PRIVATE_KEY).ifBlank { awgKeyPair.privateKey },
+                awgPublicKey = response.optString(JSON_PUBLIC_AWG_PUBLIC_KEY).ifBlank { awgKeyPair.publicKey },
             )
             applyPublicPlatformState(
                 context = context.applicationContext,

@@ -38,6 +38,8 @@ type publicDeviceEnrollAPIRequest struct {
 	IdentityKeyType string `json:"identity_key_type,omitempty"`
 	EnrollmentNonce string `json:"enrollment_nonce,omitempty"`
 	ClientVersion   string `json:"client_version,omitempty"`
+	AWGPrivateKey   string `json:"awg_private_key,omitempty"`
+	AWGPublicKey    string `json:"awg_public_key,omitempty"`
 	TimeoutSeconds  int64  `json:"timeout_seconds,omitempty"`
 }
 
@@ -149,6 +151,16 @@ func PublicDeviceEnroll(requestJSON string) string {
 	return encodePublicDeviceEnrollResult(result)
 }
 
+// GenerateWireGuardKeyPair returns a fresh WireGuard/AmneziaWG keypair as JSON
+// so Android can seal it before public-platform enrollment retries.
+func GenerateWireGuardKeyPair() string {
+	privateKey, publicKey, err := provisionclient.GenerateWireGuardKeyPair()
+	if err != nil {
+		return encodeIdentityResult(identityAPIResult{OK: false, Error: err.Error()})
+	}
+	return encodeIdentityResult(identityAPIResult{OK: true, PrivateKey: privateKey, PublicKey: publicKey})
+}
+
 func ApplyPublicPlatformConfig(requestJSON string) string {
 	var req publicApplyAPIRequest
 	if err := json.Unmarshal([]byte(requestJSON), &req); err != nil {
@@ -166,9 +178,9 @@ func publicDeviceEnroll(req publicDeviceEnrollAPIRequest) (publicDeviceEnrollAPI
 		req.NoisePrivateKey == "" || req.NoisePublicKey == "" || req.IdentityPubKey == "" {
 		return publicDeviceEnrollAPIResult{}, errors.New("public enrollment request is incomplete")
 	}
-	awgPrivate, awgPublic, err := provisionclient.GenerateWireGuardKeyPair()
+	awgPrivate, awgPublic, err := publicEnrollAWGKeyPair(req, provisionclient.GenerateWireGuardKeyPair)
 	if err != nil {
-		return publicDeviceEnrollAPIResult{}, fmt.Errorf("generate awg keypair: %w", err)
+		return publicDeviceEnrollAPIResult{}, err
 	}
 	timeout := publicEnrollTimeout
 	if req.TimeoutSeconds > 0 {
@@ -217,6 +229,25 @@ func publicDeviceEnroll(req publicDeviceEnrollAPIRequest) (publicDeviceEnrollAPI
 		AWGPrivateKey:   awgPrivate,
 		AWGPublicKey:    awgPublic,
 	}, nil
+}
+
+func publicEnrollAWGKeyPair(req publicDeviceEnrollAPIRequest, generate func() (string, string, error)) (string, string, error) {
+	awgPrivate := strings.TrimSpace(req.AWGPrivateKey)
+	awgPublic := strings.TrimSpace(req.AWGPublicKey)
+	if awgPrivate != "" && awgPublic != "" {
+		return awgPrivate, awgPublic, nil
+	}
+	if awgPrivate != "" || awgPublic != "" {
+		return "", "", errors.New("stored awg keypair is incomplete")
+	}
+	generatedPrivate, generatedPublic, err := generate()
+	if err != nil {
+		return "", "", fmt.Errorf("generate awg keypair: %w", err)
+	}
+	if strings.TrimSpace(generatedPrivate) == "" || strings.TrimSpace(generatedPublic) == "" {
+		return "", "", errors.New("generate awg keypair returned empty key")
+	}
+	return generatedPrivate, generatedPublic, nil
 }
 
 func publicNoiseJSONRequest(ctx context.Context, baseURL, serverPublic, clientPrivate, clientPublic, path string, req any, resp any) error {
