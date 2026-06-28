@@ -237,6 +237,12 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
+    fun routeGenerationGuardDropsStaleCallbacks() {
+        assertTrue(shouldAcceptRouteGeneration(callbackGeneration = 3L, currentGeneration = 3L))
+        assertFalse(shouldAcceptRouteGeneration(callbackGeneration = 2L, currentGeneration = 3L))
+    }
+
+    @Test
     fun flappingPriorityRouteDoesNotPromoteBeforeStableDwell() {
         val nowMs = 100_000L
 

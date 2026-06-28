@@ -38,6 +38,7 @@ import java.net.Socket
 import java.net.URL
 import java.util.ArrayDeque
 import java.util.Collections
+import java.util.EnumMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -257,6 +258,9 @@ internal fun shouldRestartInactiveTcpSidecarAfterStall(
 ): Boolean =
     hasStalledUserSession && !hasRecentUserDownlinkProgress && !hasYoungSession
 
+internal fun shouldAcceptRouteGeneration(callbackGeneration: Long, currentGeneration: Long): Boolean =
+    callbackGeneration == currentGeneration
+
 internal fun shouldPromoteRecoveredPriorityRoute(
     inactiveHealthySinceMs: Long,
     lastHealthLostAtMs: Long,
@@ -361,8 +365,9 @@ class AutoTransportService : Service() {
     private val realityTxBytes = AtomicLong(0)
     private val reality2RxBytes = AtomicLong(0)
     private val reality2TxBytes = AtomicLong(0)
-    private val realityGeneration = AtomicLong(0)
-    private val reality2Generation = AtomicLong(0)
+    private val routeRuntimes = EnumMap<Route, RouteRuntime>(Route::class.java).apply {
+        Route.values().forEach { put(it, RouteRuntime()) }
+    }
     private val routeHealthSnapshot = AtomicReference<RouteHealthSnapshot?>(null)
     private val awgRuDemotionLevel = AtomicLong(0)
     private val awgRuRetryAfterElapsedMs = AtomicLong(0)
@@ -2951,17 +2956,19 @@ class AutoTransportService : Service() {
         route: Route,
         forceRestart: Boolean = false,
     ): XrayStartResult {
+        var generation = routeGeneration(route)
         return runCatching {
             val current = xrayProcess(route)
             if (current?.isAlive == true) {
                 if (!forceRestart) return XrayStartResult(started = true)
-                beginRouteStart(route)
+                generation = beginRouteStart(route, forceRestart)
                 stopXraySidecar(route)
             } else {
-                beginRouteStart(route)
+                generation = beginRouteStart(route, forceRestart)
             }
             val xray = File(applicationInfo.nativeLibraryDir, XRAY_LIB_NAME)
             if (!xray.canExecute()) {
+                markRouteProcessStarted(route, generation, started = false, failure = "xray_not_executable")
                 return XrayStartResult(started = false, error = "xray_not_executable", errorKind = "process")
             }
             val configFile = writeXrayConfig(cfg, route)
@@ -2974,14 +2981,19 @@ class AutoTransportService : Service() {
                 .redirectErrorStream(true)
                 .start()
             setXrayProcess(route, process)
-            drainProcessOutput(process)
+            drainProcessOutput(route, generation, process)
             Thread.sleep(XRAY_WARMUP_MS)
             if (process.isAlive) {
+                markRouteProcessStarted(route, generation, started = true)
                 XrayStartResult(started = true)
             } else {
+                markRouteProcessStarted(route, generation, started = false, failure = "xray_process_exited")
                 XrayStartResult(started = false, error = "xray_process_exited", errorKind = "process")
             }
         }.getOrElse { error ->
+            if (generation > 0L) {
+                markRouteProcessStarted(route, generation, started = false, failure = Telemetry.safeErrorMessage(error))
+            }
             XrayStartResult(
                 started = false,
                 error = Telemetry.safeErrorMessage(error),
@@ -3005,21 +3017,114 @@ class AutoTransportService : Service() {
             }
         }
         setXrayProcess(route, null)
+        routeRuntime(route).apply {
+            processState = RouteProcessState.STOPPED
+            listenerReadyAtMs = 0L
+            probeReadyAtMs = 0L
+        }
+        Log.i(LOG_TAG, "route_state route=${routeLabel(route)} gen=${routeGeneration(route)} state=Stopped")
     }
 
-    private fun routeGeneration(route: Route): Long =
-        when (route) {
-            Route.REALITY -> realityGeneration.get()
-            Route.REALITY2 -> reality2Generation.get()
-            Route.AWG_RU, Route.AWG -> 0L
-        }
+    private fun routeRuntime(route: Route): RouteRuntime =
+        routeRuntimes[route] ?: RouteRuntime().also { routeRuntimes[route] = it }
 
-    private fun beginRouteStart(route: Route): Long =
-        when (route) {
-            Route.REALITY -> realityGeneration.incrementAndGet()
-            Route.REALITY2 -> reality2Generation.incrementAndGet()
-            Route.AWG_RU, Route.AWG -> 0L
+    private fun routeGeneration(route: Route): Long =
+        routeRuntime(route).generation
+
+    private fun beginRouteStart(route: Route, forceRestart: Boolean): Long {
+        if (!route.isTcpSidecarRoute()) return 0L
+        val runtime = routeRuntime(route)
+        val nowMs = SystemClock.elapsedRealtime()
+        if (forceRestart) {
+            runtime.processState = RouteProcessState.DRAINING
+            runtime.drainingUntilMs = nowMs + XRAY_STOP_GRACE_MS
+            Log.i(LOG_TAG, "route_state route=${routeLabel(route)} gen=${runtime.generation} state=Draining")
         }
+        runtime.generation += 1
+        runtime.processState = RouteProcessState.STARTING
+        runtime.startingAtMs = nowMs
+        runtime.processStartedAtMs = 0L
+        runtime.listenerReadyAtMs = 0L
+        runtime.probeReadyAtMs = 0L
+        runtime.lastFailure = ""
+        Log.i(LOG_TAG, "route_state route=${routeLabel(route)} gen=${runtime.generation} state=Starting")
+        return runtime.generation
+    }
+
+    private fun markRouteProcessStarted(route: Route, generation: Long, started: Boolean, failure: String = "") {
+        val runtime = routeRuntime(route)
+        if (!shouldAcceptRouteGeneration(generation, runtime.generation)) {
+            Log.i(LOG_TAG, "route_state route=${routeLabel(route)} gen=$generation ignored current=${runtime.generation}")
+            return
+        }
+        if (started) {
+            runtime.processState = RouteProcessState.STARTED
+            runtime.processStartedAtMs = SystemClock.elapsedRealtime()
+            runtime.lastFailure = ""
+            Log.i(
+                LOG_TAG,
+                "route_state route=${routeLabel(route)} gen=$generation state=Started start_ms=${runtime.elapsedSinceStart(runtime.processStartedAtMs)}",
+            )
+        } else {
+            runtime.processState = RouteProcessState.FAILED
+            runtime.lastFailure = failure
+            Log.w(LOG_TAG, "route_state route=${routeLabel(route)} gen=$generation state=Failed err=$failure")
+        }
+    }
+
+    private fun markRouteListenerReady(route: Route, generation: Long, atMs: Long) {
+        val runtime = routeRuntime(route)
+        if (!shouldAcceptRouteGeneration(generation, runtime.generation)) return
+        if (runtime.listenerReadyAtMs == 0L) {
+            runtime.listenerReadyAtMs = atMs
+            Log.i(
+                LOG_TAG,
+                "route_state route=${routeLabel(route)} gen=$generation state=ListenerReady listener_ms=${runtime.elapsedSinceStart(atMs)}",
+            )
+        }
+    }
+
+    private fun markRouteProbeReady(route: Route, generation: Long, atMs: Long) {
+        val runtime = routeRuntime(route)
+        if (!shouldAcceptRouteGeneration(generation, runtime.generation)) return
+        runtime.probeReadyAtMs = atMs
+        if (runtime.processState != RouteProcessState.ACTIVE) {
+            runtime.processState = RouteProcessState.READY
+        }
+        runtime.lastFailure = ""
+        Log.i(
+            LOG_TAG,
+            "route_state route=${routeLabel(route)} gen=$generation state=${runtime.processState.name} probe_ms=${runtime.elapsedSinceStart(atMs)}",
+        )
+    }
+
+    private fun markRouteProbeFailed(route: Route, generation: Long, failure: String) {
+        val runtime = routeRuntime(route)
+        if (!shouldAcceptRouteGeneration(generation, runtime.generation)) return
+        if (runtime.processState != RouteProcessState.DRAINING) {
+            runtime.processState = RouteProcessState.STARTED
+        }
+        runtime.probeReadyAtMs = 0L
+        runtime.lastFailure = failure
+    }
+
+    private fun markRouteActive(route: Route, atMs: Long, probeReady: Boolean = true) {
+        if (!route.isTcpSidecarRoute()) return
+        val runtime = routeRuntime(route)
+        runtime.processState = RouteProcessState.ACTIVE
+        if (probeReady) {
+            runtime.probeReadyAtMs = runtime.probeReadyAtMs.takeIf { it > 0L } ?: atMs
+        }
+        Log.i(LOG_TAG, "route_state route=${routeLabel(route)} gen=${runtime.generation} state=Active")
+    }
+
+    private fun markRouteDraining(route: Route, atMs: Long) {
+        if (!route.isTcpSidecarRoute()) return
+        val runtime = routeRuntime(route)
+        runtime.processState = RouteProcessState.DRAINING
+        runtime.drainingUntilMs = atMs + XRAY_STOP_GRACE_MS
+        Log.i(LOG_TAG, "route_state route=${routeLabel(route)} gen=${runtime.generation} state=Draining")
+    }
 
     private fun setAppliedReality2Uuid(uuid: String) {
         val normalized = uuid.trim()
@@ -3854,11 +3959,21 @@ class AutoTransportService : Service() {
         )
     }
 
-    private fun drainProcessOutput(process: Process) {
+    private fun drainProcessOutput(route: Route, generation: Long, process: Process) {
         Thread {
             runCatching {
                 process.inputStream.bufferedReader().useLines { lines ->
                     lines.forEach { _ -> }
+                }
+                val runtime = routeRuntime(route)
+                if (
+                    shouldAcceptRouteGeneration(generation, runtime.generation) &&
+                    xrayProcess(route) === process &&
+                    runtime.processState !in setOf(RouteProcessState.STOPPED, RouteProcessState.DRAINING)
+                ) {
+                    runtime.processState = RouteProcessState.FAILED
+                    runtime.lastFailure = "process_output_closed"
+                    Log.w(LOG_TAG, "route_state route=${routeLabel(route)} gen=$generation state=Failed err=process_output_closed")
                 }
             }
         }.apply {
@@ -3903,6 +4018,33 @@ class AutoTransportService : Service() {
         AWG,
         REALITY,
         REALITY2,
+    }
+
+    private fun Route.isTcpSidecarRoute(): Boolean =
+        this == Route.REALITY || this == Route.REALITY2
+
+    private enum class RouteProcessState {
+        STOPPED,
+        STARTING,
+        STARTED,
+        READY,
+        ACTIVE,
+        DRAINING,
+        FAILED,
+    }
+
+    private data class RouteRuntime(
+        var generation: Long = 0L,
+        var processState: RouteProcessState = RouteProcessState.STOPPED,
+        var startingAtMs: Long = 0L,
+        var processStartedAtMs: Long = 0L,
+        var listenerReadyAtMs: Long = 0L,
+        var probeReadyAtMs: Long = 0L,
+        var drainingUntilMs: Long = 0L,
+        var lastFailure: String = "",
+    ) {
+        fun elapsedSinceStart(atMs: Long): Long =
+            if (startingAtMs > 0L && atMs >= startingAtMs) atMs - startingAtMs else 0L
     }
 
     private enum class NetworkEvent(val logText: String, val marksTunnelDisruption: Boolean = false) {
