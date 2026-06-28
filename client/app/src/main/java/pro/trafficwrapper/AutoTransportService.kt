@@ -219,6 +219,31 @@ internal fun shouldTreatTcpUserSessionAsStalled(
         nowMs - createdAtMs > connectGraceMs &&
         nowMs - lastUplinkProgressAtMs >= txIdleThresholdMs
 
+internal fun shouldEvaluateTcpRxStall(
+    hasRecentUserTraffic: Boolean,
+    hasStalledUserSession: Boolean,
+    aggregateStalled: Boolean,
+): Boolean =
+    hasStalledUserSession || (hasRecentUserTraffic && aggregateStalled)
+
+internal fun shouldTreatTcpRxAsStalled(
+    pendingSinceMs: Long,
+    pendingBytes: Long,
+    txIdleMs: Long,
+    nowMs: Long,
+    hasRecentSessionRx: Boolean,
+    hasConnectingSession: Boolean,
+    minPendingBytes: Long,
+    stallMs: Long,
+    txIdleThresholdMs: Long,
+): Boolean =
+    pendingSinceMs > 0L &&
+        pendingBytes >= minPendingBytes &&
+        nowMs - pendingSinceMs >= stallMs &&
+        txIdleMs >= txIdleThresholdMs &&
+        !hasRecentSessionRx &&
+        !hasConnectingSession
+
 internal fun shouldPromoteRecoveredPriorityRoute(
     inactiveHealthySinceMs: Long,
     lastHealthLostAtMs: Long,
@@ -296,6 +321,10 @@ internal const val STABLE_IDLE_PROBE_INTERVAL_MS = 8_000L
 internal const val STABLE_IDLE_RX_AGE_MS = 8_000L
 internal const val STABLE_TRAFFIC_MAX_AGE_SECONDS = 30L
 internal const val STABLE_TRAFFIC_MAX_AGE_MS = STABLE_TRAFFIC_MAX_AGE_SECONDS * 1000L
+internal const val REALITY_RX_STALL_MS = 12_000L
+internal const val REALITY_RX_STALL_MIN_TX_BYTES = 256L
+internal const val REALITY_RX_STALL_TX_IDLE_MS = 10_000L
+internal const val REALITY_CONNECT_GRACE_MS = 10_000L
 internal const val TCP_PRIORITY_PROMOTE_DWELL_MS = 45_000L
 internal const val TCP_ROUTE_FLAP_WINDOW_MS = 2 * 60 * 1000L
 internal const val TCP_ROUTE_FLAP_THRESHOLD = 3
@@ -519,6 +548,9 @@ class AutoTransportService : Service() {
             val routeLastHealthyAtMs = mutableMapOf<Route, Long>()
             val tcpRouteHealthLostEvents = mutableMapOf<Route, ArrayDeque<Long>>()
             val tcpRouteFlapDemotedUntilMs = mutableMapOf<Route, Long>()
+            val tcpPendingTxSinceMs = mutableMapOf<Route, Long>()
+            val tcpPendingTxStartBytes = mutableMapOf<Route, Long>()
+            val tcpLastTxProgressAtMs = mutableMapOf<Route, Long>()
             fun markTunnelDisruption(atMs: Long, reason: String) {
                 if (atMs <= lastTunnelDisruptionAtMs) return
                 lastTunnelDisruptionAtMs = atMs
@@ -668,6 +700,88 @@ class AutoTransportService : Service() {
                     Route.AWG -> isRecent(atMs, lastAwgRxProgressAtMs, RX_FRESH_FOR_USABLE_MS)
                     else -> false
                 }
+            fun clearTcpPending(route: Route, currentTx: Long) {
+                if (!isTcpRoute(route)) return
+                tcpPendingTxSinceMs[route] = 0L
+                tcpPendingTxStartBytes[route] = currentTx
+                tcpLastTxProgressAtMs[route] = 0L
+            }
+            fun resetTcpStallState(route: Route, currentTx: Long) {
+                if (!isTcpRoute(route)) return
+                clearTcpPending(route, currentTx)
+            }
+            fun observeTcpCounters(
+                route: Route,
+                previousRx: Long,
+                currentRx: Long,
+                previousTx: Long,
+                currentTx: Long,
+                atMs: Long,
+            ) {
+                if (!isTcpRoute(route)) return
+                if (currentRx > previousRx) {
+                    clearTcpPending(route, currentTx)
+                }
+                if (currentTx > previousTx) {
+                    tcpLastTxProgressAtMs[route] = atMs
+                    if ((tcpPendingTxSinceMs[route] ?: 0L) == 0L) {
+                        tcpPendingTxSinceMs[route] = atMs
+                        tcpPendingTxStartBytes[route] = previousTx
+                    }
+                }
+            }
+            fun tcpPendingAgeMs(route: Route, atMs: Long): Long {
+                val pendingSince = tcpPendingTxSinceMs[route] ?: 0L
+                return if (pendingSince > 0L) atMs - pendingSince else 0L
+            }
+            fun tcpPendingBytes(route: Route, currentTx: Long): Long =
+                (currentTx - (tcpPendingTxStartBytes[route] ?: currentTx)).coerceAtLeast(0L)
+            fun tcpTxIdleMs(route: Route, atMs: Long): Long {
+                val lastProgressAt = tcpLastTxProgressAtMs[route] ?: 0L
+                return if (lastProgressAt > 0L) atMs - lastProgressAt else Long.MAX_VALUE
+            }
+            fun tcpUserSessionStalled(route: Route, atMs: Long): Boolean {
+                val upstreamPort = routePort(route)
+                return router?.hasStalledUserSession(
+                    upstreamPort = upstreamPort,
+                    nowMs = atMs,
+                    minUpBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                    stallMs = REALITY_RX_STALL_MS,
+                    txIdleThresholdMs = REALITY_RX_STALL_TX_IDLE_MS,
+                    connectGraceMs = REALITY_CONNECT_GRACE_MS,
+                ) == true
+            }
+            fun tcpRxStalled(route: Route, currentTx: Long, atMs: Long): Boolean {
+                val upstreamPort = routePort(route)
+                val stalledUserSession = tcpUserSessionStalled(route, atMs)
+                val aggregateStalled = shouldTreatTcpRxAsStalled(
+                    pendingSinceMs = tcpPendingTxSinceMs[route] ?: 0L,
+                    pendingBytes = tcpPendingBytes(route, currentTx),
+                    txIdleMs = tcpTxIdleMs(route, atMs),
+                    nowMs = atMs,
+                    hasRecentSessionRx = router?.hasRecentUserDownlinkProgress(
+                        upstreamPort = upstreamPort,
+                        nowMs = atMs,
+                        maxAgeMs = REALITY_RX_STALL_MS,
+                    ) == true,
+                    hasConnectingSession = router?.hasYoungSession(
+                        upstreamPort = upstreamPort,
+                        nowMs = atMs,
+                        maxAgeMs = REALITY_CONNECT_GRACE_MS,
+                    ) == true,
+                    minPendingBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                    stallMs = REALITY_RX_STALL_MS,
+                    txIdleThresholdMs = REALITY_RX_STALL_TX_IDLE_MS,
+                )
+                return shouldEvaluateTcpRxStall(
+                    hasRecentUserTraffic = router?.hasRecentUserTraffic(
+                        nowMs = atMs,
+                        maxAgeMs = STABLE_TRAFFIC_MAX_AGE_MS,
+                    ) == true,
+                    hasStalledUserSession = stalledUserSession,
+                    aggregateStalled = aggregateStalled,
+                )
+            }
             fun awgLocallyHealthy(route: Route, probe: AWGProbeResult, atMs: Long): Boolean =
                 probe.handshakeEstablished && awgLocalRxFresh(route, atMs)
             val clock = checkClock()
@@ -1213,6 +1327,14 @@ class AutoTransportService : Service() {
                     }
                     val currentRealityRx = realityRxBytes.get()
                     val currentRealityTx = realityTxBytes.get()
+                    observeTcpCounters(
+                        route = Route.REALITY,
+                        previousRx = lastRealityRx,
+                        currentRx = currentRealityRx,
+                        previousTx = lastRealityTx,
+                        currentTx = currentRealityTx,
+                        atMs = nowMs,
+                    )
                     if (currentRealityRx > lastRealityRx) {
                         lastTrafficAtMs = nowMs
                         lastRealityRxProgressAtMs = nowMs
@@ -1223,6 +1345,14 @@ class AutoTransportService : Service() {
                     }
                     val currentReality2Rx = reality2RxBytes.get()
                     val currentReality2Tx = reality2TxBytes.get()
+                    observeTcpCounters(
+                        route = Route.REALITY2,
+                        previousRx = lastReality2Rx,
+                        currentRx = currentReality2Rx,
+                        previousTx = lastReality2Tx,
+                        currentTx = currentReality2Tx,
+                        atMs = nowMs,
+                    )
                     if (currentReality2Rx > lastReality2Rx) {
                         lastTrafficAtMs = nowMs
                         lastReality2RxProgressAtMs = nowMs
@@ -1243,7 +1373,8 @@ class AutoTransportService : Service() {
                         lastRealityProbeAtMs = nowMs
                     }
                     val realityProbe = if (xrayStarted) cachedRealityProbe else RealityProbeResult(false)
-                    val realityHealthy = xrayStarted && realityProbe.healthy
+                    val realityRxStalled = tcpRxStalled(Route.REALITY, currentRealityTx, nowMs)
+                    val realityHealthy = xrayStarted && realityProbe.healthy && !realityRxStalled
                     if (xray2Started && shouldProbeReality(
                             nowMs = nowMs,
                             lastProbeAtMs = lastReality2ProbeAtMs,
@@ -1256,7 +1387,8 @@ class AutoTransportService : Service() {
                         lastReality2ProbeAtMs = nowMs
                     }
                     val reality2Probe = if (xray2Started) cachedReality2Probe else RealityProbeResult(false)
-                    val reality2Healthy = xray2Started && reality2Probe.healthy
+                    val reality2RxStalled = tcpRxStalled(Route.REALITY2, currentReality2Tx, nowMs)
+                    val reality2Healthy = xray2Started && reality2Probe.healthy && !reality2RxStalled
                     if (activeRoute == Route.REALITY && realityHealthy) {
                         outboundIp = realityProbe.outboundIp
                         lastTrafficAtMs = nowMs
@@ -1273,6 +1405,7 @@ class AutoTransportService : Service() {
                             "rl_tcp_ok" to false,
                             "rl_carry" to false,
                             "rl_tcp_err" to realityProbe.tcpError,
+                            "rl_rx_stall" to realityRxStalled,
                             "rl_rx" to currentRealityRx,
                             "rl_tx" to currentRealityTx,
                             "backoff_ms" to reconnectBackoffMs,
@@ -1286,6 +1419,7 @@ class AutoTransportService : Service() {
                             "rl2_alive" to (xray2Process?.isAlive == true),
                             "rl2_carry" to false,
                             "rl2_err" to reality2Probe.tcpError,
+                            "rl2_rx_stall" to reality2RxStalled,
                             "rl2_rx" to currentReality2Rx,
                             "rl2_tx" to currentReality2Tx,
                             "backoff_ms" to reconnectBackoffMs,

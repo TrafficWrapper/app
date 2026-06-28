@@ -80,6 +80,124 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
+    fun tcpRxStallRequiresFrozenSessionWithoutRecentRxOrConnect() {
+        val nowMs = 100_000L
+
+        assertTrue(
+            shouldTreatTcpRxAsStalled(
+                pendingSinceMs = nowMs - REALITY_RX_STALL_MS,
+                pendingBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                txIdleMs = REALITY_RX_STALL_TX_IDLE_MS,
+                nowMs = nowMs,
+                hasRecentSessionRx = false,
+                hasConnectingSession = false,
+                minPendingBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                stallMs = REALITY_RX_STALL_MS,
+                txIdleThresholdMs = REALITY_RX_STALL_TX_IDLE_MS,
+            ),
+        )
+        assertFalse(
+            shouldTreatTcpRxAsStalled(
+                pendingSinceMs = nowMs - REALITY_RX_STALL_MS,
+                pendingBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                txIdleMs = REALITY_RX_STALL_TX_IDLE_MS,
+                nowMs = nowMs,
+                hasRecentSessionRx = true,
+                hasConnectingSession = false,
+                minPendingBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                stallMs = REALITY_RX_STALL_MS,
+                txIdleThresholdMs = REALITY_RX_STALL_TX_IDLE_MS,
+            ),
+        )
+        assertFalse(
+            shouldTreatTcpRxAsStalled(
+                pendingSinceMs = nowMs - REALITY_RX_STALL_MS,
+                pendingBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                txIdleMs = 1_000L,
+                nowMs = nowMs,
+                hasRecentSessionRx = false,
+                hasConnectingSession = false,
+                minPendingBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                stallMs = REALITY_RX_STALL_MS,
+                txIdleThresholdMs = REALITY_RX_STALL_TX_IDLE_MS,
+            ),
+        )
+    }
+
+    @Test
+    fun tcpRxStallIdleAggregateDoesNotDemoteWithoutUserTraffic() {
+        assertFalse(
+            shouldEvaluateTcpRxStall(
+                hasRecentUserTraffic = false,
+                hasStalledUserSession = false,
+                aggregateStalled = true,
+            ),
+        )
+        assertTrue(
+            shouldEvaluateTcpRxStall(
+                hasRecentUserTraffic = true,
+                hasStalledUserSession = false,
+                aggregateStalled = true,
+            ),
+        )
+        assertTrue(
+            shouldEvaluateTcpRxStall(
+                hasRecentUserTraffic = false,
+                hasStalledUserSession = true,
+                aggregateStalled = false,
+            ),
+        )
+    }
+
+    @Test
+    fun tcpUserSessionStallIgnoresHealthProbeAndActiveUpload() {
+        val nowMs = 100_000L
+
+        assertTrue(
+            shouldTreatTcpUserSessionAsStalled(
+                createdAtMs = nowMs - REALITY_RX_STALL_MS,
+                upBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                downBytes = 0L,
+                lastUplinkProgressAtMs = nowMs - REALITY_RX_STALL_TX_IDLE_MS,
+                nowMs = nowMs,
+                isHealthProbe = false,
+                minUpBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                stallMs = REALITY_RX_STALL_MS,
+                txIdleThresholdMs = REALITY_RX_STALL_TX_IDLE_MS,
+                connectGraceMs = REALITY_CONNECT_GRACE_MS,
+            ),
+        )
+        assertFalse(
+            shouldTreatTcpUserSessionAsStalled(
+                createdAtMs = nowMs - REALITY_RX_STALL_MS,
+                upBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                downBytes = 0L,
+                lastUplinkProgressAtMs = nowMs - REALITY_RX_STALL_TX_IDLE_MS,
+                nowMs = nowMs,
+                isHealthProbe = true,
+                minUpBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                stallMs = REALITY_RX_STALL_MS,
+                txIdleThresholdMs = REALITY_RX_STALL_TX_IDLE_MS,
+                connectGraceMs = REALITY_CONNECT_GRACE_MS,
+            ),
+        )
+        assertFalse(
+            shouldTreatTcpUserSessionAsStalled(
+                createdAtMs = nowMs - REALITY_RX_STALL_MS,
+                upBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                downBytes = 0L,
+                lastUplinkProgressAtMs = nowMs - 1_000L,
+                nowMs = nowMs,
+                isHealthProbe = false,
+                minUpBytes = REALITY_RX_STALL_MIN_TX_BYTES,
+                stallMs = REALITY_RX_STALL_MS,
+                txIdleThresholdMs = REALITY_RX_STALL_TX_IDLE_MS,
+                connectGraceMs = REALITY_CONNECT_GRACE_MS,
+            ),
+        )
+    }
+
+    @Test
     fun flappingPriorityRouteDoesNotPromoteBeforeStableDwell() {
         val nowMs = 100_000L
 
