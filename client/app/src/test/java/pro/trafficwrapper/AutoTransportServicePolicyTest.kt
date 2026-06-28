@@ -279,6 +279,78 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
+    fun crossRouteGuardDropsStalePreparedCommit() {
+        assertTrue(
+            shouldCommitPreparedRoute(
+                requestIdAtStart = 7L,
+                currentRequestId = 7L,
+                modeAtStart = TransportChoice.AUTO,
+                currentMode = TransportChoice.AUTO,
+                targetRoute = "REALITY2",
+                preparedRoute = "REALITY2",
+            ),
+        )
+        assertFalse(
+            shouldCommitPreparedRoute(
+                requestIdAtStart = 7L,
+                currentRequestId = 8L,
+                modeAtStart = TransportChoice.AUTO,
+                currentMode = TransportChoice.AUTO,
+                targetRoute = "REALITY2",
+                preparedRoute = "REALITY2",
+            ),
+        )
+        assertFalse(
+            shouldCommitPreparedRoute(
+                requestIdAtStart = 7L,
+                currentRequestId = 7L,
+                modeAtStart = TransportChoice.AUTO,
+                currentMode = TransportChoice.REALITY,
+                targetRoute = "REALITY2",
+                preparedRoute = "REALITY2",
+            ),
+        )
+        assertFalse(
+            shouldCommitPreparedRoute(
+                requestIdAtStart = 7L,
+                currentRequestId = 7L,
+                modeAtStart = TransportChoice.AUTO,
+                currentMode = TransportChoice.AUTO,
+                targetRoute = "REALITY2",
+                preparedRoute = "AWG",
+            ),
+        )
+    }
+
+    @Test
+    fun generationScopedCloseMatchesOnlySamePortAndGeneration() {
+        assertTrue(
+            shouldCloseSessionForRouteGeneration(
+                sessionUpstreamPort = 18081,
+                sessionGeneration = 3L,
+                upstreamPort = 18081,
+                generation = 3L,
+            ),
+        )
+        assertFalse(
+            shouldCloseSessionForRouteGeneration(
+                sessionUpstreamPort = 18081,
+                sessionGeneration = 4L,
+                upstreamPort = 18081,
+                generation = 3L,
+            ),
+        )
+        assertFalse(
+            shouldCloseSessionForRouteGeneration(
+                sessionUpstreamPort = 18083,
+                sessionGeneration = 3L,
+                upstreamPort = 18081,
+                generation = 3L,
+            ),
+        )
+    }
+
+    @Test
     fun flappingPriorityRouteDoesNotPromoteBeforeStableDwell() {
         val nowMs = 100_000L
 

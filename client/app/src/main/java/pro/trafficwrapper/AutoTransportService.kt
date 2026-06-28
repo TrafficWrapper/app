@@ -269,6 +269,26 @@ internal fun shouldCommitReadyRoute(
 ): Boolean =
     routeAvailable && if (requireProbeReady) probeReady else listenerReady
 
+internal fun <T> shouldCommitPreparedRoute(
+    requestIdAtStart: Long,
+    currentRequestId: Long,
+    modeAtStart: TransportChoice,
+    currentMode: TransportChoice,
+    targetRoute: T,
+    preparedRoute: T,
+): Boolean =
+    requestIdAtStart == currentRequestId &&
+        modeAtStart == currentMode &&
+        targetRoute == preparedRoute
+
+internal fun shouldCloseSessionForRouteGeneration(
+    sessionUpstreamPort: Int,
+    sessionGeneration: Long,
+    upstreamPort: Int,
+    generation: Long,
+): Boolean =
+    sessionUpstreamPort == upstreamPort && sessionGeneration == generation
+
 internal fun shouldPromoteRecoveredPriorityRoute(
     inactiveHealthySinceMs: Long,
     lastHealthLostAtMs: Long,
@@ -410,6 +430,8 @@ class AutoTransportService : Service() {
     @Volatile
     private var router: SocksRouter? = null
 
+    private val routeSwitchRequestId = AtomicLong(0)
+
     @Volatile
     private var httpProxy: LocalHttpProxy? = null
 
@@ -440,6 +462,7 @@ class AutoTransportService : Service() {
         requestedMode = intent?.getStringExtra(EXTRA_MODE)
             ?.let { runCatching { TransportChoice.valueOf(it) }.getOrNull() }
             ?: TransportLifecycleStore.preferredMode(this)
+        routeSwitchRequestId.incrementAndGet()
         if (action == ACTION_HTTP_PROXY_CHANGED) {
             if (workerActive.get()) {
                 applyHttpProxyPreference()
@@ -766,6 +789,12 @@ class AutoTransportService : Service() {
             }
             fun tcpPendingBytes(route: Route, currentTx: Long): Long =
                 (currentTx - (tcpPendingTxStartBytes[route] ?: currentTx)).coerceAtLeast(0L)
+            fun currentTcpTx(route: Route): Long =
+                when (route) {
+                    Route.REALITY -> realityTxBytes.get()
+                    Route.REALITY2 -> reality2TxBytes.get()
+                    Route.AWG_RU, Route.AWG -> 0L
+                }
             fun tcpTxIdleMs(route: Route, atMs: Long): Long {
                 val lastProgressAt = tcpLastTxProgressAtMs[route] ?: 0L
                 return if (lastProgressAt > 0L) atMs - lastProgressAt else Long.MAX_VALUE
@@ -1154,6 +1183,7 @@ class AutoTransportService : Service() {
                     val previousAwgRuHandshakeEstablished = lastAwgRuHandshakeEstablished
                     val previousAwgHandshakeEstablished = lastAwgHandshakeEstablished
                     val mode = requestedMode
+                    val requestId = routeSwitchRequestId.get()
                     if (
                         reality2Config?.isComplete() == true &&
                         shouldRestartReality2ForUuid(
@@ -2172,6 +2202,21 @@ class AutoTransportService : Service() {
                             )
                             continue
                         }
+                        if (!shouldCommitPreparedRoute(
+                                requestIdAtStart = requestId,
+                                currentRequestId = routeSwitchRequestId.get(),
+                                modeAtStart = mode,
+                                currentMode = requestedMode,
+                                targetRoute = guardedRoute,
+                                preparedRoute = guardedRoute,
+                            )
+                        ) {
+                            Log.i(
+                                LOG_TAG,
+                                "route_state rsn=target_mismatch_drop request=$requestId current_request=${routeSwitchRequestId.get()} mode=${mode.name} current_mode=${requestedMode.name} target=${routeLabel(guardedRoute)}",
+                            )
+                            continue
+                        }
                         var demotion: AwgDemotion? = null
                         if (
                             mode == TransportChoice.AUTO &&
@@ -2194,6 +2239,12 @@ class AutoTransportService : Service() {
                         if (guardedReason == ROUTE_REASON_PRIORITY_RECOVERED) {
                             lastPriorityRecoveredSwitchAtMs = nowMs
                         }
+                        val previousGeneration = routeGeneration(previousRoute)
+                        val targetPreviousGeneration = routeGeneration(guardedRoute)
+                        resetTcpStallState(previousRoute, currentTcpTx(previousRoute))
+                        resetTcpStallState(guardedRoute, currentTcpTx(guardedRoute))
+                        markRouteDraining(previousRoute, nowMs)
+                        bumpRouteCommitGeneration(guardedRoute, nowMs, probeReady = requireProbeReady)
                         activeRoute = setRoute(
                             route = guardedRoute,
                             mode = mode,
@@ -2212,7 +2263,16 @@ class AutoTransportService : Service() {
                             },
                         )
                         markRouteActive(activeRoute, nowMs, probeReady = requireProbeReady)
-                        Log.i(LOG_TAG, "route switch is non-destructive rsn=$switchReason")
+                        val closedOldGeneration = router?.closeSessionsForRouteGeneration(routePort(previousRoute), previousGeneration) ?: 0
+                        val closedTargetOldGeneration = if (guardedRoute != previousRoute) {
+                            router?.closeSessionsForRouteGeneration(routePort(guardedRoute), targetPreviousGeneration) ?: 0
+                        } else {
+                            0
+                        }
+                        Log.i(
+                            LOG_TAG,
+                            "route switch is non-destructive rsn=$switchReason old_gen=$previousGeneration target_old_gen=$targetPreviousGeneration closed_old=$closedOldGeneration closed_target_old=$closedTargetOldGeneration",
+                        )
                         outboundIp = when (activeRoute) {
                             Route.REALITY -> realityProbe.outboundIp.takeIf { realityHealthy }.orEmpty()
                             Route.REALITY2 -> reality2Probe.outboundIp.takeIf { reality2Healthy }.orEmpty()
@@ -2246,6 +2306,9 @@ class AutoTransportService : Service() {
                             "rl_carry" to realityHealthy,
                             "rl2_carry" to reality2Healthy,
                             "route_cd_s" to routeCooldownDelaySeconds(activeRoute, nowMs),
+                            "old_generation" to previousGeneration,
+                            "generation" to routeGeneration(activeRoute),
+                            "sess_closed" to (closedOldGeneration + closedTargetOldGeneration),
                         )
                     }
                     val routeHealthy = routeHealthy(
@@ -3206,6 +3269,19 @@ class AutoTransportService : Service() {
             runtime.probeReadyAtMs = runtime.probeReadyAtMs.takeIf { it > 0L } ?: atMs
         }
         Log.i(LOG_TAG, "route_state route=${routeLabel(route)} gen=${runtime.generation} state=Active")
+    }
+
+    private fun bumpRouteCommitGeneration(route: Route, atMs: Long, probeReady: Boolean): Long {
+        if (!route.isTcpSidecarRoute()) return routeGeneration(route)
+        val runtime = routeRuntime(route)
+        runtime.generation += 1
+        runtime.processState = RouteProcessState.ACTIVE
+        runtime.listenerReadyAtMs = runtime.listenerReadyAtMs.takeIf { it > 0L } ?: atMs
+        if (probeReady) {
+            runtime.probeReadyAtMs = runtime.probeReadyAtMs.takeIf { it > 0L } ?: atMs
+        }
+        Log.i(LOG_TAG, "route_state route=${routeLabel(route)} gen=${runtime.generation} state=Commit")
+        return runtime.generation
     }
 
     private fun markRouteDraining(route: Route, atMs: Long) {
@@ -4412,7 +4488,14 @@ class AutoTransportService : Service() {
         fun closeSessionsForRouteGeneration(upstreamPort: Int, generation: Long): Int {
             val snapshot = synchronized(sessions) {
                 sessions
-                    .filterValues { it.upstreamPort == upstreamPort && it.upstreamGeneration == generation }
+                    .filterValues {
+                        shouldCloseSessionForRouteGeneration(
+                            sessionUpstreamPort = it.upstreamPort,
+                            sessionGeneration = it.upstreamGeneration,
+                            upstreamPort = upstreamPort,
+                            generation = generation,
+                        )
+                    }
                     .map { it.key }
             }
             var closed = 0
