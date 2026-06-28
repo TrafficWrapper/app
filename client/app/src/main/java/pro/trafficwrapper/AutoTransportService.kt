@@ -143,6 +143,82 @@ internal fun socksConnectAddressPolicy(atyp: Int): SocksConnectAddressPolicy =
         SocksConnectAddressPolicy(openUpstream = true)
     }
 
+internal enum class TcpPipeDirection {
+    UP,
+    DOWN,
+}
+
+internal class TrackedSocket(val createdAtMs: Long) {
+    @Volatile
+    var upstreamPort: Int = 0
+    @Volatile
+    var upstreamGeneration: Long = 0
+    @Volatile
+    var isHealthProbe: Boolean = false
+    val upBytes = AtomicLong(0)
+    val downBytes = AtomicLong(0)
+    val lastUplinkProgressAtMs = AtomicLong(0)
+    val lastDownlinkProgressAtMs = AtomicLong(0)
+}
+
+internal fun recordTrackedSocketProgress(
+    tracked: TrackedSocket,
+    bytes: Long,
+    direction: TcpPipeDirection,
+    nowMs: Long,
+): Boolean {
+    if (bytes <= 0L) return false
+    when (direction) {
+        TcpPipeDirection.DOWN -> {
+            tracked.downBytes.addAndGet(bytes)
+            tracked.lastDownlinkProgressAtMs.set(nowMs)
+        }
+        TcpPipeDirection.UP -> {
+            tracked.upBytes.addAndGet(bytes)
+            tracked.lastUplinkProgressAtMs.set(nowMs)
+        }
+    }
+    return !tracked.isHealthProbe
+}
+
+internal fun isHealthProbeDestination(destination: String, outboundUrl: String): Boolean {
+    val uri = runCatching { URI(outboundUrl) }.getOrNull() ?: return false
+    val expectedHost = uri.host?.trim()?.takeIf { it.isNotBlank() } ?: return false
+    val expectedPort = when {
+        uri.port > 0 -> uri.port
+        uri.scheme.equals("http", ignoreCase = true) -> 80
+        else -> 443
+    }
+    val trimmed = destination.trim()
+    val port = trimmed.substringAfterLast(':', "").toIntOrNull() ?: return false
+    val host = if (trimmed.startsWith("[")) {
+        trimmed.substringAfter('[').substringBefore(']')
+    } else {
+        trimmed.substringBeforeLast(':')
+    }
+    return port == expectedPort && host.equals(expectedHost, ignoreCase = true)
+}
+
+internal fun shouldTreatTcpUserSessionAsStalled(
+    createdAtMs: Long,
+    upBytes: Long,
+    downBytes: Long,
+    lastUplinkProgressAtMs: Long,
+    nowMs: Long,
+    isHealthProbe: Boolean,
+    minUpBytes: Long,
+    stallMs: Long,
+    txIdleThresholdMs: Long,
+    connectGraceMs: Long,
+): Boolean =
+    !isHealthProbe &&
+        upBytes >= minUpBytes &&
+        downBytes == 0L &&
+        lastUplinkProgressAtMs > 0L &&
+        nowMs - createdAtMs >= stallMs &&
+        nowMs - createdAtMs > connectGraceMs &&
+        nowMs - lastUplinkProgressAtMs >= txIdleThresholdMs
+
 internal fun shouldPromoteRecoveredPriorityRoute(
     inactiveHealthySinceMs: Long,
     lastHealthLostAtMs: Long,
@@ -242,6 +318,8 @@ class AutoTransportService : Service() {
     private val realityTxBytes = AtomicLong(0)
     private val reality2RxBytes = AtomicLong(0)
     private val reality2TxBytes = AtomicLong(0)
+    private val realityGeneration = AtomicLong(0)
+    private val reality2Generation = AtomicLong(0)
     private val routeHealthSnapshot = AtomicReference<RouteHealthSnapshot?>(null)
     private val awgRuDemotionLevel = AtomicLong(0)
     private val awgRuRetryAfterElapsedMs = AtomicLong(0)
@@ -2616,7 +2694,10 @@ class AutoTransportService : Service() {
             val current = xrayProcess(route)
             if (current?.isAlive == true) {
                 if (!forceRestart) return XrayStartResult(started = true)
+                beginRouteStart(route)
                 stopXraySidecar(route)
+            } else {
+                beginRouteStart(route)
             }
             val xray = File(applicationInfo.nativeLibraryDir, XRAY_LIB_NAME)
             if (!xray.canExecute()) {
@@ -2664,6 +2745,20 @@ class AutoTransportService : Service() {
         }
         setXrayProcess(route, null)
     }
+
+    private fun routeGeneration(route: Route): Long =
+        when (route) {
+            Route.REALITY -> realityGeneration.get()
+            Route.REALITY2 -> reality2Generation.get()
+            Route.AWG_RU, Route.AWG -> 0L
+        }
+
+    private fun beginRouteStart(route: Route): Long =
+        when (route) {
+            Route.REALITY -> realityGeneration.incrementAndGet()
+            Route.REALITY2 -> reality2Generation.incrementAndGet()
+            Route.AWG_RU, Route.AWG -> 0L
+        }
 
     private fun setAppliedReality2Uuid(uuid: String) {
         val normalized = uuid.trim()
@@ -2985,7 +3080,7 @@ class AutoTransportService : Service() {
                 Route.AWG -> AWG_UPSTREAM
                 Route.REALITY -> REALITY_UPSTREAM
                 Route.REALITY2 -> REALITY2_UPSTREAM
-            },
+            }.withGeneration(routeGeneration(selected)),
         )
         Log.i(LOG_TAG, "route switched to $selected")
         return selected
@@ -3558,7 +3653,10 @@ class AutoTransportService : Service() {
         BACKSTOP_ALARM("backstop alarm"),
     }
 
-    private data class Upstream(val host: String, val port: Int)
+    private data class Upstream(val host: String, val port: Int, val generation: Long = 0)
+
+    private fun Upstream.withGeneration(generation: Long): Upstream =
+        if (this.generation == generation) this else copy(generation = generation)
 
     private data class RouteCounters(val rx: AtomicLong, val tx: AtomicLong)
 
@@ -3615,6 +3713,7 @@ class AutoTransportService : Service() {
         private val ioPool = Executors.newCachedThreadPool()
         private val activeSessionCount = AtomicLong(0)
         private val sessions = Collections.synchronizedMap(mutableMapOf<Socket, TrackedSocket>())
+        private val lastUserTrafficAtMs = AtomicLong(0)
         private val nextSessionID = AtomicLong(1)
 
         @Volatile
@@ -3683,6 +3782,67 @@ class AutoTransportService : Service() {
             return closed
         }
 
+        fun closeSessionsForRouteGeneration(upstreamPort: Int, generation: Long): Int {
+            val snapshot = synchronized(sessions) {
+                sessions
+                    .filterValues { it.upstreamPort == upstreamPort && it.upstreamGeneration == generation }
+                    .map { it.key }
+            }
+            var closed = 0
+            snapshot.forEach { socket ->
+                if (runCatching { socket.close() }.isSuccess) {
+                    closed++
+                }
+            }
+            return closed
+        }
+
+        fun hasRecentUserDownlinkProgress(upstreamPort: Int, nowMs: Long, maxAgeMs: Long): Boolean =
+            trackedSessionsFor(upstreamPort).any { tracked ->
+                val lastRx = tracked.lastDownlinkProgressAtMs.get()
+                !tracked.isHealthProbe && lastRx > 0L && nowMs - lastRx in 0..maxAgeMs
+            }
+
+        fun hasStalledUserSession(
+            upstreamPort: Int,
+            nowMs: Long,
+            minUpBytes: Long,
+            stallMs: Long,
+            txIdleThresholdMs: Long,
+            connectGraceMs: Long,
+        ): Boolean =
+            trackedSessionsFor(upstreamPort).any { tracked ->
+                shouldTreatTcpUserSessionAsStalled(
+                    createdAtMs = tracked.createdAtMs,
+                    upBytes = tracked.upBytes.get(),
+                    downBytes = tracked.downBytes.get(),
+                    lastUplinkProgressAtMs = tracked.lastUplinkProgressAtMs.get(),
+                    nowMs = nowMs,
+                    isHealthProbe = tracked.isHealthProbe,
+                    minUpBytes = minUpBytes,
+                    stallMs = stallMs,
+                    txIdleThresholdMs = txIdleThresholdMs,
+                    connectGraceMs = connectGraceMs,
+                )
+            }
+
+        fun hasYoungSession(upstreamPort: Int, nowMs: Long, maxAgeMs: Long): Boolean =
+            trackedSessionsFor(upstreamPort).any { tracked ->
+                nowMs - tracked.createdAtMs in 0..maxAgeMs
+            }
+
+        fun hasRecentUserTraffic(nowMs: Long, maxAgeMs: Long): Boolean {
+            val lastTraffic = lastUserTrafficAtMs.get()
+            return lastTraffic > 0L && nowMs - lastTraffic in 0..maxAgeMs
+        }
+
+        private fun trackedSessionsFor(upstreamPort: Int): List<TrackedSocket> =
+            synchronized(sessions) {
+                sessions.values
+                    .filter { it.upstreamPort == upstreamPort }
+                    .distinctBy { System.identityHashCode(it) }
+            }
+
         fun stop() {
             active.set(false)
             runCatching { serverSocket?.close() }
@@ -3697,7 +3857,8 @@ class AutoTransportService : Service() {
             val sessionID = nextSessionID.getAndIncrement()
             val sessionCreatedAtMs = SystemClock.elapsedRealtime()
             var upstream: Socket? = null
-            sessions[client] = TrackedSocket(sessionCreatedAtMs)
+            val tracked = TrackedSocket(sessionCreatedAtMs)
+            sessions[client] = tracked
             try {
                 client.use { clientSocket ->
                     tuneSocket(clientSocket)
@@ -3705,14 +3866,20 @@ class AutoTransportService : Service() {
                     val clientOut = clientSocket.getOutputStream()
                     val request = readClientConnectRequest(clientIn, clientOut)
                     val selected = upstreamProvider()
-                    val counters = countersFor(selected)
-                    Log.d(LOG_TAG, "session=$sessionID connect dest=${request.destination} upstream=${selected.host}:${selected.port}")
+                    tracked.upstreamPort = selected.port
+                    tracked.upstreamGeneration = selected.generation
+                    tracked.isHealthProbe = isHealthProbeDestination(request.destination, OUTBOUND_URL)
+                    val counters = countersFor(selected, request.destination)
+                    Log.d(
+                        LOG_TAG,
+                        "session=$sessionID connect dest=${request.destination} upstream=${selected.host}:${selected.port} gen=${selected.generation}",
+                    )
                     val upstreamSocketForSession = connectUpstream(request.raw, selected)
                     upstream = upstreamSocketForSession
-                    sessions[upstreamSocketForSession] = TrackedSocket(sessionCreatedAtMs)
+                    sessions[upstreamSocketForSession] = tracked
                     upstreamSocketForSession.use { upstreamSocket ->
                         sendSuccess(clientOut)
-                        val totals = proxy(sessionID, clientSocket, upstreamSocket, counters)
+                        val totals = proxy(sessionID, clientSocket, upstreamSocket, counters, tracked)
                         Log.d(
                             LOG_TAG,
                             "session=$sessionID closed dest=${request.destination} up=${totals.upBytes} down=${totals.downBytes}",
@@ -3815,7 +3982,13 @@ class AutoTransportService : Service() {
             }
         }
 
-        private fun proxy(sessionID: Long, client: Socket, upstream: Socket, counters: RouteCounters?): PipeTotals {
+        private fun proxy(
+            sessionID: Long,
+            client: Socket,
+            upstream: Socket,
+            counters: RouteCounters?,
+            tracked: TrackedSocket,
+        ): PipeTotals {
             val closed = AtomicBoolean(false)
             val done = CountDownLatch(2)
             val upBytes = AtomicLong(0)
@@ -3835,6 +4008,7 @@ class AutoTransportService : Service() {
                         counter = upBytes,
                         aggregateCounter = counters?.tx,
                         direction = "up",
+                        tracked = tracked,
                     )
                 } finally {
                     closeBoth()
@@ -3850,6 +4024,7 @@ class AutoTransportService : Service() {
                         counter = downBytes,
                         aggregateCounter = counters?.rx,
                         direction = "down",
+                        tracked = tracked,
                     )
                 } finally {
                     closeBoth()
@@ -3876,6 +4051,7 @@ class AutoTransportService : Service() {
             counter: AtomicLong,
             aggregateCounter: AtomicLong?,
             direction: String,
+            tracked: TrackedSocket,
         ) {
             try {
                 val buffer = ByteArray(PROXY_BUFFER_BYTES)
@@ -3883,8 +4059,14 @@ class AutoTransportService : Service() {
                     val read = input.read(buffer)
                     if (read < 0) break
                     output.write(buffer, 0, read)
-                    counter.addAndGet(read.toLong())
-                    aggregateCounter?.addAndGet(read.toLong())
+                    val readBytes = read.toLong()
+                    counter.addAndGet(readBytes)
+                    aggregateCounter?.addAndGet(readBytes)
+                    val pipeDirection = if (direction == "down") TcpPipeDirection.DOWN else TcpPipeDirection.UP
+                    val nowMs = SystemClock.elapsedRealtime()
+                    if (recordTrackedSocketProgress(tracked, readBytes, pipeDirection, nowMs)) {
+                        lastUserTrafficAtMs.set(nowMs)
+                    }
                 }
                 output.flush()
             } catch (error: Throwable) {
@@ -3910,12 +4092,14 @@ class AutoTransportService : Service() {
             return "$host:$port"
         }
 
-        private fun countersFor(upstream: Upstream): RouteCounters? =
-            when (upstream.port) {
+        private fun countersFor(upstream: Upstream, destination: String): RouteCounters? {
+            if (isHealthProbeDestination(destination, OUTBOUND_URL)) return null
+            return when (upstream.port) {
                 REALITY_PORT -> RouteCounters(rx = realityRxCounter, tx = realityTxCounter)
                 REALITY2_PORT -> RouteCounters(rx = reality2RxCounter, tx = reality2TxCounter)
                 else -> null
             }
+        }
 
         private fun sendSuccess(output: OutputStream) {
             output.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
@@ -3951,8 +4135,6 @@ class AutoTransportService : Service() {
         private class UpstreamConnectException(cause: Throwable) : Exception(cause.message, cause)
 
         private class SocksRequestRejectedException(message: String) : Exception(message)
-
-        private data class TrackedSocket(val createdAtMs: Long)
 
         private companion object {
             private const val PROXY_BUFFER_BYTES = 64 * 1024

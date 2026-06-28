@@ -53,6 +53,33 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
+    fun healthProbeDestinationMatchesOutboundUrl() {
+        assertTrue(isHealthProbeDestination("api.ipify.org:443", "https://api.ipify.org"))
+        assertTrue(isHealthProbeDestination("example.com:80", "http://example.com/path"))
+        assertFalse(isHealthProbeDestination("example.com:443", "http://example.com/path"))
+        assertFalse(isHealthProbeDestination("other.example:443", "https://example.com"))
+    }
+
+    @Test
+    fun trackedSocketProgressTracksBytesAndExcludesHealthProbe() {
+        val tracked = TrackedSocket(createdAtMs = 1_000L)
+
+        assertTrue(recordTrackedSocketProgress(tracked, 512L, TcpPipeDirection.UP, 2_000L))
+        assertEquals(512L, tracked.upBytes.get())
+        assertEquals(2_000L, tracked.lastUplinkProgressAtMs.get())
+        assertTrue(recordTrackedSocketProgress(tracked, 1_024L, TcpPipeDirection.DOWN, 2_500L))
+        assertEquals(1_024L, tracked.downBytes.get())
+        assertEquals(2_500L, tracked.lastDownlinkProgressAtMs.get())
+
+        val probe = TrackedSocket(createdAtMs = 1_000L).apply {
+            isHealthProbe = true
+        }
+        assertFalse(recordTrackedSocketProgress(probe, 128L, TcpPipeDirection.DOWN, 3_000L))
+        assertEquals(128L, probe.downBytes.get())
+        assertEquals(3_000L, probe.lastDownlinkProgressAtMs.get())
+    }
+
+    @Test
     fun flappingPriorityRouteDoesNotPromoteBeforeStableDwell() {
         val nowMs = 100_000L
 
