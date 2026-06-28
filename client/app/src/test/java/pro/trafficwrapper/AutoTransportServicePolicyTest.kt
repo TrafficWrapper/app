@@ -198,6 +198,45 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
+    fun watchdogDemotesOnlyActiveStalledTcpRoute() {
+        assertTrue(shouldDemoteActiveTcpRouteAfterStall(rxStalled = true, routeIsActive = true))
+        assertFalse(shouldDemoteActiveTcpRouteAfterStall(rxStalled = true, routeIsActive = false))
+        assertFalse(shouldDemoteActiveTcpRouteAfterStall(rxStalled = false, routeIsActive = true))
+    }
+
+    @Test
+    fun watchdogRestartsWarmSidecarOnlyForOldFrozenUserSession() {
+        assertTrue(
+            shouldRestartInactiveTcpSidecarAfterStall(
+                hasStalledUserSession = true,
+                hasRecentUserDownlinkProgress = false,
+                hasYoungSession = false,
+            ),
+        )
+        assertFalse(
+            shouldRestartInactiveTcpSidecarAfterStall(
+                hasStalledUserSession = true,
+                hasRecentUserDownlinkProgress = true,
+                hasYoungSession = false,
+            ),
+        )
+        assertFalse(
+            shouldRestartInactiveTcpSidecarAfterStall(
+                hasStalledUserSession = true,
+                hasRecentUserDownlinkProgress = false,
+                hasYoungSession = true,
+            ),
+        )
+        assertFalse(
+            shouldRestartInactiveTcpSidecarAfterStall(
+                hasStalledUserSession = false,
+                hasRecentUserDownlinkProgress = false,
+                hasYoungSession = false,
+            ),
+        )
+    }
+
+    @Test
     fun flappingPriorityRouteDoesNotPromoteBeforeStableDwell() {
         val nowMs = 100_000L
 

@@ -244,6 +244,19 @@ internal fun shouldTreatTcpRxAsStalled(
         !hasRecentSessionRx &&
         !hasConnectingSession
 
+internal fun shouldDemoteActiveTcpRouteAfterStall(
+    rxStalled: Boolean,
+    routeIsActive: Boolean,
+): Boolean =
+    rxStalled && routeIsActive
+
+internal fun shouldRestartInactiveTcpSidecarAfterStall(
+    hasStalledUserSession: Boolean,
+    hasRecentUserDownlinkProgress: Boolean,
+    hasYoungSession: Boolean,
+): Boolean =
+    hasStalledUserSession && !hasRecentUserDownlinkProgress && !hasYoungSession
+
 internal fun shouldPromoteRecoveredPriorityRoute(
     inactiveHealthySinceMs: Long,
     lastHealthLostAtMs: Long,
@@ -325,6 +338,7 @@ internal const val REALITY_RX_STALL_MS = 12_000L
 internal const val REALITY_RX_STALL_MIN_TX_BYTES = 256L
 internal const val REALITY_RX_STALL_TX_IDLE_MS = 10_000L
 internal const val REALITY_CONNECT_GRACE_MS = 10_000L
+internal const val REALITY_SIDECAR_WATCHDOG_BACKOFF_MS = 45_000L
 internal const val TCP_PRIORITY_PROMOTE_DWELL_MS = 45_000L
 internal const val TCP_ROUTE_FLAP_WINDOW_MS = 2 * 60 * 1000L
 internal const val TCP_ROUTE_FLAP_THRESHOLD = 3
@@ -551,6 +565,8 @@ class AutoTransportService : Service() {
             val tcpPendingTxSinceMs = mutableMapOf<Route, Long>()
             val tcpPendingTxStartBytes = mutableMapOf<Route, Long>()
             val tcpLastTxProgressAtMs = mutableMapOf<Route, Long>()
+            val tcpForcedUnhealthyUntilMs = mutableMapOf<Route, Long>()
+            val tcpWatchdogRestartAfterMs = mutableMapOf<Route, Long>()
             fun markTunnelDisruption(atMs: Long, reason: String) {
                 if (atMs <= lastTunnelDisruptionAtMs) return
                 lastTunnelDisruptionAtMs = atMs
@@ -590,6 +606,7 @@ class AutoTransportService : Service() {
                 if (route == Route.AWG_RU || route == Route.AWG) return
                 routeCooldownLevel[route] = 0
                 routeCooldownUntilMs[route] = 0
+                tcpForcedUnhealthyUntilMs[route] = 0
             }
             fun isTcpRoute(route: Route): Boolean =
                 route == Route.REALITY || route == Route.REALITY2
@@ -781,6 +798,108 @@ class AutoTransportService : Service() {
                     hasStalledUserSession = stalledUserSession,
                     aggregateStalled = aggregateStalled,
                 )
+            }
+            fun markTcpRouteForcedUnhealthy(route: Route, atMs: Long, durationMs: Long) {
+                if (!isTcpRoute(route)) return
+                tcpForcedUnhealthyUntilMs[route] = maxOf(
+                    tcpForcedUnhealthyUntilMs[route] ?: 0L,
+                    atMs + durationMs,
+                )
+                routeHealthySinceMs[route] = 0L
+                routeUnhealthySinceMs[route] = atMs
+            }
+            fun isTcpRouteForcedUnhealthy(route: Route, atMs: Long): Boolean =
+                isTcpRoute(route) && (tcpForcedUnhealthyUntilMs[route] ?: 0L) > atMs
+            fun requestAutoFailoverAfterWatchdog(route: Route) {
+                if (requestedMode != TransportChoice.AUTO) {
+                    requestedMode = TransportChoice.AUTO
+                    TransportLifecycleStore.rememberActiveTransport(applicationContext, TransportChoice.AUTO)
+                }
+                Log.w(LOG_TAG, "route_state rsn=watchdog_auto_failover from=${routeLabel(route)}")
+                telemetryEvent(
+                    "route_state",
+                    "rsn" to "watchdog_auto_failover",
+                    "route" to routeLabel(route),
+                )
+                synchronized(resyncSignal) {
+                    resyncSignal.notifyAll()
+                }
+            }
+            fun restartStalledTcpSidecar(
+                route: Route,
+                cfg: RealityUiConfig?,
+                atMs: Long,
+                currentTx: Long,
+                currentActiveRoute: Route,
+            ): XrayStartResult? {
+                if (!isTcpRoute(route) || cfg?.isComplete() != true || xrayProcess(route)?.isAlive != true) return null
+                val nextAllowedAt = tcpWatchdogRestartAfterMs[route] ?: 0L
+                if (atMs < nextAllowedAt) return null
+                if (shouldDemoteActiveTcpRouteAfterStall(rxStalled = true, routeIsActive = route == currentActiveRoute)) {
+                    val pendingBytes = tcpPendingBytes(route, currentTx)
+                    val pendingAgeMs = tcpPendingAgeMs(route, atMs)
+                    recordTcpRouteHealthLost(route, atMs)
+                    val backoffMs = demoteRoute(route, atMs, "rx_stall_watchdog")
+                    markTcpRouteForcedUnhealthy(route, atMs, backoffMs)
+                    clearTcpPending(route, currentTx)
+                    tcpWatchdogRestartAfterMs[route] = atMs + REALITY_SIDECAR_WATCHDOG_BACKOFF_MS
+                    telemetryEvent(
+                        "watchdog_demote",
+                        "route" to routeLabel(route),
+                        "generation" to routeGeneration(route),
+                        "pending_bytes" to pendingBytes,
+                        "pending_age_ms" to pendingAgeMs,
+                    )
+                    requestAutoFailoverAfterWatchdog(route)
+                    return null
+                }
+                val upstreamPort = routePort(route)
+                val stalledUserSession = tcpUserSessionStalled(route, atMs)
+                val hasRecentRx = router?.hasRecentUserDownlinkProgress(
+                    upstreamPort = upstreamPort,
+                    nowMs = atMs,
+                    maxAgeMs = REALITY_RX_STALL_MS,
+                ) == true
+                val hasYoungSession = router?.hasYoungSession(
+                    upstreamPort = upstreamPort,
+                    nowMs = atMs,
+                    maxAgeMs = REALITY_CONNECT_GRACE_MS,
+                ) == true
+                if (!shouldRestartInactiveTcpSidecarAfterStall(stalledUserSession, hasRecentRx, hasYoungSession)) {
+                    clearTcpPending(route, currentTx)
+                    return null
+                }
+                val oldGeneration = routeGeneration(route)
+                val closedSessions = router?.closeSessionsForRouteGeneration(upstreamPort, oldGeneration) ?: 0
+                Log.w(LOG_TAG, "restarting inactive ${routeLabel(route)} sidecar after rx stall gen=$oldGeneration closed=$closedSessions")
+                val result = startXraySidecar(cfg, route, forceRestart = true)
+                when (route) {
+                    Route.REALITY -> xrayStarted = result.started
+                    Route.REALITY2 -> {
+                        xray2Started = result.started
+                        if (result.started) {
+                            setAppliedReality2Uuid(cfg.uuid)
+                        } else {
+                            setAppliedReality2Uuid("")
+                        }
+                    }
+                    Route.AWG_RU, Route.AWG -> Unit
+                }
+                clearTcpPending(route, currentTx)
+                tcpWatchdogRestartAfterMs[route] = atMs + REALITY_SIDECAR_WATCHDOG_BACKOFF_MS
+                telemetryEvent(
+                    "xray_start_result",
+                    "rsn" to "watchdog_restart_inactive",
+                    "route" to routeLabel(route),
+                    "generation" to routeGeneration(route),
+                    "old_generation" to oldGeneration,
+                    "closed_sessions" to closedSessions,
+                    "rl_started" to result.started,
+                    "err_where" to "watchdog_restart",
+                    "err_kind" to result.errorKind,
+                    "err_msg" to result.error,
+                )
+                return result
             }
             fun awgLocallyHealthy(route: Route, probe: AWGProbeResult, atMs: Long): Boolean =
                 probe.handshakeEstablished && awgLocalRxFresh(route, atMs)
@@ -1374,7 +1493,6 @@ class AutoTransportService : Service() {
                     }
                     val realityProbe = if (xrayStarted) cachedRealityProbe else RealityProbeResult(false)
                     val realityRxStalled = tcpRxStalled(Route.REALITY, currentRealityTx, nowMs)
-                    val realityHealthy = xrayStarted && realityProbe.healthy && !realityRxStalled
                     if (xray2Started && shouldProbeReality(
                             nowMs = nowMs,
                             lastProbeAtMs = lastReality2ProbeAtMs,
@@ -1388,7 +1506,16 @@ class AutoTransportService : Service() {
                     }
                     val reality2Probe = if (xray2Started) cachedReality2Probe else RealityProbeResult(false)
                     val reality2RxStalled = tcpRxStalled(Route.REALITY2, currentReality2Tx, nowMs)
-                    val reality2Healthy = xray2Started && reality2Probe.healthy && !reality2RxStalled
+                    if (realityRxStalled) {
+                        restartStalledTcpSidecar(Route.REALITY, realityConfig, nowMs, currentRealityTx, activeRoute)
+                    }
+                    if (reality2RxStalled) {
+                        restartStalledTcpSidecar(Route.REALITY2, reality2Config, nowMs, currentReality2Tx, activeRoute)
+                    }
+                    val realityForcedUnhealthy = isTcpRouteForcedUnhealthy(Route.REALITY, nowMs)
+                    val reality2ForcedUnhealthy = isTcpRouteForcedUnhealthy(Route.REALITY2, nowMs)
+                    val reality2Healthy = xray2Started && reality2Probe.healthy && !reality2RxStalled && !reality2ForcedUnhealthy
+                    val realityHealthy = xrayStarted && realityProbe.healthy && !realityRxStalled && !realityForcedUnhealthy
                     if (activeRoute == Route.REALITY && realityHealthy) {
                         outboundIp = realityProbe.outboundIp
                         lastTrafficAtMs = nowMs
