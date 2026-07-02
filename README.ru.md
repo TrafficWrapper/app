@@ -163,7 +163,7 @@ export TW_PUBLIC_SIGNING_CERT_SHA256=<your-release-cert-sha256>
 
 - Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.17>
 - Файл: `TrafficWrapper-app-v0.1.17.apk`
-- APK SHA-256: `ae41e5f4a6868b2b4ffe28da71db7c2cb44834923c881c5e442d8a6e715bf166`
+- APK SHA-256: `920ceeb5cda58217254765a1167267d5cc55d5f11cbda74918b955b8a363998c`
 - SHA-256 signing certificate: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
 - Application ID: `org.trafficwrapper.app`
 - Версия: `0.1.17` (`versionCode=18`)
@@ -185,7 +185,7 @@ minisign подпись manifest и optional rebuild из git tag.
 
 ```sh
 APK=TrafficWrapper-app-v0.1.17.apk \
-EXPECTED_APK_SHA256=ae41e5f4a6868b2b4ffe28da71db7c2cb44834923c881c5e442d8a6e715bf166 \
+EXPECTED_APK_SHA256=920ceeb5cda58217254765a1167267d5cc55d5f11cbda74918b955b8a363998c \
 EXPECTED_CERT_SHA256=bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8 \
 ./build/verify-release.sh
 ```
