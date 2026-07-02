@@ -200,48 +200,51 @@ internal fun discoverySinks(
     config: PublicClientConfig,
     socksListen: String,
 ): List<DiscoverySink> {
-    val sinks = linkedMapOf<String, DiscoverySink>()
-    val bootstrapBase = runCatching {
-        PublicPlatformConfigParser.parseBootstrap(stored.bootstrapRaw, nowMs = 0).orchestratorUrl
-    }.getOrDefault("")
-    discoveryBaseUrl(bootstrapBase)?.let {
-        sinks["direct|$it"] = DiscoverySink("orchestrator-direct", it)
-    }
+    val tunnelSinks = linkedMapOf<String, DiscoverySink>()
+    val directSinks = linkedMapOf<String, DiscoverySink>()
     val tunnelSocks = socksListen.ifBlank { UPDATE_ROUTER_SOCKS_LISTEN }
     config.workers
         .flatMap { it.routes }
         .map { it.params }
         .forEachIndexed { index, params ->
             collectDiscoveryUrls(params.optJSONArray("discovery_urls")).forEach { url ->
-                val key = if (url.startsWith("https://", ignoreCase = true)) "direct|$url" else "tunnel|$url"
-                sinks.putIfAbsent(
-                    key,
-                    DiscoverySink(
-                        name = "route-discovery-$index",
-                        baseUrl = url,
-                        socksListen = if (url.startsWith("https://", ignoreCase = true)) "" else tunnelSocks,
-                    ),
-                )
+                addDiscoverySink(tunnelSinks, directSinks, "route-discovery-$index", url, tunnelSocks)
             }
             params.optString("discovery_url").trim().takeIf { it.isNotBlank() }?.let { raw ->
                 normalizeDiscoveryUrl(raw)?.let { url ->
-                    val direct = url.startsWith("https://", ignoreCase = true)
-                    sinks.putIfAbsent(
-                        "${if (direct) "direct" else "tunnel"}|$url",
-                        DiscoverySink("route-discovery-$index", url, if (direct) "" else tunnelSocks),
-                    )
+                    addDiscoverySink(tunnelSinks, directSinks, "route-discovery-$index", url, tunnelSocks)
                 }
             }
             params.optString("config_url").trim().takeIf { it.isNotBlank() }?.let { raw ->
                 normalizeDiscoveryUrl(raw)?.let { url ->
-                    sinks.putIfAbsent(
+                    tunnelSinks.putIfAbsent(
                         "tunnel-config|$url",
                         DiscoverySink("route-config-$index", url, tunnelSocks),
                     )
                 }
             }
         }
-    return sinks.values.toList()
+    val bootstrapBase = runCatching {
+        PublicPlatformConfigParser.parseBootstrap(stored.bootstrapRaw, nowMs = 0).orchestratorUrl
+    }.getOrDefault("")
+    discoveryBaseUrl(bootstrapBase)?.let {
+        directSinks.putIfAbsent("direct|$it", DiscoverySink("orchestrator-direct", it))
+    }
+    return tunnelSinks.values.toList() + directSinks.values.toList()
+}
+
+private fun addDiscoverySink(
+    tunnelSinks: MutableMap<String, DiscoverySink>,
+    directSinks: MutableMap<String, DiscoverySink>,
+    name: String,
+    url: String,
+    tunnelSocks: String,
+) {
+    if (url.startsWith("https://", ignoreCase = true)) {
+        directSinks.putIfAbsent("direct|$url", DiscoverySink(name, url))
+    } else {
+        tunnelSinks.putIfAbsent("tunnel|$url", DiscoverySink(name, url, tunnelSocks))
+    }
 }
 
 private fun collectDiscoveryUrls(array: JSONArray?): List<String> {

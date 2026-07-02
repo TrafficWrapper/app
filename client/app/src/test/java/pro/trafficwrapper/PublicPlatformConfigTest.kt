@@ -305,15 +305,15 @@ class PublicPlatformConfigTest {
 
         assertEquals(
             listOf(
-                "https://orch.dev/discovery",
-                "https://worker.example/discovery",
                 "http://awg-gw:8080/tw",
+                "https://worker.example/discovery",
+                "https://orch.dev/discovery",
             ),
             sinks.map { it.baseUrl },
         )
-        assertEquals("", sinks[0].socksListen)
+        assertEquals("127.0.0.1:18080", sinks[0].socksListen)
         assertEquals("", sinks[1].socksListen)
-        assertEquals("127.0.0.1:18080", sinks[2].socksListen)
+        assertEquals("", sinks[2].socksListen)
         assertTrue(sinks.none { it.baseUrl.contains("netcloud", ignoreCase = true) })
     }
 

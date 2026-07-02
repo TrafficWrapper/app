@@ -176,7 +176,7 @@
     <string name="direct_update_fallback_title">Прямое HTTPS-обновление</string>
     <string name="direct_update_fallback_warning">Выключено по умолчанию. Если включить, приложение может скачать обновление без туннеля с операторских HTTPS-зеркал; зеркало увидит ваш реальный IP, а соединение будет видно сети.</string>
     <string name="discovery_subscription_title">Подписка на endpoints</string>
-    <string name="discovery_subscription_warning">Выключено по умолчанию. Если включить, приложение будет принимать подписанный оператором список egress-endpoints; неподписанные или устаревшие данные отклоняются.</string>
+    <string name="discovery_subscription_warning">Выключено по умолчанию. Если включить, приложение сначала проверяет подписанный оператором список egress-endpoints через туннель; если туннель недоступен, оно может сделать прямой запрос к оператор-серверу, раскрывая ваш реальный IP. Неподписанные или устаревшие данные отклоняются.</string>
     <string name="update_available_version">Доступно обновление %1$s (%2$d)</string>
     <string name="update_published_version">На сервере: версия %1$s (%2$d)</string>
     <string name="update_changelog_title">Что изменилось</string>
