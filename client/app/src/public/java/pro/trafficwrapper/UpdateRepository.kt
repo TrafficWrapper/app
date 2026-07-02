@@ -2,6 +2,7 @@ package pro.trafficwrapper
 
 import android.content.Context
 import android.util.Log
+import org.json.JSONArray
 import java.io.File
 
 class UpdateRepository(private val context: Context) {
@@ -13,11 +14,13 @@ class UpdateRepository(private val context: Context) {
         allowProvisioningFallback: Boolean = false,
         activeTransportOverride: String? = null,
     ): UpdateCheckOutcome {
-        if (!auth.authorized) {
+        val directEnabled = TransportLifecycleStore.directUpdateFallbackEnabled(context)
+        val tunnelViable = auth.authorized && socksListen.isNotBlank()
+        if (!tunnelViable && !directEnabled) {
             return UpdateCheckOutcome(status = UpdateCheckStatus.ERROR, errorTextRes = R.string.update_error_tunnel_required)
         }
         return try {
-            val verified = fetchFirstVerifiedBundle()
+            val verified = fetchFirstVerifiedBundle(socksListen, tunnelViable, directEnabled)
             when (val decision = verified.decision) {
                 is ManifestDecision.Latest -> UpdateCheckOutcome(
                     status = UpdateCheckStatus.LATEST,
@@ -50,13 +53,15 @@ class UpdateRepository(private val context: Context) {
         activeTransportOverride: String? = null,
         onProgress: (downloadedBytes: Long, totalBytes: Long) -> Unit = { _, _ -> },
     ): UpdateCheckOutcome {
-        if (!auth.authorized) {
+        val directEnabled = TransportLifecycleStore.directUpdateFallbackEnabled(context)
+        val tunnelViable = auth.authorized && socksListen.isNotBlank()
+        if (!tunnelViable && !directEnabled) {
             return UpdateCheckOutcome(status = UpdateCheckStatus.ERROR, errorTextRes = R.string.update_error_tunnel_required)
         }
         return try {
             var lastError: Throwable? = null
             var degradedOutcome: UpdateCheckOutcome? = null
-            for (endpoint in updateEndpoints()) {
+            for (endpoint in updateEndpoints(socksListen, tunnelViable, directEnabled)) {
                 val verified = runCatching { fetchVerifiedBundle(endpoint) }
                     .onFailure {
                         lastError = it
@@ -124,9 +129,13 @@ class UpdateRepository(private val context: Context) {
         }
     }
 
-    private fun fetchFirstVerifiedBundle(): VerifiedManifestBundle {
+    private fun fetchFirstVerifiedBundle(
+        socksListen: String,
+        tunnelViable: Boolean,
+        directEnabled: Boolean,
+    ): VerifiedManifestBundle {
         var lastError: Throwable? = null
-        for (endpoint in updateEndpoints()) {
+        for (endpoint in updateEndpoints(socksListen, tunnelViable, directEnabled)) {
             val result = runCatching { fetchVerifiedBundle(endpoint) }
             result.getOrNull()?.let { return it }
             result.exceptionOrNull()?.let { lastError = it }
@@ -141,14 +150,47 @@ class UpdateRepository(private val context: Context) {
         }
     }
 
-    private fun updateEndpoints(): List<UpdateEndpoint> {
+    private fun updateEndpoints(
+        socksListen: String,
+        tunnelViable: Boolean,
+        directEnabled: Boolean,
+    ): List<UpdateEndpoint> {
         val urls = linkedSetOf<String>()
-        TransportRuntime.publicPlatformRouteSlots.orderedRoutes.forEach { resolved ->
-            val url = resolved.route.params.optString("config_url").trim()
-            if (url.isNotBlank()) urls += url.trimEnd('/')
+        if (tunnelViable) {
+            TransportRuntime.publicPlatformRouteSlots.orderedRoutes.forEach { resolved ->
+                val url = resolved.route.params.optString("config_url").trim()
+                if (url.isNotBlank()) urls += url.trimEnd('/')
+            }
+            if (urls.isEmpty()) urls += PUBLIC_PLATFORM_UPDATE_BASE_URL
+            return urls.map { UpdateEndpoint(it, socksListen.ifBlank { UPDATE_ROUTER_SOCKS_LISTEN }) }
         }
-        if (urls.isEmpty()) urls += PUBLIC_PLATFORM_UPDATE_BASE_URL
-        return urls.map { UpdateEndpoint(it, UPDATE_ROUTER_SOCKS_LISTEN) }
+        if (!directEnabled) return emptyList()
+        return directUpdateBaseUrls().map { UpdateEndpoint(it, "", UpdateSource.DIRECT) }
+    }
+
+    private fun directUpdateBaseUrls(): List<String> {
+        return publicDirectUpdateBaseUrls(TransportRuntime.publicPlatformRouteSlots.orderedRoutes.map { it.route.params })
+    }
+
+    private fun publicDirectUpdateBaseUrls(routeParams: Iterable<org.json.JSONObject>): List<String> {
+        val urls = linkedSetOf<String>()
+        routeParams.forEach { params ->
+            collectUrlArray(params.optJSONArray("direct_update_urls"), urls)
+            collectUrlArray(params.optJSONArray("fallback_urls"), urls)
+            val single = params.optString("direct_update_url").trim()
+            if (single.isNotBlank()) urls += single
+        }
+        return urls
+            .map { it.trim().trimEnd('/') }
+            .filter { it.startsWith("https://", ignoreCase = true) }
+    }
+
+    private fun collectUrlArray(array: JSONArray?, out: MutableSet<String>) {
+        if (array == null) return
+        for (index in 0 until array.length()) {
+            val value = array.optString(index).trim()
+            if (value.isNotBlank()) out += value
+        }
     }
 
     private fun updateCacheDir(): File =

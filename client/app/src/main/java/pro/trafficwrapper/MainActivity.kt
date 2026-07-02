@@ -1227,6 +1227,12 @@ private fun SettingsScreen(
     var permissionCheckRequested by remember { mutableStateOf(0) }
     var permissionChecking by remember { mutableStateOf(false) }
     var permissionResults by remember { mutableStateOf<List<PermissionCheckResult>?>(null) }
+    var directUpdateFallbackOn by remember {
+        mutableStateOf(TransportLifecycleStore.directUpdateFallbackEnabled(context.applicationContext))
+    }
+    var discoverySubscriptionOn by remember {
+        mutableStateOf(TransportLifecycleStore.discoverySubscriptionEnabled(context.applicationContext))
+    }
 
     LaunchedEffect(permissionCheckRequested) {
         if (permissionCheckRequested == 0) return@LaunchedEffect
@@ -1267,8 +1273,64 @@ private fun SettingsScreen(
     }
 
     SettingsSection(title = stringResource(R.string.settings_update_title)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.direct_update_fallback_title),
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    text = stringResource(R.string.direct_update_fallback_warning),
+                    modifier = Modifier.padding(top = 4.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = directUpdateFallbackOn,
+                onCheckedChange = { enabled ->
+                    TransportLifecycleStore.setDirectUpdateFallbackEnabled(context.applicationContext, enabled)
+                    directUpdateFallbackOn =
+                        TransportLifecycleStore.directUpdateFallbackEnabled(context.applicationContext)
+                },
+            )
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.discovery_subscription_title),
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    text = stringResource(R.string.discovery_subscription_warning),
+                    modifier = Modifier.padding(top = 4.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = discoverySubscriptionOn,
+                onCheckedChange = { enabled ->
+                    TransportLifecycleStore.setDiscoverySubscriptionEnabled(context.applicationContext, enabled)
+                    discoverySubscriptionOn =
+                        TransportLifecycleStore.discoverySubscriptionEnabled(context.applicationContext)
+                },
+            )
+        }
         Button(
-            enabled = !updates.inProgress && auth.authorized,
+            enabled = !updates.inProgress && (auth.authorized || directUpdateFallbackOn),
             onClick = {
                 DistributionChannel.requestUpdateCheck(
                     context = context.applicationContext,

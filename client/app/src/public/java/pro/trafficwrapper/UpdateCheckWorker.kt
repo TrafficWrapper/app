@@ -20,8 +20,18 @@ class UpdateCheckWorker(
         val transport = TransportRuntime.state
         val auth = TransportRuntime.auth
         val socksListen = transport.socksListen.ifBlank { auth.provisionedSOCKS }
-        if (!auth.authorized || !transport.handshakeEstablished || socksListen.isBlank()) {
+        val directFallback = TransportLifecycleStore.directUpdateFallbackEnabled(applicationContext)
+        if ((!auth.authorized || !transport.handshakeEstablished || socksListen.isBlank()) && !directFallback) {
             return Result.success()
+        }
+        runCatching {
+            DiscoveryRepository(applicationContext).maybeRefresh(socksListen = socksListen)
+        }.onSuccess { result ->
+            if (result?.applied == true) {
+                android.util.Log.i("TWPublicUpdate", "public discovery refreshed seq=${result.seq}")
+            }
+        }.onFailure { error ->
+            android.util.Log.w("TWPublicUpdate", "public discovery refresh failed", error)
         }
         val outcome = UpdateRepository(applicationContext).check(
             auth = auth,

@@ -8,6 +8,8 @@ import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URI
+import okhttp3.OkHttpClient
+import okhttp3.Request
 
 class UpdateDownloader(
     private val socksListen: String,
@@ -237,14 +239,16 @@ class UpdateDownloader(
         val code: Int,
         val headers: Map<String, String>,
         val input: InputStream,
-        val socket: Socket,
+        val socket: Socket? = null,
+        val response: Closeable? = null,
     ) : Closeable {
         val isSuccessful: Boolean
             get() = code in 200..299
 
         override fun close() {
             runCatching { input.close() }
-            runCatching { socket.close() }
+            runCatching { response?.close() }
+            runCatching { socket?.close() }
         }
     }
 
@@ -273,6 +277,10 @@ class UpdateDownloader(
 
         private const val DEFAULT_SOCKS_HOST = "127.0.0.1"
         private const val DEFAULT_SOCKS_PORT = "18080"
+        private val directClient = OkHttpClient.Builder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
     }
 
     private fun openHttp(
@@ -280,6 +288,9 @@ class UpdateDownloader(
         method: String,
         headers: Map<String, String> = emptyMap(),
     ): HttpResponse {
+        if (source == UpdateSource.DIRECT) {
+            return openDirectHttps(url, method, headers)
+        }
         val uri = URI(url)
         if ((uri.scheme ?: "").lowercase() != "http") {
             throw UpdateVerificationException(R.string.update_error_download)
@@ -315,6 +326,32 @@ class UpdateDownloader(
             runCatching { socket.close() }
             throw error
         }
+    }
+
+    private fun openDirectHttps(
+        url: String,
+        method: String,
+        headers: Map<String, String>,
+    ): HttpResponse {
+        val uri = URI(url)
+        if ((uri.scheme ?: "").lowercase() != "https") {
+            throw UpdateVerificationException(R.string.update_error_download)
+        }
+        val request = Request.Builder()
+            .url(url)
+            .method(method, null)
+            .also { builder ->
+                headers.forEach { (name, value) -> builder.header(name, value) }
+            }
+            .build()
+        val response = directClient.newCall(request).execute()
+        val input = response.body.byteStream()
+        return HttpResponse(
+            code = response.code,
+            headers = response.headers.toMultimap().mapValues { it.value.joinToString(",") },
+            input = input,
+            response = response,
+        )
     }
 
     private fun openSocks5Socket(targetHost: String, targetPort: Int): Socket {

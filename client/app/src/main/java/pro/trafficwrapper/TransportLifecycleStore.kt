@@ -15,6 +15,8 @@ object TransportLifecycleStore {
     private const val KEY_TELEMETRY = "telemetry"
     private const val KEY_TELEMETRY_REMOTE_OFF = "telemetry_remote_off"
     private const val KEY_HTTP_PROXY = "http_proxy"
+    private const val KEY_DIRECT_UPDATE_FALLBACK = "direct_update_fallback"
+    private const val KEY_DISCOVERY_SUBSCRIPTION = "discovery_subscription"
 
     fun rememberActiveTransport(context: Context, mode: TransportChoice) {
         prefs(context).edit()
@@ -144,6 +146,36 @@ object TransportLifecycleStore {
             .apply()
     }
 
+    fun directUpdateFallbackEnabled(context: Context): Boolean =
+        directUpdateFallbackPreference(
+            if (prefs(context).contains(KEY_DIRECT_UPDATE_FALLBACK)) {
+                prefs(context).getBoolean(KEY_DIRECT_UPDATE_FALLBACK, false)
+            } else {
+                null
+            },
+        )
+
+    fun setDirectUpdateFallbackEnabled(context: Context, on: Boolean) {
+        prefs(context).edit()
+            .putBoolean(KEY_DIRECT_UPDATE_FALLBACK, on)
+            .apply()
+    }
+
+    fun discoverySubscriptionEnabled(context: Context): Boolean =
+        discoverySubscriptionPreference(
+            if (prefs(context).contains(KEY_DISCOVERY_SUBSCRIPTION)) {
+                prefs(context).getBoolean(KEY_DISCOVERY_SUBSCRIPTION, false)
+            } else {
+                null
+            },
+        )
+
+    fun setDiscoverySubscriptionEnabled(context: Context, on: Boolean) {
+        prefs(context).edit()
+            .putBoolean(KEY_DISCOVERY_SUBSCRIPTION, on)
+            .apply()
+    }
+
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -151,3 +183,7 @@ object TransportLifecycleStore {
 }
 
 internal fun httpProxyPreference(stored: Boolean?): Boolean = stored ?: false
+
+internal fun directUpdateFallbackPreference(stored: Boolean?): Boolean = stored ?: false
+
+internal fun discoverySubscriptionPreference(stored: Boolean?): Boolean = stored ?: false

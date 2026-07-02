@@ -34,6 +34,7 @@ data class ManifestBundle(
 
 enum class UpdateSource {
     PLATFORM,
+    DIRECT,
 }
 
 sealed class ManifestDecision {
