@@ -10,6 +10,7 @@ enum class UpdateNetworkKind {
     WIFI,
     CELLULAR,
     ETHERNET,
+    METERED,
     OTHER,
     NONE,
 }
@@ -24,7 +25,7 @@ internal fun shouldAutoDownloadUpdate(policy: UpdateAutoDownloadPolicy, network:
     if (!policy.autoDownloadEnabled) return false
     return when (network) {
         UpdateNetworkKind.WIFI, UpdateNetworkKind.ETHERNET -> policy.wifiEnabled
-        UpdateNetworkKind.CELLULAR -> policy.mobileEnabled
+        UpdateNetworkKind.CELLULAR, UpdateNetworkKind.METERED -> policy.mobileEnabled
         UpdateNetworkKind.OTHER -> policy.wifiEnabled
         UpdateNetworkKind.NONE -> false
     }
@@ -42,26 +43,65 @@ object UpdateNetworkPolicy {
         runCatching {
             val connectivity = context.getSystemService(ConnectivityManager::class.java)
             val activeCaps = connectivity.activeNetwork?.let { connectivity.getNetworkCapabilities(it) }
-            val underlying = activeCaps.underlyingNetworksCompat()
-            val candidates = (underlying + connectivity.allNetworks.toList())
-                .distinct()
-                .mapNotNull { network ->
-                    val caps = connectivity.getNetworkCapabilities(network) ?: return@mapNotNull null
-                    if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return@mapNotNull null
-                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return@mapNotNull null
-                    caps
-                }
-            val caps = candidates.firstOrNull()
-                ?: activeCaps?.takeUnless { it.hasTransport(NetworkCapabilities.TRANSPORT_VPN) }
-                ?: return@runCatching UpdateNetworkKind.NONE
-            when {
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> UpdateNetworkKind.WIFI
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> UpdateNetworkKind.ETHERNET
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> UpdateNetworkKind.CELLULAR
-                else -> UpdateNetworkKind.OTHER
-            }
+            val activeKind = activeCaps.toUpdateNetworkKind()
+            val underlyingKinds = activeCaps.underlyingNetworksCompat()
+                .mapNotNull { network -> connectivity.getNetworkCapabilities(network).toUpdateNetworkKind() }
+            val fallbackKinds = connectivity.allNetworks
+                .mapNotNull { network -> connectivity.getNetworkCapabilities(network).toUpdateNetworkKind() }
+            chooseUpdateNetworkKind(activeKind, underlyingKinds, fallbackKinds)
         }.getOrDefault(UpdateNetworkKind.OTHER)
 }
+
+internal fun classifyUpdateNetworkCapabilities(
+    wifi: Boolean,
+    cellular: Boolean,
+    ethernet: Boolean,
+    vpn: Boolean,
+    internet: Boolean,
+    notMetered: Boolean,
+): UpdateNetworkKind? {
+    if (!internet || vpn) return null
+    if (cellular) return UpdateNetworkKind.CELLULAR
+    if (!notMetered) return UpdateNetworkKind.METERED
+    return when {
+        wifi -> UpdateNetworkKind.WIFI
+        ethernet -> UpdateNetworkKind.ETHERNET
+        else -> UpdateNetworkKind.OTHER
+    }
+}
+
+internal fun chooseUpdateNetworkKind(
+    activeKind: UpdateNetworkKind?,
+    underlyingKinds: List<UpdateNetworkKind>,
+    fallbackKinds: List<UpdateNetworkKind>,
+): UpdateNetworkKind {
+    activeKind?.let { return it }
+    reduceUpdateNetworkKinds(underlyingKinds)?.let { return it }
+    reduceUpdateNetworkKinds(fallbackKinds)?.let { return it }
+    return UpdateNetworkKind.NONE
+}
+
+private fun reduceUpdateNetworkKinds(kinds: List<UpdateNetworkKind>): UpdateNetworkKind? {
+    if (kinds.isEmpty()) return null
+    if (UpdateNetworkKind.CELLULAR in kinds) return UpdateNetworkKind.CELLULAR
+    if (UpdateNetworkKind.METERED in kinds) return UpdateNetworkKind.METERED
+    if (UpdateNetworkKind.WIFI in kinds) return UpdateNetworkKind.WIFI
+    if (UpdateNetworkKind.ETHERNET in kinds) return UpdateNetworkKind.ETHERNET
+    if (UpdateNetworkKind.OTHER in kinds) return UpdateNetworkKind.OTHER
+    return null
+}
+
+private fun NetworkCapabilities?.toUpdateNetworkKind(): UpdateNetworkKind? =
+    this?.let {
+        classifyUpdateNetworkCapabilities(
+            wifi = it.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+            cellular = it.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+            ethernet = it.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+            vpn = it.hasTransport(NetworkCapabilities.TRANSPORT_VPN),
+            internet = it.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
+            notMetered = it.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
+        )
+    }
 
 @Suppress("UNCHECKED_CAST")
 private fun NetworkCapabilities?.underlyingNetworksCompat(): List<Network> {
