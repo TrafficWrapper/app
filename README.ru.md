@@ -161,12 +161,12 @@ export TW_PUBLIC_SIGNING_CERT_SHA256=<your-release-cert-sha256>
 
 Публичный APK доступен в GitHub Releases:
 
-- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.16>
-- Файл: `TrafficWrapper-app-v0.1.16.apk`
-- APK SHA-256: `6ba34be22b0f7c5e9cd697d6ce313b0efc808e468590b4e02ac5233eaa38d53e`
+- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.17>
+- Файл: `TrafficWrapper-app-v0.1.17.apk`
+- APK SHA-256: `ae41e5f4a6868b2b4ffe28da71db7c2cb44834923c881c5e442d8a6e715bf166`
 - SHA-256 signing certificate: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
 - Application ID: `org.trafficwrapper.app`
-- Версия: `0.1.16` (`versionCode=17`)
+- Версия: `0.1.17` (`versionCode=18`)
 
 Чтобы установить APK: скачайте файл на телефон, разрешите установку из
 неизвестных источников для браузера или файлового менеджера, откройте
@@ -184,8 +184,8 @@ artifacts. Он проверяет APK SHA-256, SHA-256 signing certificate APK,
 minisign подпись manifest и optional rebuild из git tag.
 
 ```sh
-APK=TrafficWrapper-app-v0.1.16.apk \
-EXPECTED_APK_SHA256=6ba34be22b0f7c5e9cd697d6ce313b0efc808e468590b4e02ac5233eaa38d53e \
+APK=TrafficWrapper-app-v0.1.17.apk \
+EXPECTED_APK_SHA256=ae41e5f4a6868b2b4ffe28da71db7c2cb44834923c881c5e442d8a6e715bf166 \
 EXPECTED_CERT_SHA256=bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8 \
 ./build/verify-release.sh
 ```
@@ -193,7 +193,7 @@ EXPECTED_CERT_SHA256=bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36
 Если у вас также есть update manifest и public update key:
 
 ```sh
-APK=TrafficWrapper-app-v0.1.16.apk \
+APK=TrafficWrapper-app-v0.1.17.apk \
 MANIFEST=update-manifest.json \
 MINISIG=update-manifest.json.minisig \
 MINISIGN_PUBKEY=<update.pub line> \
