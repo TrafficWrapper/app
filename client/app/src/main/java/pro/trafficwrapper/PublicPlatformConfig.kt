@@ -382,7 +382,28 @@ object PublicPlatformConfigParser {
             fingerprint = clampRealityFingerprint(params.optString(JSON_REALITY_FINGERPRINT, "chrome")),
             spiderX = params.optString(JSON_REALITY_SPIDER_X, "/"),
             dest = params.optString(JSON_REALITY_DEST),
+            xhttpPath = params.xhttpString(JSON_REALITY_XHTTP_PATH, JSON_REALITY_XHTTP_PATH_SNAKE),
+            xhttpMode = params.xhttpString(JSON_REALITY_XHTTP_MODE, JSON_REALITY_XHTTP_MODE_SNAKE),
+            xhttpExtraJson = params.xhttpObjectString(JSON_REALITY_XHTTP_EXTRA, JSON_REALITY_XHTTP_EXTRA_SNAKE),
         )
+
+    private fun JSONObject.xhttpString(camelKey: String, snakeKey: String): String {
+        val xhttp = optJSONObject(JSON_REALITY_XHTTP)
+        return xhttp?.optString(camelKey).orEmpty()
+            .ifBlank { xhttp?.optString(snakeKey).orEmpty() }
+            .ifBlank { optString("xhttp_$snakeKey") }
+            .ifBlank { optString("xhttp${camelKey.replaceFirstChar { it.uppercaseChar() }}") }
+            .trim()
+    }
+
+    private fun JSONObject.xhttpObjectString(camelKey: String, snakeKey: String): String {
+        val xhttp = optJSONObject(JSON_REALITY_XHTTP)
+        return xhttp?.optJSONObject(camelKey)?.toString().orEmpty()
+            .ifBlank { xhttp?.optJSONObject(snakeKey)?.toString().orEmpty() }
+            .ifBlank { optJSONObject("xhttp_$snakeKey")?.toString().orEmpty() }
+            .ifBlank { optJSONObject("xhttp${camelKey.replaceFirstChar { it.uppercaseChar() }}")?.toString().orEmpty() }
+            .trim()
+    }
 
     private fun JSONObject.withMergedParams(): JSONObject {
         val merged = JSONObject(toString())
@@ -503,6 +524,13 @@ object PublicPlatformConfigParser {
     private const val JSON_REALITY_FINGERPRINT = "fingerprint"
     private const val JSON_REALITY_SPIDER_X = "spiderX"
     private const val JSON_REALITY_DEST = "dest"
+    private const val JSON_REALITY_XHTTP = "xhttp"
+    private const val JSON_REALITY_XHTTP_PATH = "path"
+    private const val JSON_REALITY_XHTTP_PATH_SNAKE = "path"
+    private const val JSON_REALITY_XHTTP_MODE = "mode"
+    private const val JSON_REALITY_XHTTP_MODE_SNAKE = "mode"
+    private const val JSON_REALITY_XHTTP_EXTRA = "extra"
+    private const val JSON_REALITY_XHTTP_EXTRA_SNAKE = "extra"
     private const val DEFAULT_CONFIG_EXPIRES_AT = "9999-12-31T23:59:59Z"
     private val REALITY_ROUTE_TYPES = setOf("reality", "reality2")
     private val AWG_ROUTE_TYPES = setOf("awg", "awgru", "awg_ru")

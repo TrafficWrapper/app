@@ -83,6 +83,9 @@ data class RealityUiConfig(
     val fingerprint: String = "",
     val spiderX: String = "",
     val dest: String = "",
+    val xhttpPath: String = "",
+    val xhttpMode: String = "",
+    val xhttpExtraJson: String = "",
 ) {
     fun isComplete(): Boolean =
         transport.isNotBlank() &&
@@ -95,7 +98,11 @@ data class RealityUiConfig(
             publicKey.isNotBlank() &&
             shortId.isNotBlank() &&
             fingerprint.isNotBlank() &&
-            spiderX.isNotBlank()
+            spiderX.isNotBlank() &&
+            (
+                !network.equals("xhttp", ignoreCase = true) ||
+                    (xhttpPath.isNotBlank() && xhttpMode.isNotBlank())
+                )
 }
 
 data class AuthUiState(

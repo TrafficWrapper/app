@@ -172,22 +172,7 @@ class RealityService : Service() {
             .put("tag", "reality-out")
             .put("protocol", "vless")
             .put("settings", JSONObject().put("vnext", JSONArray().put(vnext)))
-            .put(
-                "streamSettings",
-                JSONObject()
-                    .put("network", cfg.network)
-                    .put("security", cfg.security)
-                    .put("sockopt", realitySockopt())
-                    .put(
-                        "realitySettings",
-                        JSONObject()
-                            .put("serverName", cfg.serverName)
-                            .put("fingerprint", cfg.fingerprint)
-                            .put("publicKey", cfg.publicKey)
-                            .put("shortId", cfg.shortId)
-                            .put("spiderX", cfg.spiderX),
-                    ),
-            )
+            .put("streamSettings", realityStreamSettingsJson(cfg, realitySockopt()))
         val config = JSONObject()
             .put("log", JSONObject().put("loglevel", "warning"))
             .put("inbounds", JSONArray().put(inbound))

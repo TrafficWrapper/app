@@ -3513,19 +3513,9 @@ class AutoTransportService : Service() {
             .put("settings", JSONObject().put("vnext", JSONArray().put(vnext)))
             .put(
                 "streamSettings",
-                JSONObject()
-                    .put("network", cfg.network)
-                    .put("security", cfg.security)
-                    .put("sockopt", realitySockopt())
-                    .put(
-                        "realitySettings",
-                        JSONObject()
-                            .put("serverName", cfg.serverName)
-                            .put("fingerprint", cfg.fingerprint)
-                            .put("publicKey", cfg.publicKey)
-                            .put("shortId", cfg.shortId)
-                            .put("spiderX", cfg.spiderX),
-                    ),
+                realityStreamSettingsJson(cfg, realitySockopt()) { message ->
+                    Log.w(LOG_TAG, "invalid xhttp extra ignored: $message")
+                },
             )
         val config = JSONObject()
             .put("log", JSONObject().put("loglevel", "warning"))
