@@ -157,40 +157,20 @@ class UpdateRepository(private val context: Context) {
     ): List<UpdateEndpoint> {
         val urls = linkedSetOf<String>()
         if (tunnelViable) {
-            TransportRuntime.publicPlatformRouteSlots.orderedRoutes.forEach { resolved ->
-                val url = resolved.route.params.optString("config_url").trim()
-                if (url.isNotBlank()) urls += url.trimEnd('/')
-            }
-            if (urls.isEmpty()) urls += PUBLIC_PLATFORM_UPDATE_BASE_URL
-            return urls.map { UpdateEndpoint(it, socksListen.ifBlank { UPDATE_ROUTER_SOCKS_LISTEN }) }
+            return publicUpdateEndpoints(
+                routeParams = TransportRuntime.publicPlatformRouteSlots.orderedRoutes.map { it.route.params },
+                socksListen = socksListen,
+                tunnelViable = true,
+                directEnabled = directEnabled,
+            ).map { UpdateEndpoint(it.baseUrl, it.socksListen, it.source) }
         }
         if (!directEnabled) return emptyList()
-        return directUpdateBaseUrls().map { UpdateEndpoint(it, "", UpdateSource.DIRECT) }
-    }
-
-    private fun directUpdateBaseUrls(): List<String> {
-        return publicDirectUpdateBaseUrls(TransportRuntime.publicPlatformRouteSlots.orderedRoutes.map { it.route.params })
-    }
-
-    private fun publicDirectUpdateBaseUrls(routeParams: Iterable<org.json.JSONObject>): List<String> {
-        val urls = linkedSetOf<String>()
-        routeParams.forEach { params ->
-            collectUrlArray(params.optJSONArray("direct_update_urls"), urls)
-            collectUrlArray(params.optJSONArray("fallback_urls"), urls)
-            val single = params.optString("direct_update_url").trim()
-            if (single.isNotBlank()) urls += single
-        }
-        return urls
-            .map { it.trim().trimEnd('/') }
-            .filter { it.startsWith("https://", ignoreCase = true) }
-    }
-
-    private fun collectUrlArray(array: JSONArray?, out: MutableSet<String>) {
-        if (array == null) return
-        for (index in 0 until array.length()) {
-            val value = array.optString(index).trim()
-            if (value.isNotBlank()) out += value
-        }
+        return publicUpdateEndpoints(
+            routeParams = TransportRuntime.publicPlatformRouteSlots.orderedRoutes.map { it.route.params },
+            socksListen = socksListen,
+            tunnelViable = false,
+            directEnabled = true,
+        ).map { UpdateEndpoint(it.baseUrl, it.socksListen, it.source) }
     }
 
     private fun updateCacheDir(): File =
@@ -223,5 +203,58 @@ class UpdateRepository(private val context: Context) {
 
     private companion object {
         private const val TAG = "TWPublicUpdate"
+    }
+}
+
+internal data class PublicUpdateEndpointCandidate(
+    val baseUrl: String,
+    val socksListen: String,
+    val source: UpdateSource = UpdateSource.PLATFORM,
+)
+
+internal fun publicUpdateEndpoints(
+    routeParams: Iterable<org.json.JSONObject>,
+    socksListen: String,
+    tunnelViable: Boolean,
+    directEnabled: Boolean,
+): List<PublicUpdateEndpointCandidate> {
+    if (tunnelViable) {
+        val urls = linkedSetOf<String>()
+        routeParams.forEach { params ->
+            val url = params.optString("config_url").trim()
+            if (url.isNotBlank()) urls += url.trimEnd('/')
+        }
+        if (urls.isEmpty()) urls += PUBLIC_PLATFORM_UPDATE_BASE_URL
+        return urls.map {
+            PublicUpdateEndpointCandidate(
+                baseUrl = it,
+                socksListen = socksListen.ifBlank { UPDATE_ROUTER_SOCKS_LISTEN },
+            )
+        }
+    }
+    if (!directEnabled) return emptyList()
+    return publicDirectUpdateBaseUrls(routeParams).map {
+        PublicUpdateEndpointCandidate(it, "", UpdateSource.DIRECT)
+    }
+}
+
+internal fun publicDirectUpdateBaseUrls(routeParams: Iterable<org.json.JSONObject>): List<String> {
+    val urls = linkedSetOf<String>()
+    routeParams.forEach { params ->
+        collectUrlArray(params.optJSONArray("direct_update_urls"), urls)
+        collectUrlArray(params.optJSONArray("fallback_urls"), urls)
+        val single = params.optString("direct_update_url").trim()
+        if (single.isNotBlank()) urls += single
+    }
+    return urls
+        .map { it.trim().trimEnd('/') }
+        .filter { it.startsWith("https://", ignoreCase = true) }
+}
+
+private fun collectUrlArray(array: JSONArray?, out: MutableSet<String>) {
+    if (array == null) return
+    for (index in 0 until array.length()) {
+        val value = array.optString(index).trim()
+        if (value.isNotBlank()) out += value
     }
 }
