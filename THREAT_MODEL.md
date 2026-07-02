@@ -11,6 +11,9 @@ App-specific risks and controls:
   material. External imports must be confirmed by the user before enrollment.
 - `client-config-v1` is accepted only after minisign verification against the
   pinned config public key.
+- SOCKS domain targets are resolved through the AWG netstack DNS servers inside
+  the tunnel. The app must not fall back to the host OS plaintext resolver for
+  proxied domain names.
 - APK self-updates are accepted only when the update manifest verifies and the
   downloaded APK certificate matches the pinned SHA-256 fingerprint.
 - Workers remain exit/decryption points for AWG. The app can enforce signatures

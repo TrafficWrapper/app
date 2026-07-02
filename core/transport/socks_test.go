@@ -1,12 +1,15 @@
 package transport
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	netstacktun "github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 )
 
 func TestSOCKSAcceptTemporaryErrorDoesNotStopLoop(t *testing.T) {
@@ -124,6 +127,60 @@ func TestSOCKSProxyHalfCloseAllowsResponseAfterClientFIN(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("proxy did not finish")
+	}
+}
+
+func TestResolveTargetIPDoesNotUseResolver(t *testing.T) {
+	oldLookup := lookupSOCKSTargetHost
+	lookupSOCKSTargetHost = func(context.Context, *netstacktun.Net, string) ([]string, error) {
+		t.Fatal("IP target unexpectedly used DNS resolver")
+		return nil, nil
+	}
+	defer func() { lookupSOCKSTargetHost = oldLookup }()
+
+	addr, err := resolveTarget(context.Background(), nil, socksTarget{host: "203.0.113.8", port: 443})
+	if err != nil {
+		t.Fatalf("resolve IP target: %v", err)
+	}
+	if got := addr.String(); got != "203.0.113.8:443" {
+		t.Fatalf("resolved target=%s, want 203.0.113.8:443", got)
+	}
+}
+
+func TestResolveTargetDomainUsesTunnelResolver(t *testing.T) {
+	oldLookup := lookupSOCKSTargetHost
+	var called atomic.Bool
+	lookupSOCKSTargetHost = func(ctx context.Context, tnet *netstacktun.Net, host string) ([]string, error) {
+		called.Store(true)
+		if host != "example.com" {
+			t.Fatalf("resolver host=%q, want example.com", host)
+		}
+		if tnet != nil {
+			t.Fatal("test passed unexpected netstack instance")
+		}
+		return []string{"2001:db8::1", "198.51.100.17"}, nil
+	}
+	defer func() { lookupSOCKSTargetHost = oldLookup }()
+
+	addr, err := resolveTarget(context.Background(), nil, socksTarget{host: "example.com", port: 8443})
+	if err != nil {
+		t.Fatalf("resolve domain target: %v", err)
+	}
+	if !called.Load() {
+		t.Fatal("domain target did not use tunnel resolver")
+	}
+	if got := addr.String(); got != "198.51.100.17:8443" {
+		t.Fatalf("resolved target=%s, want 198.51.100.17:8443", got)
+	}
+}
+
+func TestResolveTargetDomainRequiresTunnelResolver(t *testing.T) {
+	oldLookup := lookupSOCKSTargetHost
+	defer func() { lookupSOCKSTargetHost = oldLookup }()
+
+	_, err := resolveTarget(context.Background(), nil, socksTarget{host: "example.com", port: 443})
+	if err == nil {
+		t.Fatal("resolve domain target succeeded without tunnel resolver")
 	}
 }
 

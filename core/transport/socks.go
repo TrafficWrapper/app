@@ -213,27 +213,34 @@ func readSOCKSConnect(r io.Reader) (socksTarget, error) {
 }
 
 func (s *socksServer) dial(ctx context.Context, target socksTarget) (net.Conn, error) {
-	addr, err := resolveTarget(ctx, target)
+	addr, err := resolveTarget(ctx, s.tnet, target)
 	if err != nil {
 		return nil, err
 	}
 	return s.tnet.DialContextTCPAddrPort(ctx, addr)
 }
 
-func resolveTarget(ctx context.Context, target socksTarget) (netip.AddrPort, error) {
+var lookupSOCKSTargetHost = func(ctx context.Context, tnet *netstacktun.Net, host string) ([]string, error) {
+	if tnet == nil {
+		return nil, errors.New("netstack resolver is unavailable")
+	}
+	return tnet.LookupContextHost(ctx, host)
+}
+
+func resolveTarget(ctx context.Context, tnet *netstacktun.Net, target socksTarget) (netip.AddrPort, error) {
 	if ip, err := netip.ParseAddr(target.host); err == nil {
 		if ip.Is4() {
 			return netip.AddrPortFrom(ip, target.port), nil
 		}
 		return netip.AddrPort{}, fmt.Errorf("IPv6 target is not supported without IPv6 local address: %s", target.host)
 	}
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, target.host)
+	addrs, err := lookupSOCKSTargetHost(ctx, tnet, target.host)
 	if err != nil {
 		return netip.AddrPort{}, err
 	}
 	for _, addr := range addrs {
-		ip, ok := netip.AddrFromSlice(addr.IP)
-		if ok && ip.Is4() {
+		ip, err := netip.ParseAddr(addr)
+		if err == nil && ip.Is4() {
 			return netip.AddrPortFrom(ip, target.port), nil
 		}
 	}
