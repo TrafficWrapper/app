@@ -28,6 +28,68 @@ class MainActivityUiPolicyTest {
     }
 
     @Test
+    fun routeRegionUsesCarryingRouteAndOmitsBlankRegion() {
+        val regions = mapOf("AWG" to "Operator West", "REALITY2" to "Operator East")
+        val route = statusRouteForUi(
+            TransportUiState(activeTransport = "AWG", carryingTransport = "REALITY2"),
+            TransportChoice.AWG,
+        )
+
+        assertEquals("REALITY2", route)
+        assertEquals("Operator East", routeRegionForUi(route, regions))
+        assertEquals("", routeRegionForUi("REALITY", regions))
+    }
+
+    @Test
+    fun statusDetailsAddRegionOnlyWhenPresent() {
+        assertEquals(
+            "REALITY B · Operator East · stable",
+            connectedStatusDetail("REALITY B", "Operator East", "stable"),
+        )
+        assertEquals(
+            "REALITY B · stable",
+            connectedStatusDetail("REALITY B", "", "stable"),
+        )
+        assertEquals(
+            "Connecting to REALITY B (Operator East)…",
+            connectingStatusDetail(
+                label = "REALITY B",
+                region = "Operator East",
+                fallback = "Connecting…",
+                formatNoRegion = { "Connecting to $it…" },
+                formatWithRegion = { label, region -> "Connecting to $label ($region)…" },
+            ),
+        )
+        assertEquals(
+            "Connecting to REALITY B…",
+            connectingStatusDetail(
+                label = "REALITY B",
+                region = "",
+                fallback = "Connecting…",
+                formatNoRegion = { "Connecting to $it…" },
+                formatWithRegion = { label, region -> "Connecting to $label ($region)…" },
+            ),
+        )
+        assertEquals(
+            "Connecting…",
+            connectingStatusDetail(
+                label = "AUTO",
+                region = "Operator East",
+                fallback = "Connecting…",
+                formatNoRegion = { "Connecting to $it…" },
+                formatWithRegion = { label, region -> "Connecting to $label ($region)…" },
+            ),
+        )
+    }
+
+    @Test
+    fun transportModeCardSubtitlePrefersActionDetailThenRegion() {
+        assertEquals("нет маршрута", transportModeCardSubtitle("нет маршрута", "Operator East"))
+        assertEquals("Operator East", transportModeCardSubtitle(null, " Operator East "))
+        assertEquals(null, transportModeCardSubtitle(null, ""))
+    }
+
+    @Test
     fun exchangeRecencyBucketsAreStable() {
         assertEquals("exchange now", formatExchangeRecency(null))
         assertEquals("exchange now", formatExchangeRecency(2))

@@ -83,6 +83,8 @@
     <string name="main_status_disconnected">Отключено</string>
     <string name="main_status_disconnected_hint">Нажмите «Подключить»</string>
     <string name="main_status_connecting">Подключение…</string>
+    <string name="main_status_connecting_detail">Подключение к %1$s…</string>
+    <string name="main_status_connecting_detail_region">Подключение к %1$s (%2$s)…</string>
     <string name="main_status_connected">Подключено</string>
     <string name="main_status_connected_hint">стабильно</string>
     <string name="main_status_traffic">Трафик: ↓ %1$s / ↑ %2$s</string>

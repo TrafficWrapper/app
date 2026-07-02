@@ -77,6 +77,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -743,20 +745,34 @@ private fun ConnectionStatusCard(
     val textColor: Color
     val titleRes: Int
     val detail: String
+    val context = LocalContext.current
     val route = statusRouteForUi(transport, selectedTransport)
+    val routeRegion = routeRegionForUi(route, TransportRuntime.publicPlatformRouteSlots.routeRegions)
     val traffic = rememberSessionTrafficSnapshot(connected, route)
     when {
         connected -> {
             backgroundColor = Color(0xFFE6F4EA)
             textColor = Color(0xFF14532D)
             titleRes = R.string.main_status_connected
-            detail = "${displayTransportLabel(route)} · ${stringResource(R.string.main_status_connected_hint)}"
+            detail = connectedStatusDetail(
+                label = displayTransportLabel(route),
+                region = routeRegion,
+                stableText = stringResource(R.string.main_status_connected_hint),
+            )
         }
         connecting -> {
             backgroundColor = Color(0xFFFFF4D6)
             textColor = Color(0xFF6F4B00)
             titleRes = R.string.main_status_connecting
-            detail = stringResource(transport.stateTextRes)
+            detail = connectingStatusDetail(
+                label = displayTransportLabel(route),
+                region = routeRegion,
+                fallback = stringResource(transport.stateTextRes),
+                formatNoRegion = { context.getString(R.string.main_status_connecting_detail, it) },
+                formatWithRegion = { label, region ->
+                    context.getString(R.string.main_status_connecting_detail_region, label, region)
+                },
+            )
         }
         else -> {
             backgroundColor = Color(0xFFFFEBEE)
@@ -1430,9 +1446,11 @@ private fun TransportModeCard(
     detail: String? = null,
 ) {
     val selected = selectedTransport == choice
+    val region = transportChoiceRegion(choice, TransportRuntime.publicPlatformRouteSlots.routeRegions)
+    val subtitle = transportModeCardSubtitle(detail = detail, region = region)
     Surface(
         modifier = modifier
-            .height(if (detail == null) 64.dp else 74.dp)
+            .height(if (subtitle == null) 64.dp else 82.dp)
             .clickable(enabled = enabled) {
                 TransportRuntime.selectedTransport = choice
                 if (auth.authorized) {
@@ -1447,17 +1465,26 @@ private fun TransportModeCard(
             modifier = Modifier.padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column(modifier = Modifier.weight(1f)) {
+            Column(
+                modifier = Modifier.weight(1f),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
                 Text(
                     text = stringResource(transportChoiceLabelRes(choice)),
                     fontWeight = FontWeight.SemiBold,
                     color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
                 )
-                detail?.let {
+                subtitle?.let {
                     Text(
                         text = it,
                         modifier = Modifier.padding(top = 2.dp),
                         style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
                     )
                 }
             }
@@ -2415,6 +2442,39 @@ private fun displayTransportLabel(raw: String): String =
         TRANSPORT_LABEL_REALITY2 -> "REALITY B"
         else -> raw.ifBlank { "AUTO" }
     }
+
+private fun transportChoiceRegion(choice: TransportChoice, regions: Map<String, String>): String =
+    routeRegionForUi(defaultRouteForChoice(choice), regions)
+
+internal fun routeRegionForUi(route: String, regions: Map<String, String>): String =
+    regions[route].orEmpty()
+
+internal fun transportModeCardSubtitle(detail: String?, region: String): String? =
+    detail ?: region.trim().ifBlank { null }
+
+internal fun connectedStatusDetail(label: String, region: String, stableText: String): String =
+    listOf(label, region.trim(), stableText)
+        .filter { it.isNotBlank() }
+        .joinToString(" · ")
+
+internal fun connectingStatusDetail(
+    label: String,
+    region: String,
+    fallback: String,
+    formatNoRegion: (String) -> String,
+    formatWithRegion: (String, String) -> String,
+): String {
+    val normalizedLabel = label.trim()
+    if (normalizedLabel.isBlank() || normalizedLabel == "AUTO") {
+        return fallback
+    }
+    val normalizedRegion = region.trim()
+    return if (normalizedRegion.isBlank()) {
+        formatNoRegion(normalizedLabel)
+    } else {
+        formatWithRegion(normalizedLabel, normalizedRegion)
+    }
+}
 
 private fun refreshAttentionState(context: Context) {
     refreshBatteryRestrictionRuntime(context.applicationContext)

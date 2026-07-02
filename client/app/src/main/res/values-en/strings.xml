@@ -4,6 +4,8 @@
     <string name="transport_mode_reality">REALITY A</string>
     <string name="transport_mode_reality2">REALITY B</string>
     <string name="transport_mode_auto_detail">Auto: operator routes by priority</string>
+    <string name="main_status_connecting_detail">Connecting to %1$s…</string>
+    <string name="main_status_connecting_detail_region">Connecting to %1$s (%2$s)…</string>
     <string name="main_status_traffic">Traffic: ↓ %1$s / ↑ %2$s</string>
     <string name="main_status_speed">Speed: ↓ %1$s / ↑ %2$s</string>
     <string name="main_status_quality">Quality: %1$s</string>
