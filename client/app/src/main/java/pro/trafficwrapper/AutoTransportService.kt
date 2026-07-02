@@ -309,6 +309,23 @@ internal fun canSwitchRoutePolicy(
         nowMs - lastRouteSwitchAtMs >= switchMinIntervalMs ||
         reason == ROUTE_REASON_ACTIVE_UNHEALTHY
 
+internal fun xrayTlsAttemptJitterDelayMs(
+    nowMs: Long,
+    lastAttemptAtMs: Long,
+    attemptsInWindow: Int,
+    minSpacingMs: Long,
+    burstLimit: Int,
+    burstDelayMs: Long,
+): Long {
+    val spacingDelay = if (lastAttemptAtMs > 0L) {
+        (minSpacingMs - (nowMs - lastAttemptAtMs)).coerceAtLeast(0L)
+    } else {
+        0L
+    }
+    val burstDelay = if (attemptsInWindow >= burstLimit) burstDelayMs else 0L
+    return maxOf(spacingDelay, burstDelay)
+}
+
 internal fun shouldPromoteRecoveredPriorityRoute(
     inactiveHealthySinceMs: Long,
     lastHealthLostAtMs: Long,
@@ -399,6 +416,11 @@ internal const val TCP_ROUTE_FLAP_DEMOTE_MAX_MS = 5 * 60 * 1000L
 internal const val TCP_ROUTE_FLAP_DEMOTE_MAX_SHIFT = 4
 internal const val ROUTE_SWITCH_MIN_INTERVAL_MS = 10_000L
 internal const val PREPARE_RETRY_BACKOFF_MS = 1_250L
+internal const val XRAY_TLS_ATTEMPT_WINDOW_MS = 60_000L
+internal const val XRAY_TLS_ATTEMPT_MIN_SPACING_MS = 450L
+internal const val XRAY_TLS_ATTEMPT_BURST_LIMIT = 3
+internal const val XRAY_TLS_ATTEMPT_BURST_DELAY_MS = 1_200L
+internal const val XRAY_TLS_ATTEMPT_JITTER_MS = 250L
 internal const val ROUTE_REASON_ACTIVE_UNHEALTHY = "active_unhealthy"
 internal const val SOCKS5_VERSION = 5
 internal const val SOCKS5_ATYP_IPV4 = 1
@@ -446,6 +468,9 @@ class AutoTransportService : Service() {
 
     @Volatile
     private var xray2Process: Process? = null
+
+    private val xrayTlsAttemptLock = Any()
+    private val xrayTlsAttemptHistoryBySni = linkedMapOf<String, ArrayDeque<Long>>()
 
     @Volatile
     private var appliedReality2Uuid: String = ""
@@ -3158,6 +3183,7 @@ class AutoTransportService : Service() {
                 markRouteProcessStarted(route, generation, started = false, failure = "xray_not_executable")
                 return XrayStartResult(started = false, error = "xray_not_executable", errorKind = "process")
             }
+            applyXrayTlsAttemptJitter(cfg, route)
             val configFile = writeXrayConfig(cfg, route)
             val process = ProcessBuilder(
                 xray.absolutePath,
@@ -3186,6 +3212,42 @@ class AutoTransportService : Service() {
                 errorKind = Telemetry.errorKind(error),
             )
         }
+    }
+
+    private fun applyXrayTlsAttemptJitter(cfg: RealityUiConfig, route: Route) {
+        val sni = cfg.serverName.trim().lowercase()
+        if (sni.isBlank()) return
+        val delayMs = synchronized(xrayTlsAttemptLock) {
+            val nowMs = SystemClock.elapsedRealtime()
+            val attempts = xrayTlsAttemptHistoryBySni.getOrPut(sni) { ArrayDeque() }
+            while (attempts.isNotEmpty() && nowMs - attempts.first() > XRAY_TLS_ATTEMPT_WINDOW_MS) {
+                attempts.removeFirst()
+            }
+            val baseDelayMs = xrayTlsAttemptJitterDelayMs(
+                nowMs = nowMs,
+                lastAttemptAtMs = attempts.lastOrNull() ?: 0L,
+                attemptsInWindow = attempts.size,
+                minSpacingMs = XRAY_TLS_ATTEMPT_MIN_SPACING_MS,
+                burstLimit = XRAY_TLS_ATTEMPT_BURST_LIMIT,
+                burstDelayMs = XRAY_TLS_ATTEMPT_BURST_DELAY_MS,
+            )
+            val jitterMs = if (baseDelayMs > 0L) {
+                Random.nextLong(0L, XRAY_TLS_ATTEMPT_JITTER_MS + 1L)
+            } else {
+                0L
+            }
+            val totalDelayMs = baseDelayMs + jitterMs
+            attempts.addLast(nowMs + totalDelayMs)
+            totalDelayMs
+        }
+        if (delayMs <= 0L) return
+        Log.i(LOG_TAG, "Xray TLS attempt jitter route=${route.name} delay_ms=$delayMs")
+        telemetryEvent(
+            "xray_tls_jitter",
+            "route" to routeLabel(route),
+            "delay_ms" to delayMs,
+        )
+        SystemClock.sleep(delayMs)
     }
 
     private fun stopXraySidecar(route: Route) {

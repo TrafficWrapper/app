@@ -53,6 +53,43 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
+    fun xrayTlsAttemptJitterKeepsMinimumSpacingAndBurstDelay() {
+        assertEquals(
+            250L,
+            xrayTlsAttemptJitterDelayMs(
+                nowMs = 1_200L,
+                lastAttemptAtMs = 1_000L,
+                attemptsInWindow = 1,
+                minSpacingMs = 450L,
+                burstLimit = 3,
+                burstDelayMs = 1_200L,
+            ),
+        )
+        assertEquals(
+            1_200L,
+            xrayTlsAttemptJitterDelayMs(
+                nowMs = 10_000L,
+                lastAttemptAtMs = 1_000L,
+                attemptsInWindow = 3,
+                minSpacingMs = 450L,
+                burstLimit = 3,
+                burstDelayMs = 1_200L,
+            ),
+        )
+        assertEquals(
+            0L,
+            xrayTlsAttemptJitterDelayMs(
+                nowMs = 10_000L,
+                lastAttemptAtMs = 1_000L,
+                attemptsInWindow = 2,
+                minSpacingMs = 450L,
+                burstLimit = 3,
+                burstDelayMs = 1_200L,
+            ),
+        )
+    }
+
+    @Test
     fun healthProbeDestinationMatchesOutboundUrl() {
         assertTrue(isHealthProbeDestination("api.ipify.org:443", "https://api.ipify.org"))
         assertTrue(isHealthProbeDestination("example.com:80", "http://example.com/path"))
