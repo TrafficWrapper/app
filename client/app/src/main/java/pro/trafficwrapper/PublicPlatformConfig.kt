@@ -72,6 +72,7 @@ data class PublicRouteConfig(
     val port: Int,
     val expectedEgressIp: String,
     val dialectId: String,
+    val region: String = "",
     val params: JSONObject,
 )
 
@@ -101,6 +102,7 @@ data class PublicPlatformRouteSlots(
     val realityExpectedEgressIp: String = "",
     val orderedRoutes: List<PublicResolvedRoute> = emptyList(),
     val routePriorities: Map<String, Int> = emptyMap(),
+    val routeRegions: Map<String, String> = emptyMap(),
 ) {
     fun hasUsableRoute(): Boolean =
         awgRu != null || awg != null || reality2?.isComplete() == true || reality?.isComplete() == true
@@ -235,6 +237,12 @@ object PublicPlatformConfigParser {
                 reality = primaryReality,
                 reality2 = secondaryReality,
             ),
+            routeRegions = publicRouteRegions(
+                awgRu = primaryAwg,
+                awg = secondaryAwg,
+                reality = primaryReality,
+                reality2 = secondaryReality,
+            ),
         )
     }
 
@@ -267,6 +275,24 @@ object PublicPlatformConfigParser {
             .mapIndexed { rank, item -> item.first to rank }
             .toMap()
     }
+
+    private fun publicRouteRegions(
+        awgRu: PublicRouteConfig?,
+        awg: PublicRouteConfig?,
+        reality2: PublicRouteConfig?,
+        reality: PublicRouteConfig?,
+    ): Map<String, String> =
+        listOf(
+            "AWG_RU" to awgRu,
+            "REALITY" to reality,
+            "AWG" to awg,
+            "REALITY2" to reality2,
+        )
+            .mapNotNull { (slot, route) ->
+                val region = route?.region?.trim().orEmpty()
+                if (region.isBlank()) null else slot to region
+            }
+            .toMap()
 
     private fun parseEnvelope(raw: String, expectedPublicKey: String): PublicClientConfigEnvelope {
         val root = JSONObject(raw)
@@ -330,6 +356,7 @@ object PublicPlatformConfigParser {
                             worker.optString(JSON_EXPECTED_EGRESS_IP),
                         ),
                         dialectId = value.optString(JSON_DIALECT_ID).ifBlank { params.optString(JSON_DIALECT_ID) },
+                        region = value.optString(JSON_REGION).ifBlank { params.optString(JSON_REGION) }.trim(),
                         params = params,
                     )
                 } else {
@@ -355,6 +382,7 @@ object PublicPlatformConfigParser {
             port = params.optInt(JSON_PORT, endpointPort ?: 0),
             expectedEgressIp = worker.getString(JSON_EXPECTED_EGRESS_IP),
             dialectId = params.optString(JSON_DIALECT_ID),
+            region = params.optString(JSON_REGION).trim(),
             params = params,
         )
     }
@@ -497,6 +525,7 @@ object PublicPlatformConfigParser {
     private const val JSON_ID = "id"
     private const val JSON_WORKER_ID = "worker_id"
     private const val JSON_LABEL = "label"
+    private const val JSON_REGION = "region"
     private const val JSON_PRIORITY = "priority"
     private const val JSON_WEIGHT = "weight"
     private const val JSON_ROUTES = "routes"

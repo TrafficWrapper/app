@@ -265,6 +265,38 @@ class PublicPlatformConfigTest {
     }
 
     @Test
+    fun routeSlotsExposeOptionalOperatorRegionMetadata() {
+        val parsed = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = JSONObject()
+                .put("config_json", regionClientConfig())
+                .put("minisig", "sig")
+                .toString(),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 0,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+
+        val slots = PublicPlatformConfigParser.routeSlots(
+            config = parsed,
+            deviceId = "device-a",
+            credentials = PublicPlatformCredentials(
+                deviceID = "device-a",
+                realityUUID = "22222222-2222-4222-8222-222222222222",
+                internalIP = "10.13.13.3/32",
+                psk2 = "psk",
+                serverAWGPublic = "server-awg",
+                awgPrivateKey = "private",
+                awgPublicKey = "public",
+            ),
+        )
+
+        assertEquals("Operator Edge", parsed.workers.single().routes[0].region)
+        assertEquals("Operator Edge", slots.routeRegions["REALITY"])
+        assertEquals(null, slots.routeRegions["AWG"])
+    }
+
+    @Test
     fun routeSlotsParseXhttpRealityParams() {
         val parsed = PublicPlatformConfigParser.verifyAndParseClientConfig(
             envelopeRaw = JSONObject()
@@ -388,6 +420,9 @@ class PublicPlatformConfigTest {
 
     private fun nestedParamsClientConfig(): String =
         """{"schema":1,"ns":"client-config-v1","seq":2,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-nested","label":"Nested","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":2053,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","flow":"xtls-rprx-vision","security":"reality","network":"tcp","fingerprint":"firefox"}},{"type":"awg","enabled":true,"address":"worker.example","port":51888,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"awg-server-pub","endpoint":"worker.example:51888","dialect_id":"dialect-1"}}]}]}"""
+
+    private fun regionClientConfig(): String =
+        """{"schema":1,"ns":"client-config-v1","seq":12,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-region","label":"Region","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":443,"expected_egress_ip":"198.51.100.22","region":"Operator Edge","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","security":"reality","network":"tcp","fingerprint":"chrome"}},{"type":"awg","enabled":true,"address":"worker.example","port":51888,"expected_egress_ip":"198.51.100.22","params":{"public_key":"awg-server-pub","endpoint":"worker.example:51888"}}]}]}"""
 
     private fun xhttpClientConfig(): String =
         """{"schema":1,"ns":"client-config-v1","seq":3,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-xhttp","label":"XHTTP","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":443,"expected_egress_ip":"198.51.100.21","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","security":"reality","network":"xhttp","fingerprint":"chrome","xhttp":{"path":"/operator-path","mode":"auto","extra":{"headers":{"X-Test":"1"}}}}}]}]}"""
