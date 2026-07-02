@@ -184,6 +184,72 @@ func TestResolveTargetDomainRequiresTunnelResolver(t *testing.T) {
 	}
 }
 
+func TestSOCKSIPv6TargetReturnsAddressTypeUnsupported(t *testing.T) {
+	code := socksReplyCodeForRequest(t, socksConnectRequestIPv6(net.ParseIP("2001:db8::1"), 443))
+	if code != 0x08 {
+		t.Fatalf("IPv6 SOCKS reply=%#x want 0x08", code)
+	}
+}
+
+func TestSOCKSGenericResolveFailureReturnsGeneralFailure(t *testing.T) {
+	oldLookup := lookupSOCKSTargetHost
+	lookupSOCKSTargetHost = func(context.Context, *netstacktun.Net, string) ([]string, error) {
+		return nil, errors.New("resolver down")
+	}
+	defer func() { lookupSOCKSTargetHost = oldLookup }()
+
+	code := socksReplyCodeForRequest(t, socksConnectRequestDomain("example.com", 443))
+	if code != 0x05 {
+		t.Fatalf("generic failure SOCKS reply=%#x want 0x05", code)
+	}
+}
+
+func socksReplyCodeForRequest(t *testing.T, request []byte) byte {
+	t.Helper()
+	client, serverConn := net.Pipe()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() { done <- (&socksServer{}).handle(serverConn) }()
+
+	if _, err := client.Write([]byte{socksVersion5, 0x01, socksNoAuth}); err != nil {
+		t.Fatalf("write handshake: %v", err)
+	}
+	reply := make([]byte, 2)
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatalf("read handshake reply: %v", err)
+	}
+	if _, err := client.Write(request); err != nil {
+		t.Fatalf("write connect request: %v", err)
+	}
+	socksReply := make([]byte, 10)
+	if _, err := io.ReadFull(client, socksReply); err != nil {
+		t.Fatalf("read socks reply: %v", err)
+	}
+	_ = client.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("socks handler did not finish")
+	}
+	return socksReply[1]
+}
+
+func socksConnectRequestDomain(host string, port uint16) []byte {
+	raw := []byte(host)
+	req := []byte{socksVersion5, socksConnect, 0x00, 0x03, byte(len(raw))}
+	req = append(req, raw...)
+	req = append(req, byte(port>>8), byte(port))
+	return req
+}
+
+func socksConnectRequestIPv6(ip net.IP, port uint16) []byte {
+	raw := ip.To16()
+	req := []byte{socksVersion5, socksConnect, 0x00, 0x04}
+	req = append(req, raw...)
+	req = append(req, byte(port>>8), byte(port))
+	return req
+}
+
 type scriptedListener struct {
 	calls atomic.Int32
 	errs  []error

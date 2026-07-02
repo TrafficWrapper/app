@@ -128,7 +128,12 @@ func (s *socksServer) handle(client net.Conn) error {
 	defer cancel()
 	upstream, err := s.dial(ctx, target)
 	if err != nil {
-		_ = writeSOCKSReply(client, 0x05)
+		if errors.Is(err, errUnsupportedAddrType) {
+			log.Printf("transport: socks refused IPv6/unsupported %q (fail-closed)", target.host)
+			_ = writeSOCKSReply(client, 0x08)
+		} else {
+			_ = writeSOCKSReply(client, 0x05)
+		}
 		return err
 	}
 	defer upstream.Close()
@@ -227,12 +232,14 @@ var lookupSOCKSTargetHost = func(ctx context.Context, tnet *netstacktun.Net, hos
 	return tnet.LookupContextHost(ctx, host)
 }
 
+var errUnsupportedAddrType = errors.New("unsupported address type")
+
 func resolveTarget(ctx context.Context, tnet *netstacktun.Net, target socksTarget) (netip.AddrPort, error) {
 	if ip, err := netip.ParseAddr(target.host); err == nil {
 		if ip.Is4() {
 			return netip.AddrPortFrom(ip, target.port), nil
 		}
-		return netip.AddrPort{}, fmt.Errorf("IPv6 target is not supported without IPv6 local address: %s", target.host)
+		return netip.AddrPort{}, fmt.Errorf("%w: IPv6 target is not supported without IPv6 local address: %s", errUnsupportedAddrType, target.host)
 	}
 	addrs, err := lookupSOCKSTargetHost(ctx, tnet, target.host)
 	if err != nil {
@@ -244,7 +251,7 @@ func resolveTarget(ctx context.Context, tnet *netstacktun.Net, target socksTarge
 			return netip.AddrPortFrom(ip, target.port), nil
 		}
 	}
-	return netip.AddrPort{}, fmt.Errorf("no IPv4 address for %s", target.host)
+	return netip.AddrPort{}, fmt.Errorf("%w: no IPv4 address for %s", errUnsupportedAddrType, target.host)
 }
 
 func writeSOCKSReply(w io.Writer, code byte) error {
