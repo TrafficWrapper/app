@@ -166,12 +166,12 @@ These variables are read by Gradle or the scripts in `build/`:
 
 The public APK is available on GitHub Releases:
 
-- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.23>
-- File: `TrafficWrapper-app-v0.1.23.apk`
-- APK SHA-256: `d44a4dd4076656ab9a920b7a54bfe4c462bcae6c3e6a0f0922555f442c994dab`
+- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.24>
+- File: `TrafficWrapper-app-v0.1.24.apk`
+- APK SHA-256: `4b5823e7e405a45af1acf94cea541efd964465d63b5e8159afa92088c72d5a82`
 - Signing certificate SHA-256: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
 - Application ID: `org.trafficwrapper.app`
-- Version: `0.1.23` (`versionCode=24`)
+- Version: `0.1.24` (`versionCode=25`)
 
 To install it, download the APK on the phone, allow installation from unknown
 sources for your browser or file manager, open the downloaded file, and confirm
@@ -189,8 +189,8 @@ It checks the APK SHA-256, APK signing certificate SHA-256, optional minisign
 manifest signature, and optional rebuild from a git tag.
 
 ```sh
-APK=TrafficWrapper-app-v0.1.23.apk \
-EXPECTED_APK_SHA256=d44a4dd4076656ab9a920b7a54bfe4c462bcae6c3e6a0f0922555f442c994dab \
+APK=TrafficWrapper-app-v0.1.24.apk \
+EXPECTED_APK_SHA256=4b5823e7e405a45af1acf94cea541efd964465d63b5e8159afa92088c72d5a82 \
 EXPECTED_CERT_SHA256=bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8 \
 ./build/verify-release.sh
 ```
@@ -198,7 +198,7 @@ EXPECTED_CERT_SHA256=bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36
 If you also have an update manifest and public update key:
 
 ```sh
-APK=TrafficWrapper-app-v0.1.23.apk \
+APK=TrafficWrapper-app-v0.1.24.apk \
 MANIFEST=update-manifest.json \
 MINISIG=update-manifest.json.minisig \
 MINISIGN_PUBKEY=<update.pub line> \
