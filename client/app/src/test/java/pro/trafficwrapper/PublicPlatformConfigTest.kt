@@ -282,6 +282,41 @@ class PublicPlatformConfigTest {
         assertEquals("android", clampRealityFingerprint(" Android "))
     }
 
+    @Test
+    fun discoverySinksUseOnlyOperatorProvidedUrls() {
+        val parsed = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = JSONObject()
+                .put("config_json", discoveryClientConfig())
+                .put("minisig", "sig")
+                .toString(),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 0,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        val sinks = discoverySinks(
+            stored = StoredPublicPlatformState(
+                bootstrapRaw = bootstrapJson("2035-01-01T00:00:00Z"),
+                configPubkeyPin = PUBLIC_KEY,
+            ),
+            config = parsed,
+            socksListen = "127.0.0.1:18080",
+        )
+
+        assertEquals(
+            listOf(
+                "https://orch.dev/discovery",
+                "https://worker.example/discovery",
+                "http://awg-gw:8080/tw",
+            ),
+            sinks.map { it.baseUrl },
+        )
+        assertEquals("", sinks[0].socksListen)
+        assertEquals("", sinks[1].socksListen)
+        assertEquals("127.0.0.1:18080", sinks[2].socksListen)
+        assertTrue(sinks.none { it.baseUrl.contains("netcloud", ignoreCase = true) })
+    }
+
     private fun fakeVerifier(ok: Boolean): PublicMinisignVerifier =
         object : PublicMinisignVerifier {
             override fun verify(message: String, signature: String, publicKey: String): Boolean =
@@ -305,6 +340,9 @@ class PublicPlatformConfigTest {
 
     private fun nestedParamsClientConfig(): String =
         """{"schema":1,"ns":"client-config-v1","seq":2,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-nested","label":"Nested","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":2053,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","flow":"xtls-rprx-vision","security":"reality","network":"tcp","fingerprint":"firefox"}},{"type":"awg","enabled":true,"address":"worker.example","port":51888,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"awg-server-pub","endpoint":"worker.example:51888","dialect_id":"dialect-1"}}]}]}"""
+
+    private fun discoveryClientConfig(): String =
+        """{"schema":1,"ns":"client-config-v1","seq":9,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","discovery_pubkey":"RWQdiscovery","workers":[{"worker_id":"worker-discovery","label":"Discovery","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":443,"expected_egress_ip":"198.51.100.30","params":{"discovery_urls":["https://worker.example/discovery"],"config_url":"http://awg-gw:8080/tw","public_key":"reality-pub","short_id":"sid","server_name":"www.microsoft.com"}}]}]}"""
 
     private fun envelope(configJson: String, signature: String): String =
         JSONObject()
