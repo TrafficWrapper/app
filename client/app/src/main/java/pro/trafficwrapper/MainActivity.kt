@@ -90,6 +90,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import java.security.SecureRandom
 import java.util.Locale
+import java.net.URI
+import java.net.URLDecoder
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -121,6 +123,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             handlePublicBootstrapIntent(intent)
+            handlePublicDeepLinkIntent(intent)
         } else {
             requestStartupAutoconnect(applicationContext)
         }
@@ -150,6 +153,7 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         handleBatteryHintIntent(intent)
         handlePublicBootstrapIntent(intent)
+        handlePublicDeepLinkIntent(intent)
     }
 
     @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
@@ -216,7 +220,45 @@ class MainActivity : ComponentActivity() {
             PUBLIC_BOOTSTRAP_ERROR = getString(R.string.public_bootstrap_invalid)
         }
     }
+
+    private fun handlePublicDeepLinkIntent(intent: Intent?) {
+        if (!DeploymentConfig.IS_PUBLIC_PLATFORM || intent == null) return
+        val raw = publicEnrollDeepLinkBootstrap(intent.dataString) ?: return
+        try {
+            val parsed = PublicPlatformConfigParser.parseBootstrap(raw)
+            PENDING_EXTERNAL_BOOTSTRAP = PendingExternalBootstrap(
+                raw = raw.trim(),
+                orchestratorUrl = parsed.orchestratorUrl,
+                configPubkeyPin = parsed.configPubkeyPin,
+            )
+            PUBLIC_BOOTSTRAP_ERROR = null
+        } catch (_: Throwable) {
+            PUBLIC_BOOTSTRAP_ERROR = getString(R.string.public_bootstrap_invalid)
+        }
+    }
 }
+
+internal fun publicEnrollDeepLinkBootstrap(uriText: String?): String? {
+    val uri = runCatching { URI(uriText?.trim().orEmpty()) }.getOrNull() ?: return null
+    if (!uri.scheme.equals("twp", ignoreCase = true) || !uri.host.equals("enroll", ignoreCase = true)) {
+        return null
+    }
+    val params = parseQueryParams(uri.rawQuery.orEmpty())
+    return params["bootstrap"]?.takeIf { it.isNotBlank() }
+        ?: params["payload"]?.takeIf { it.isNotBlank() }
+}
+
+private fun parseQueryParams(rawQuery: String): Map<String, String> {
+    if (rawQuery.isBlank()) return emptyMap()
+    return rawQuery.split('&').mapNotNull { part ->
+        val key = part.substringBefore('=', "").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val value = part.substringAfter('=', "")
+        urlDecode(key) to urlDecode(value)
+    }.toMap()
+}
+
+private fun urlDecode(value: String): String =
+    URLDecoder.decode(value.replace("+", "%2B"), Charsets.UTF_8.name())
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

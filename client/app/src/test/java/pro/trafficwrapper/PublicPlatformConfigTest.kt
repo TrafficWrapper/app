@@ -64,6 +64,19 @@ class PublicPlatformConfigTest {
     }
 
     @Test
+    fun enrollDeepLinkExtractsBootstrapPayloadOnly() {
+        val raw = bootstrapJson("2035-01-01T00:00:00Z")
+        val encoded = Base64.getEncoder().encodeToString(raw.toByteArray(Charsets.UTF_8))
+        val link = "twp://enroll?bootstrap=${java.net.URLEncoder.encode(encoded, Charsets.UTF_8.name())}"
+
+        val extracted = publicEnrollDeepLinkBootstrap(link)
+        assertEquals(encoded, extracted)
+        assertEquals("once-token", PublicPlatformConfigParser.parseBootstrap(extracted!!, nowMs = 0).bootstrapToken)
+        assertEquals(null, publicEnrollDeepLinkBootstrap("twp://enroll?token=once-token"))
+        assertEquals(null, publicEnrollDeepLinkBootstrap("https://example.test/enroll?bootstrap=$encoded"))
+    }
+
+    @Test
     fun clientConfigVerifiesSignatureAndRejectsUnsigned() {
         val config = clientConfig(seq = 7)
         val envelope = envelope(config, signature = "sig")
