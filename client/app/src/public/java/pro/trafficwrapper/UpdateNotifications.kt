@@ -7,6 +7,18 @@ import android.content.Context
 import androidx.annotation.StringRes
 
 object UpdateNotifications {
+    fun downloadForegroundNotification(context: Context): Notification {
+        val manager = manager(context)
+        ensureChannel(context, manager)
+        return Notification.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(context.getString(R.string.update_notification_title))
+            .setContentText(context.getString(R.string.update_notification_downloading))
+            .setOngoing(true)
+            .setProgress(0, 0, true)
+            .build()
+    }
+
     fun showDownloadProgress(context: Context, downloadedBytes: Long, totalBytes: Long) {
         val manager = manager(context)
         ensureChannel(context, manager)

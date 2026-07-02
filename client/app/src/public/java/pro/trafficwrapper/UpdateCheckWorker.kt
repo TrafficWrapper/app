@@ -3,6 +3,7 @@ package pro.trafficwrapper
 import android.content.Context
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ForegroundInfo
 import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
@@ -48,10 +49,18 @@ class UpdateCheckWorker(
                     checkedAt = checkedAt,
                     showSheet = false,
                 )
-                UpdateNotifications.showInstallStatus(
-                    applicationContext,
-                    R.string.update_notification_available,
-                )
+                if (shouldAutoDownloadUpdate(
+                        UpdateNetworkPolicy.currentPolicy(applicationContext),
+                        UpdateNetworkPolicy.underlyingNetworkKind(applicationContext),
+                    )
+                ) {
+                    downloadAvailableUpdate(auth, socksListen, transport.activeTransport, checkedAt)
+                } else {
+                    UpdateNotifications.showInstallStatus(
+                        applicationContext,
+                        R.string.update_notification_available,
+                    )
+                }
             }
 
             UpdateCheckStatus.LATEST -> {
@@ -80,6 +89,58 @@ class UpdateCheckWorker(
         return Result.success()
     }
 
+    private fun downloadAvailableUpdate(
+        auth: AuthUiState,
+        socksListen: String,
+        activeTransport: String,
+        checkedAt: String,
+    ) {
+        setForegroundAsync(
+            ForegroundInfo(
+                AUTO_DOWNLOAD_NOTIFICATION_ID,
+                UpdateNotifications.downloadForegroundNotification(applicationContext),
+            ),
+        ).get()
+        TransportRuntime.updates = TransportRuntime.updates.copy(
+            inProgress = true,
+            downloadInProgress = true,
+            statusTextRes = R.string.update_status_downloading,
+            errorTextRes = null,
+            downloadedBytes = 0,
+        )
+        val result = UpdateRepository(applicationContext).downloadAndVerify(
+            auth = auth,
+            socksListen = socksListen,
+            allowProvisioningFallback = false,
+            activeTransportOverride = activeTransport,
+        ) { downloaded, total ->
+            TransportRuntime.updates = TransportRuntime.updates.copy(
+                downloadedBytes = downloaded,
+                totalBytes = total,
+            )
+            if (total > 0) {
+                UpdateNotifications.showDownloadProgress(applicationContext, downloaded, total)
+            }
+        }
+        UpdateNotifications.clearDownload(applicationContext)
+        TransportRuntime.updates = updateStateFromOutcome(
+            outcome = result,
+            checkedAt = checkedAt,
+            showSheet = false,
+        ).copy(inProgress = false, downloadInProgress = false)
+        if (result.status == UpdateCheckStatus.AVAILABLE && result.apkFile != null) {
+            UpdateNotifications.showInstallStatus(
+                applicationContext,
+                R.string.update_notification_ready,
+            )
+        } else if (result.status == UpdateCheckStatus.ERROR) {
+            UpdateNotifications.showInstallStatus(
+                applicationContext,
+                result.errorTextRes ?: R.string.update_error_unknown,
+            )
+        }
+    }
+
     companion object {
         fun schedule(context: Context) {
             val constraints = Constraints.Builder()
@@ -104,5 +165,6 @@ class UpdateCheckWorker(
         private const val WORK_NAME = "trafficwrapper-update-check"
         private const val REPEAT_INTERVAL_HOURS = 12L
         private const val FLEX_INTERVAL_HOURS = 2L
+        private const val AUTO_DOWNLOAD_NOTIFICATION_ID = 1403
     }
 }

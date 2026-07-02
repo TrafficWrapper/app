@@ -26,6 +26,12 @@
     <string name="http_proxy_instruction">Settings → Wi-Fi → your network → Proxy → Manual → host 127.0.0.1, port 18090.</string>
     <string name="direct_update_fallback_title">Direct HTTPS update</string>
     <string name="direct_update_fallback_warning">Disabled by default. If enabled, the app can download updates without the tunnel from operator HTTPS mirrors; the mirror will see your real IP and the connection will be visible to the network.</string>
+    <string name="auto_update_download_title">Auto-download updates</string>
+    <string name="auto_update_download_warning">Disabled by default. If enabled, the app downloads and verifies the APK in the background; installation still requires user confirmation.</string>
+    <string name="auto_update_wifi_title">Download on Wi-Fi</string>
+    <string name="auto_update_wifi_body">By default auto-download is allowed only on Wi-Fi/ethernet and does not run on mobile networks.</string>
+    <string name="auto_update_mobile_title">Download on mobile data</string>
+    <string name="auto_update_mobile_body">Enable only if the operator channel and data plan allow background APK downloads on cellular/metered networks.</string>
     <string name="discovery_subscription_title">Endpoint subscription</string>
     <string name="discovery_subscription_warning">Disabled by default. If enabled, the app first checks the operator-signed egress endpoint list through the tunnel; if the tunnel is unavailable, it may make a direct request to the operator server and expose your real IP. Unsigned or stale data is rejected.</string>
     <string name="public_bootstrap_body">Scan the QR from the orchestrator web admin, or import the one-time bootstrap as Base64/JSON. The app will verify expiry and the config key.</string>
@@ -40,4 +46,5 @@
     <string name="public_bootstrap_camera_error">Could not open the camera for QR scanning</string>
     <string name="public_bootstrap_import_file">Open bootstrap file</string>
     <string name="public_bootstrap_invalid">Bootstrap string is invalid or expired</string>
+    <string name="update_notification_ready">Update APK downloaded and verified</string>
 </resources>

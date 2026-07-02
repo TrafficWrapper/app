@@ -1570,6 +1570,15 @@ private fun SettingsScreen(
     var directUpdateFallbackOn by remember {
         mutableStateOf(TransportLifecycleStore.directUpdateFallbackEnabled(context.applicationContext))
     }
+    var autoDownloadOn by remember {
+        mutableStateOf(TransportLifecycleStore.autoDownloadUpdatesEnabled(context.applicationContext))
+    }
+    var autoDownloadWifiOn by remember {
+        mutableStateOf(TransportLifecycleStore.autoDownloadWifiEnabled(context.applicationContext))
+    }
+    var autoDownloadMobileOn by remember {
+        mutableStateOf(TransportLifecycleStore.autoDownloadMobileEnabled(context.applicationContext))
+    }
     var discoverySubscriptionOn by remember {
         mutableStateOf(TransportLifecycleStore.discoverySubscriptionEnabled(context.applicationContext))
     }
@@ -1641,6 +1650,35 @@ private fun SettingsScreen(
                     TransportLifecycleStore.setDirectUpdateFallbackEnabled(context.applicationContext, enabled)
                     directUpdateFallbackOn =
                         TransportLifecycleStore.directUpdateFallbackEnabled(context.applicationContext)
+                },
+            )
+        }
+        SettingsToggleRow(
+            title = stringResource(R.string.auto_update_download_title),
+            body = stringResource(R.string.auto_update_download_warning),
+            checked = autoDownloadOn,
+            onCheckedChange = { enabled ->
+                TransportLifecycleStore.setAutoDownloadUpdatesEnabled(context.applicationContext, enabled)
+                autoDownloadOn = TransportLifecycleStore.autoDownloadUpdatesEnabled(context.applicationContext)
+            },
+        )
+        if (autoDownloadOn) {
+            SettingsToggleRow(
+                title = stringResource(R.string.auto_update_wifi_title),
+                body = stringResource(R.string.auto_update_wifi_body),
+                checked = autoDownloadWifiOn,
+                onCheckedChange = { enabled ->
+                    TransportLifecycleStore.setAutoDownloadWifiEnabled(context.applicationContext, enabled)
+                    autoDownloadWifiOn = TransportLifecycleStore.autoDownloadWifiEnabled(context.applicationContext)
+                },
+            )
+            SettingsToggleRow(
+                title = stringResource(R.string.auto_update_mobile_title),
+                body = stringResource(R.string.auto_update_mobile_body),
+                checked = autoDownloadMobileOn,
+                onCheckedChange = { enabled ->
+                    TransportLifecycleStore.setAutoDownloadMobileEnabled(context.applicationContext, enabled)
+                    autoDownloadMobileOn = TransportLifecycleStore.autoDownloadMobileEnabled(context.applicationContext)
                 },
             )
         }
@@ -1823,6 +1861,33 @@ private fun SettingsSection(title: String, content: @Composable () -> Unit) {
             Spacer(modifier = Modifier.height(10.dp))
             content()
         }
+    }
+}
+
+@Composable
+private fun SettingsToggleRow(
+    title: String,
+    body: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = title, style = MaterialTheme.typography.titleSmall)
+            Text(
+                text = body,
+                modifier = Modifier.padding(top = 4.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
 

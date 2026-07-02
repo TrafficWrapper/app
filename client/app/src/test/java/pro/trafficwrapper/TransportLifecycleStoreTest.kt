@@ -24,6 +24,21 @@ class TransportLifecycleStoreTest {
     }
 
     @Test
+    fun autoDownloadPreferencesDefaultOffAndWifiOnlyWhenEnabled() {
+        assertFalse(autoDownloadUpdatesPreference(null))
+        assertFalse(autoDownloadUpdatesPreference(false))
+        assertTrue(autoDownloadUpdatesPreference(true))
+
+        assertTrue(autoDownloadWifiPreference(null))
+        assertFalse(autoDownloadWifiPreference(false))
+        assertTrue(autoDownloadWifiPreference(true))
+
+        assertFalse(autoDownloadMobilePreference(null))
+        assertFalse(autoDownloadMobilePreference(false))
+        assertTrue(autoDownloadMobilePreference(true))
+    }
+
+    @Test
     fun discoverySubscriptionPreferenceDefaultsFalse() {
         assertFalse(discoverySubscriptionPreference(null))
         assertFalse(discoverySubscriptionPreference(false))

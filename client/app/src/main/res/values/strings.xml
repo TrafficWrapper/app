@@ -201,6 +201,12 @@
     <string name="update_status_mandatory_degraded">Обновление требуется, но сеть недоступна</string>
     <string name="direct_update_fallback_title">Прямое HTTPS-обновление</string>
     <string name="direct_update_fallback_warning">Выключено по умолчанию. Если включить, приложение может скачать обновление без туннеля с операторских HTTPS-зеркал; зеркало увидит ваш реальный IP, а соединение будет видно сети.</string>
+    <string name="auto_update_download_title">Автоскачивание обновлений</string>
+    <string name="auto_update_download_warning">Выключено по умолчанию. Если включить, приложение будет скачивать и проверять APK в фоне; установка всё равно требует подтверждения пользователя.</string>
+    <string name="auto_update_wifi_title">Скачивать по Wi-Fi</string>
+    <string name="auto_update_wifi_body">По умолчанию автоскачивание разрешено только на Wi-Fi/ethernet и не запускается на мобильной сети.</string>
+    <string name="auto_update_mobile_title">Скачивать по мобильной сети</string>
+    <string name="auto_update_mobile_body">Включайте только если операторский канал и тариф допускают фоновую загрузку APK по cellular/metered сети.</string>
     <string name="discovery_subscription_title">Подписка на endpoints</string>
     <string name="discovery_subscription_warning">Выключено по умолчанию. Если включить, приложение сначала проверяет подписанный оператором список egress-endpoints через туннель; если туннель недоступен, оно может сделать прямой запрос к оператор-серверу, раскрывая ваш реальный IP. Неподписанные или устаревшие данные отклоняются.</string>
     <string name="update_available_version">Доступно обновление %1$s (%2$d)</string>
@@ -252,6 +258,7 @@
     <string name="update_notification_title">Обновление TrafficWrapper</string>
     <string name="update_notification_downloading">Скачивание обновления</string>
     <string name="update_notification_available">Доступно обновление</string>
+    <string name="update_notification_ready">APK обновления скачан и проверен</string>
     <string name="notification_channel">Работа транспорта</string>
     <string name="notification_title">TrafficWrapper активен</string>
     <string name="notification_text">Транспорт работает в пользовательском режиме</string>

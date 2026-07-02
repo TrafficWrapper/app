@@ -16,6 +16,9 @@ object TransportLifecycleStore {
     private const val KEY_TELEMETRY_REMOTE_OFF = "telemetry_remote_off"
     private const val KEY_HTTP_PROXY = "http_proxy"
     private const val KEY_DIRECT_UPDATE_FALLBACK = "direct_update_fallback"
+    private const val KEY_AUTO_DOWNLOAD_UPDATES = "auto_download_updates"
+    private const val KEY_AUTO_DOWNLOAD_WIFI = "auto_download_wifi"
+    private const val KEY_AUTO_DOWNLOAD_MOBILE = "auto_download_mobile"
     private const val KEY_DISCOVERY_SUBSCRIPTION = "discovery_subscription"
     private const val KEY_SERVICE_NOTIFICATIONS = "service_notifications"
     private const val KEY_SERVICE_NOTIFICATION_TUNNEL_AT = "service_notification_tunnel_at"
@@ -170,6 +173,51 @@ object TransportLifecycleStore {
             .apply()
     }
 
+    fun autoDownloadUpdatesEnabled(context: Context): Boolean =
+        autoDownloadUpdatesPreference(
+            if (prefs(context).contains(KEY_AUTO_DOWNLOAD_UPDATES)) {
+                prefs(context).getBoolean(KEY_AUTO_DOWNLOAD_UPDATES, false)
+            } else {
+                null
+            },
+        )
+
+    fun setAutoDownloadUpdatesEnabled(context: Context, on: Boolean) {
+        prefs(context).edit()
+            .putBoolean(KEY_AUTO_DOWNLOAD_UPDATES, on)
+            .apply()
+    }
+
+    fun autoDownloadWifiEnabled(context: Context): Boolean =
+        autoDownloadWifiPreference(
+            if (prefs(context).contains(KEY_AUTO_DOWNLOAD_WIFI)) {
+                prefs(context).getBoolean(KEY_AUTO_DOWNLOAD_WIFI, true)
+            } else {
+                null
+            },
+        )
+
+    fun setAutoDownloadWifiEnabled(context: Context, on: Boolean) {
+        prefs(context).edit()
+            .putBoolean(KEY_AUTO_DOWNLOAD_WIFI, on)
+            .apply()
+    }
+
+    fun autoDownloadMobileEnabled(context: Context): Boolean =
+        autoDownloadMobilePreference(
+            if (prefs(context).contains(KEY_AUTO_DOWNLOAD_MOBILE)) {
+                prefs(context).getBoolean(KEY_AUTO_DOWNLOAD_MOBILE, false)
+            } else {
+                null
+            },
+        )
+
+    fun setAutoDownloadMobileEnabled(context: Context, on: Boolean) {
+        prefs(context).edit()
+            .putBoolean(KEY_AUTO_DOWNLOAD_MOBILE, on)
+            .apply()
+    }
+
     fun discoverySubscriptionEnabled(context: Context): Boolean =
         discoverySubscriptionPreference(
             if (prefs(context).contains(KEY_DISCOVERY_SUBSCRIPTION)) {
@@ -293,6 +341,12 @@ object TransportLifecycleStore {
 internal fun httpProxyPreference(stored: Boolean?): Boolean = stored ?: false
 
 internal fun directUpdateFallbackPreference(stored: Boolean?): Boolean = stored ?: false
+
+internal fun autoDownloadUpdatesPreference(stored: Boolean?): Boolean = stored ?: false
+
+internal fun autoDownloadWifiPreference(stored: Boolean?): Boolean = stored ?: true
+
+internal fun autoDownloadMobilePreference(stored: Boolean?): Boolean = stored ?: false
 
 internal fun discoverySubscriptionPreference(stored: Boolean?): Boolean = stored ?: false
 
