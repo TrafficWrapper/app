@@ -497,15 +497,14 @@ object Telemetry {
             val header = readPublicHttpHeader(input)
             val statusLine = header.lineSequence().firstOrNull().orEmpty()
             val code = statusLine.split(' ').firstOrNull { it.toIntOrNull() != null }?.toIntOrNull() ?: 0
-            val responseText = if (code in 200..299 && code != 204) {
-                input.readBytes().toString(Charsets.UTF_8).take(MAX_RESPONSE_CHARS)
-            } else {
-                ""
+            val responseText = input.readBytes().toString(Charsets.UTF_8).take(MAX_RESPONSE_CHARS)
+            if (code in 400..499 && isDeviceNotApprovedMessage(responseText)) {
+                markPublicDeviceReauthRequired(context, "telemetry")
             }
             val disable = header.lineSequence().any { line ->
                 line.substringBefore(':').equals("X-TW-Disable", ignoreCase = true) &&
                     line.substringAfter(':', "").isDisableValue()
-            } || responseText.isNotBlank() && runCatching {
+            } || code in 200..299 && code != 204 && responseText.isNotBlank() && runCatching {
                 JSONObject(responseText).optBoolean("telemetry_off", false)
             }.getOrDefault(false)
             return PostResult(httpCode = code, disableTelemetry = disable)

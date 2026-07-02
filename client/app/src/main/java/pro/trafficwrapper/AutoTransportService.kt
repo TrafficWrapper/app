@@ -3029,7 +3029,12 @@ class AutoTransportService : Service() {
                 Log.i(LOG_TAG, "public config hot-applied seq=${config.seq} from $baseUrl")
                 return PublicConfigPollResult(applied = true, seq = config.seq)
             } catch (error: Throwable) {
-                lastError = "${baseUrl}: ${Telemetry.safeErrorMessage(error)}"
+                val message = Telemetry.safeErrorMessage(error)
+                if (isDeviceNotApprovedMessage(message)) {
+                    markPublicDeviceReauthRequired(applicationContext, "config-poll")
+                    return PublicConfigPollResult(error = message)
+                }
+                lastError = "${baseUrl}: $message"
             }
         }
         return PublicConfigPollResult(error = lastError)
@@ -3070,8 +3075,11 @@ class AutoTransportService : Service() {
             val input = socket.getInputStream()
             val header = readInternalHttpHeader(input)
             val status = header.lineSequence().firstOrNull().orEmpty()
-            if (!status.contains(" 200 ")) error("config http status: $status")
-            return input.readBytes().toString(Charsets.UTF_8)
+            val body = input.readBytes().toString(Charsets.UTF_8)
+            if (!status.contains(" 200 ")) {
+                error("config http status: $status ${body.take(PUBLIC_CONFIG_ERROR_BODY_CHARS)}")
+            }
+            return body
         }
     }
 
@@ -5183,6 +5191,7 @@ class AutoTransportService : Service() {
         private const val PUBLIC_CONFIG_POLL_INITIAL_DELAY_MS = 5_000L
         private const val PUBLIC_CONFIG_POLL_INTERVAL_MS = 20_000L
         private const val PUBLIC_CONFIG_POLL_TIMEOUT_MS = 7_000L
+        private const val PUBLIC_CONFIG_ERROR_BODY_CHARS = 256
         private const val PUBLIC_HTTP_HEADER_LIMIT_BYTES = 64 * 1024
         private const val PUBLIC_CONFIG_DEFAULT_BASE_URL = "http://awg-gw:8080/tw"
         // Android deep Doze throttles exact allow-while-idle alarms to roughly
