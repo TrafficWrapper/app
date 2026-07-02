@@ -16,8 +16,13 @@
   перед parsing routes и update metadata.
 - `AutoTransportService.kt` открывает local SOCKS front-end, probe'ит worker x
   route candidates и выбирает REALITY или AWG по health и policy.
+- Optional builds с `TW_VPN_ENABLED=true` включают `TwVpnService.kt` и
+  `core/transport/vpnbridge.go`: Android `VpnService` TUN traffic bridge'ится в
+  тот же local SOCKS/front transport path.
 - APK self-updates проверяют и update minisign manifest, и pinned APK signing
   certificate fingerprint.
 
-App не является Android VPN. Он переносит только traffic, отправленный в его
-local SOCKS front-end или через user-selected integrations.
+Default app не является Android VPN. Он переносит только traffic, отправленный
+в local SOCKS front-end или через user-selected integrations. VPN mode — это
+отдельный compile-time и runtime opt-in path для операторов, которым нужен
+full-device или split-app routing.

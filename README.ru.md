@@ -6,9 +6,10 @@
 
 Android public client для TrafficWrapper — open-source self-hosted платформы
 private transport для небольших operator deployments и transport-obfuscation
-research. Приложение не является Android VPN: оно поднимает local SOCKS
-front-end и гонит traffic выбранных apps через signed deployment config и
-user-space transports.
+research. Default app остаётся SOCKS-only: оно поднимает local SOCKS front-end
+и гонит traffic выбранных apps через signed deployment config и user-space
+transports. Optional full-device Android VPN mode можно собрать с
+`TW_VPN_ENABLED=true`; по умолчанию он выключен.
 
 Оператор владеет deployment keys, worker endpoints, bootstrap payloads и update
 channel. Public app проверяет minisign-signed config и update manifests, pin'ит
@@ -135,6 +136,7 @@ export TW_PUBLIC_SIGNING_CERT_SHA256=<your-release-cert-sha256>
 | `TW_VERSION_NAME` | Android version name. | Опц. | Дефолт `public-1.0.0`; перекрывает `TW_PUBLIC_VERSION_NAME`. |
 | `TW_PUBLIC_VERSION_NAME` | Legacy/public fallback version name. | Опц. | Используется только если `TW_VERSION_NAME` не задан. |
 | `TW_ENROLLMENT_SECRET` | Optional BuildConfig enrollment secret. | Опц. | Обычно empty для public platform builds. |
+| `TW_VPN_ENABLED` | Включает optional Android `VpnService` mode и UI при сборке. | Опц. | Дефолт `false`; public APK по умолчанию остаётся SOCKS-only. |
 | `TW_RELEASE_KEYSTORE` | Путь к Android release keystore. | Обяз. для release | Генерируете сами через `keytool -genkeypair`. |
 | `TW_RELEASE_KEY_ALIAS` | Alias внутри release keystore. | Обяз. для release | Значение `-alias` из `keytool`. |
 | `TW_RELEASE_STORE_PASSWORD` | Keystore password. | Обяз. для release | Хранить в CI secrets или вводить интерактивно; не коммитить. |
@@ -161,12 +163,12 @@ export TW_PUBLIC_SIGNING_CERT_SHA256=<your-release-cert-sha256>
 
 Публичный APK доступен в GitHub Releases:
 
-- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.20>
-- Файл: `TrafficWrapper-app-v0.1.20.apk`
-- APK SHA-256: `e317374bebbd196c9caaa1f6e4d6740f41b10fadb95627d045fdd97f24e76510`
+- Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.21>
+- Файл: `TrafficWrapper-app-v0.1.21.apk`
+- APK SHA-256: `6828f50d0b308bf1c75778c3ef95f06a215d2a97bc0c55db9768bfb7dd759f9d`
 - SHA-256 signing certificate: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
 - Application ID: `org.trafficwrapper.app`
-- Версия: `0.1.20` (`versionCode=21`)
+- Версия: `0.1.21` (`versionCode=22`)
 
 Чтобы установить APK: скачайте файл на телефон, разрешите установку из
 неизвестных источников для браузера или файлового менеджера, откройте
@@ -184,8 +186,8 @@ artifacts. Он проверяет APK SHA-256, SHA-256 signing certificate APK,
 minisign подпись manifest и optional rebuild из git tag.
 
 ```sh
-APK=TrafficWrapper-app-v0.1.20.apk \
-EXPECTED_APK_SHA256=e317374bebbd196c9caaa1f6e4d6740f41b10fadb95627d045fdd97f24e76510 \
+APK=TrafficWrapper-app-v0.1.21.apk \
+EXPECTED_APK_SHA256=6828f50d0b308bf1c75778c3ef95f06a215d2a97bc0c55db9768bfb7dd759f9d \
 EXPECTED_CERT_SHA256=bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8 \
 ./build/verify-release.sh
 ```
@@ -193,7 +195,7 @@ EXPECTED_CERT_SHA256=bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36
 Если у вас также есть update manifest и public update key:
 
 ```sh
-APK=TrafficWrapper-app-v0.1.20.apk \
+APK=TrafficWrapper-app-v0.1.21.apk \
 MANIFEST=update-manifest.json \
 MINISIG=update-manifest.json.minisig \
 MINISIGN_PUBKEY=<update.pub line> \
@@ -204,6 +206,22 @@ Byte-for-byte сравнение APK после `TAG=<release-tag>` требуе
 build inputs, которые использовались для этого APK. Операторы со своим keystore
 могут использовать script для reproducible verification собственного release
 channel.
+
+## Optional VPN Mode
+
+Обычная public build остаётся SOCKS-only. Чтобы протестировать device-wide
+routing, соберите с `TW_VPN_ENABLED=true`. Это компилирует Android `VpnService`,
+Go gVisor TUN-to-SOCKS bridge и UI controls для full-device или split-app mode.
+
+VPN mode включается пользователем вручную. Full mode гонит device traffic через
+существующий transport и исключает сам app process через Android networking APIs,
+чтобы bridge не зациклился в собственный VPN. Split mode использует Android
+`addAllowedApplication` для выбранных apps. Kill switch по умолчанию включён:
+когда VPN включён в full mode и Android не даёт non-VPN underlying network,
+приложение поднимает blackhole VPN вместо прямой утечки traffic.
+
+При `TW_VPN_ENABLED=false` APK предоставляет только существующий SOCKS5
+`127.0.0.1:18080` и optional local HTTP proxy `127.0.0.1:18090`.
 
 ## Bootstrap
 

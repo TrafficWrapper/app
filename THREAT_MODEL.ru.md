@@ -17,6 +17,13 @@ App-specific risks and controls:
   plaintext resolver для proxied domain names.
 - APK self-updates принимаются только когда update manifest проходит verify и
   certificate скачанного APK совпадает с pinned SHA-256 fingerprint.
+- Optional VPN mode компилируется только при `TW_VPN_ENABLED=true` и остаётся
+  runtime opt-in через Android `VpnService` consent. Full mode bind'ит app
+  process к non-VPN underlying network, чтобы не зациклиться в собственный VPN;
+  если full VPN включён и такой network недоступен, default kill switch
+  поднимает blackhole VPN вместо fallback к clear traffic.
+- Split VPN mode опирается на Android `addAllowedApplication`; apps вне
+  выбранного набора намеренно не routed через TrafficWrapper.
 - Workers остаются exit/decryption points для AWG. App может enforce signatures
   и pins, но не может сделать untrusted worker доверенным.
 - Logs, screenshots, bug reports и copied config не должны включать реальные

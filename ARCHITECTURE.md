@@ -16,8 +16,13 @@ This repository implements the Android public client:
   before parsing routes and update metadata.
 - `AutoTransportService.kt` exposes a local SOCKS front-end, probes worker x
   route candidates, and selects REALITY or AWG according to health and policy.
+- Optional `TW_VPN_ENABLED=true` builds include `TwVpnService.kt` and
+  `core/transport/vpnbridge.go`, which bridge Android `VpnService` TUN traffic
+  into the same local SOCKS/front transport path.
 - APK self-updates verify both the update minisign manifest and the pinned APK
   signing certificate fingerprint.
 
-The app is not an Android VPN. It only carries traffic sent to its local SOCKS
-front-end or through user-selected integrations.
+The default app is not an Android VPN. It only carries traffic sent to its local
+SOCKS front-end or through user-selected integrations. VPN mode is a separate
+compile-time and runtime opt-in path for operators who want full-device or
+split-app routing.
