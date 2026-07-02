@@ -1,6 +1,7 @@
 package pro.trafficwrapper
 
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -36,6 +37,7 @@ import java.net.URI
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
+import java.util.Locale
 import java.util.ArrayDeque
 import java.util.Collections
 import java.util.EnumMap
@@ -482,6 +484,8 @@ class AutoTransportService : Service() {
 
     @Volatile
     private var httpProxy: LocalHttpProxy? = null
+
+    private var serviceTunnelDownSinceMs: Long = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -2470,19 +2474,19 @@ class AutoTransportService : Service() {
                             stableSinceElapsedRealtimeMs = stableSinceElapsedRealtimeMs,
                         ),
                     )
-                    publishState(
-                        stateFor(
-                            route = activeRoute,
-                            awgRuProbe = awgRuProbe,
-                            awgProbe = awgProbe,
-                            realityHealthy = realityHealthy,
-                            reality2Healthy = reality2Healthy,
-                            outboundIp = outboundIp,
-                            lastExchangeAgeSeconds = lastExchangeAgeSeconds,
-                            stableSinceElapsedRealtimeMs = stableSinceElapsedRealtimeMs.takeIf { routeHealthy },
-                            clock = clock,
-                        ),
+                    val uiState = stateFor(
+                        route = activeRoute,
+                        awgRuProbe = awgRuProbe,
+                        awgProbe = awgProbe,
+                        realityHealthy = realityHealthy,
+                        reality2Healthy = reality2Healthy,
+                        outboundIp = outboundIp,
+                        lastExchangeAgeSeconds = lastExchangeAgeSeconds,
+                        stableSinceElapsedRealtimeMs = stableSinceElapsedRealtimeMs.takeIf { routeHealthy },
+                        clock = clock,
                     )
+                    publishState(uiState)
+                    maybeShowServiceNotifications(uiState, nowMs)
                     val stable = routeHealthy &&
                         lastExchangeAgeSeconds != null &&
                         lastExchangeAgeSeconds <= STABLE_TRAFFIC_MAX_AGE_SECONDS
@@ -4252,6 +4256,7 @@ class AutoTransportService : Service() {
     ): TransportUiState {
         val routeHealthy = routeHealthy(route, awgRuProbe, awgProbe, realityHealthy, reality2Healthy, outboundIp)
         val tunnelStable = routeHealthy
+        val label = routeLabel(route)
         return TransportUiState(
             stateTextRes = when {
                 tunnelStable -> R.string.state_connected_stable
@@ -4262,7 +4267,8 @@ class AutoTransportService : Service() {
             clockSkewSeconds = clock.skewSeconds,
             handshakeEstablished = routeHealthy,
             tunnelStable = tunnelStable,
-            activeTransport = routeLabel(route),
+            activeTransport = label,
+            carryingTransport = label.takeIf { routeHealthy }.orEmpty(),
             socksListen = ROUTER_SOCKS,
             rxBytes = when (route) {
                 Route.AWG_RU -> awgRuProbe.rxBytes
@@ -4336,8 +4342,10 @@ class AutoTransportService : Service() {
         }
 
     private fun publishState(state: TransportUiState) {
+        val enriched = withHttpProxyState(state)
+        latestCarryingState.set(enriched.takeIf { it.carryingTransport.isNotBlank() || it.handshakeEstablished })
         mainHandler.post {
-            TransportRuntime.state = withHttpProxyState(state)
+            TransportRuntime.state = enriched
         }
     }
 
@@ -4386,7 +4394,12 @@ class AutoTransportService : Service() {
             getString(R.string.notification_channel),
             NotificationManager.IMPORTANCE_LOW,
         )
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val alertChannel = NotificationChannel(
+            SERVICE_ALERT_CHANNEL_ID,
+            getString(R.string.service_alert_channel),
+            NotificationManager.IMPORTANCE_DEFAULT,
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannels(listOf(channel, alertChannel))
     }
 
     private fun buildNotification(): Notification =
@@ -4397,6 +4410,134 @@ class AutoTransportService : Service() {
             .setContentIntent(mainActivityLaunchPendingIntent(this))
             .setOngoing(true)
             .build()
+
+    private fun maybeShowServiceNotifications(state: TransportUiState, nowMs: Long) {
+        if (!TransportLifecycleStore.serviceNotificationsEnabled(this)) return
+        maybeShowTunnelDownNotification(state, nowMs)
+        maybeShowApprovalRequiredNotification(nowMs)
+        maybeShowQuotaLowNotification(nowMs)
+    }
+
+    private fun maybeShowTunnelDownNotification(state: TransportUiState, nowMs: Long) {
+        val carrying = state.handshakeEstablished || state.carryingTransport.isNotBlank()
+        if (carrying || !TransportLifecycleStore.shouldKeepAlive(this)) {
+            serviceTunnelDownSinceMs = 0L
+            return
+        }
+        if (serviceTunnelDownSinceMs == 0L) {
+            serviceTunnelDownSinceMs = nowMs
+            return
+        }
+        if (nowMs - serviceTunnelDownSinceMs < SERVICE_TUNNEL_DOWN_NOTIFICATION_DELAY_MS) return
+        if (isAppInForeground()) return
+        if (!TransportLifecycleStore.shouldShowServiceNotification(
+                this,
+                ServiceNotificationKind.TUNNEL_DOWN,
+                nowMs,
+            )
+        ) {
+            return
+        }
+        showServiceAlertNotification(
+            notificationId = SERVICE_TUNNEL_DOWN_NOTIFICATION_ID,
+            title = getString(R.string.service_alert_tunnel_title),
+            text = getString(R.string.service_alert_tunnel_text),
+        )
+        TransportLifecycleStore.markServiceNotificationShown(this, ServiceNotificationKind.TUNNEL_DOWN, nowMs)
+    }
+
+    private fun maybeShowApprovalRequiredNotification(nowMs: Long) {
+        val auth = TransportRuntime.auth
+        if (auth.authorized || !approvalRequiredStatus(auth.statusTextRes)) return
+        if (isAppInForeground()) return
+        if (!TransportLifecycleStore.shouldShowServiceNotification(
+                this,
+                ServiceNotificationKind.APPROVAL_REQUIRED,
+                nowMs,
+            )
+        ) {
+            return
+        }
+        showServiceAlertNotification(
+            notificationId = SERVICE_APPROVAL_REQUIRED_NOTIFICATION_ID,
+            title = getString(R.string.service_alert_approval_title),
+            text = getString(R.string.service_alert_approval_text),
+        )
+        TransportLifecycleStore.markServiceNotificationShown(this, ServiceNotificationKind.APPROVAL_REQUIRED, nowMs)
+    }
+
+    private fun approvalRequiredStatus(statusTextRes: Int): Boolean =
+        statusTextRes == R.string.enrollment_status_pending ||
+            statusTextRes == R.string.enrollment_status_blocked ||
+            statusTextRes == R.string.enrollment_status_limit
+
+    private fun maybeShowQuotaLowNotification(nowMs: Long) {
+        val quota = TransportRuntime.auth.quota
+        if (!quota.hasTrafficLimit || !quota.hasUsage) return
+        val limit = quota.limitBytes.coerceAtLeast(1L)
+        val remaining = quota.remainingBytes ?: quota.usedBytes?.let { (limit - it).coerceAtLeast(0L) } ?: return
+        val threshold = maxOf(50L * 1024L * 1024L, limit / 10L)
+        if (remaining > threshold) return
+        if (isAppInForeground()) return
+        if (!TransportLifecycleStore.shouldShowServiceNotification(
+                this,
+                ServiceNotificationKind.QUOTA_LOW,
+                nowMs,
+            )
+        ) {
+            return
+        }
+        showServiceAlertNotification(
+            notificationId = SERVICE_QUOTA_LOW_NOTIFICATION_ID,
+            title = getString(R.string.service_alert_quota_title),
+            text = getString(
+                R.string.service_alert_quota_text,
+                formatServiceBytes(remaining),
+                formatServiceBytes(limit),
+            ),
+        )
+        TransportLifecycleStore.markServiceNotificationShown(this, ServiceNotificationKind.QUOTA_LOW, nowMs)
+    }
+
+    private fun formatServiceBytes(bytes: Long): String {
+        val units = arrayOf("B", "KB", "MB", "GB", "TB")
+        var value = bytes.coerceAtLeast(0L).toDouble()
+        var index = 0
+        while (value >= 1024.0 && index < units.lastIndex) {
+            value /= 1024.0
+            index++
+        }
+        return if (index == 0) {
+            String.format(Locale.US, "%d %s", value.toLong(), units[index])
+        } else {
+            String.format(Locale.US, "%.1f %s", value, units[index])
+        }
+    }
+
+    private fun showServiceAlertNotification(notificationId: Int, title: String, text: String) {
+        val notification = Notification.Builder(this, SERVICE_ALERT_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(mainActivityLaunchPendingIntent(this))
+            .setAutoCancel(true)
+            .build()
+        runCatching {
+            getSystemService(NotificationManager::class.java).notify(notificationId, notification)
+        }.onFailure {
+            Log.w(LOG_TAG, "service alert notification failed: ${it.message}")
+        }
+    }
+
+    private fun isAppInForeground(): Boolean {
+        val manager = getSystemService(ActivityManager::class.java) ?: return false
+        val pid = android.os.Process.myPid()
+        return manager.runningAppProcesses
+            ?.firstOrNull { it.pid == pid }
+            ?.let { it.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND }
+            ?: false
+    }
 
     private fun startTransportForeground() {
         val notification = buildNotification()
@@ -4964,7 +5105,12 @@ class AutoTransportService : Service() {
         private var requestedMode: TransportChoice = TransportChoice.AUTO
 
         private const val CHANNEL_ID = "transport"
+        private const val SERVICE_ALERT_CHANNEL_ID = "service-alerts"
         private const val NOTIFICATION_ID = 1303
+        private const val SERVICE_TUNNEL_DOWN_NOTIFICATION_ID = 1313
+        private const val SERVICE_APPROVAL_REQUIRED_NOTIFICATION_ID = 1314
+        private const val SERVICE_QUOTA_LOW_NOTIFICATION_ID = 1315
+        private const val SERVICE_TUNNEL_DOWN_NOTIFICATION_DELAY_MS = 60_000L
         private const val XRAY_LIB_NAME = "libxray.so"
 
         private const val ROUTER_HOST = "127.0.0.1"
@@ -5053,6 +5199,9 @@ class AutoTransportService : Service() {
 
         private val activeService = AtomicReference<AutoTransportService?>(null)
         private val lastNetworkReviveAtMs = AtomicLong(0)
+        private val latestCarryingState = AtomicReference<TransportUiState?>(null)
+
+        fun latestCarryingUiState(): TransportUiState? = latestCarryingState.get()
 
         fun requestBackstopResync(context: Context): Boolean {
             if (!TransportLifecycleStore.shouldKeepAlive(context)) return false
