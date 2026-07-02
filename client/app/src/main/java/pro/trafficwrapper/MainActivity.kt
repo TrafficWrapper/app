@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -51,11 +52,13 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -633,6 +636,9 @@ private fun MainScreen(
         transportRunning = transportRunning,
         connecting = connecting,
     )
+    if (BuildConfig.VPN_ENABLED) {
+        MainVpnToggle(context = context, transport = transport)
+    }
     AttentionBanners(
         context = context,
         auth = auth,
@@ -970,6 +976,121 @@ internal fun primaryTransportAction(connecting: Boolean, transportRunning: Boole
         connecting -> PrimaryTransportAction.CANCEL_CONNECTING
         transportRunning -> PrimaryTransportAction.DISCONNECT
         else -> PrimaryTransportAction.CONNECT
+    }
+
+@Composable
+private fun MainVpnToggle(context: Context, transport: TransportUiState) {
+    if (!BuildConfig.VPN_ENABLED) return
+    val appContext = context.applicationContext
+    var vpnOn by remember { mutableStateOf(TransportLifecycleStore.vpnEnabled(appContext)) }
+    var vpnMode by remember { mutableStateOf(TransportLifecycleStore.vpnMode(appContext)) }
+    var allowedApps by remember { mutableStateOf(TransportLifecycleStore.vpnAllowedApps(appContext)) }
+    LaunchedEffect(transport.vpnEnabled, transport.vpnActive) {
+        vpnOn = TransportLifecycleStore.vpnEnabled(appContext)
+        vpnMode = TransportLifecycleStore.vpnMode(appContext)
+        allowedApps = TransportLifecycleStore.vpnAllowedApps(appContext)
+    }
+    val onToggle = rememberVpnToggleHandler(
+        context = context,
+        vpnMode = vpnMode,
+        allowedApps = allowedApps,
+        onPreferenceChanged = { enabled -> vpnOn = enabled },
+    )
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 12.dp),
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.vpn_mode_title),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = stringResource(if (vpnMode == VpnTrafficMode.FULL) R.string.vpn_scope_full else R.string.vpn_scope_split),
+                    modifier = Modifier.padding(top = 2.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = stringResource(vpnStatusTextRes(transport)),
+                    modifier = Modifier.padding(top = 2.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = vpnStatusColor(transport),
+                )
+            }
+            Switch(checked = vpnOn, onCheckedChange = onToggle)
+        }
+    }
+}
+
+@Composable
+private fun rememberVpnToggleHandler(
+    context: Context,
+    vpnMode: VpnTrafficMode,
+    allowedApps: Set<String>,
+    onPreferenceChanged: (Boolean) -> Unit,
+): (Boolean) -> Unit {
+    val appContext = context.applicationContext
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            setVpnPreference(appContext, enabled = true, transition = VpnTransition.STARTING)
+            onPreferenceChanged(true)
+            startVpnModeService(appContext)
+        } else {
+            Toast.makeText(appContext, R.string.vpn_permission_denied, Toast.LENGTH_LONG).show()
+            setVpnPreference(appContext, enabled = false)
+            onPreferenceChanged(false)
+        }
+    }
+    return onToggle@{ enabled ->
+        if (enabled) {
+            if (vpnMode == VpnTrafficMode.SPLIT && allowedApps.isEmpty()) {
+                Toast.makeText(appContext, R.string.vpn_split_empty, Toast.LENGTH_LONG).show()
+                setVpnPreference(appContext, enabled = false)
+                onPreferenceChanged(false)
+                return@onToggle
+            }
+            val prepareIntent = VpnService.prepare(context)
+            if (prepareIntent != null) {
+                permissionLauncher.launch(prepareIntent)
+            } else {
+                setVpnPreference(appContext, enabled = true, transition = VpnTransition.STARTING)
+                onPreferenceChanged(true)
+                startVpnModeService(appContext)
+            }
+        } else {
+            setVpnPreference(appContext, enabled = false, transition = VpnTransition.STOPPING)
+            onPreferenceChanged(false)
+            stopVpnModeService(appContext)
+        }
+    }
+}
+
+@StringRes
+private fun vpnStatusTextRes(transport: TransportUiState): Int =
+    when (transport.vpnTransition) {
+        VpnTransition.STARTING -> R.string.vpn_mode_starting
+        VpnTransition.STOPPING -> R.string.vpn_mode_stopping
+        VpnTransition.NONE -> if (transport.vpnActive) R.string.vpn_mode_active else R.string.vpn_mode_off
+    }
+
+@Composable
+private fun vpnStatusColor(transport: TransportUiState): Color =
+    when {
+        transport.vpnTransition != VpnTransition.NONE -> Color(0xFF6F4B00)
+        transport.vpnActive -> Color(0xFF14532D)
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
 
 @Composable
@@ -1631,6 +1752,12 @@ private fun SettingsScreen(
         HttpProxyPanel(context, transport)
     }
 
+    if (BuildConfig.VPN_ENABLED) {
+        SettingsSection(title = stringResource(R.string.vpn_mode_title)) {
+            VpnModePanel(context, transport)
+        }
+    }
+
     SettingsSection(title = stringResource(R.string.telemetry_title)) {
         TelemetryPanel(context)
     }
@@ -1822,6 +1949,191 @@ private fun HttpProxyPanel(context: Context, transport: TransportUiState) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+    }
+}
+
+@Composable
+private fun VpnModePanel(context: Context, transport: TransportUiState) {
+    if (!BuildConfig.VPN_ENABLED) return
+    val appContext = context.applicationContext
+    var vpnOn by remember { mutableStateOf(TransportLifecycleStore.vpnEnabled(appContext)) }
+    var vpnMode by remember { mutableStateOf(TransportLifecycleStore.vpnMode(appContext)) }
+    var allowedApps by remember { mutableStateOf(TransportLifecycleStore.vpnAllowedApps(appContext)) }
+    var killSwitchOn by remember { mutableStateOf(TransportLifecycleStore.vpnKillSwitchEnabled(appContext)) }
+    LaunchedEffect(transport.vpnEnabled, transport.vpnActive) {
+        vpnOn = TransportLifecycleStore.vpnEnabled(appContext)
+        vpnMode = TransportLifecycleStore.vpnMode(appContext)
+        allowedApps = TransportLifecycleStore.vpnAllowedApps(appContext)
+        killSwitchOn = TransportLifecycleStore.vpnKillSwitchEnabled(appContext)
+    }
+    Text(
+        text = stringResource(R.string.vpn_mode_description),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Text(
+        text = stringResource(vpnStatusTextRes(transport)),
+        modifier = Modifier.padding(top = 8.dp),
+        style = MaterialTheme.typography.bodyMedium,
+        color = vpnStatusColor(transport),
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = stringResource(R.string.vpn_mode_title),
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+        val onToggle = rememberVpnToggleHandler(
+            context = context,
+            vpnMode = vpnMode,
+            allowedApps = allowedApps,
+            onPreferenceChanged = { enabled -> vpnOn = enabled },
+        )
+        Switch(checked = vpnOn, onCheckedChange = onToggle)
+    }
+    Text(
+        text = stringResource(R.string.vpn_scope_title),
+        modifier = Modifier.padding(top = 14.dp),
+        style = MaterialTheme.typography.titleSmall,
+        fontWeight = FontWeight.SemiBold,
+    )
+    VpnModeOption(
+        title = stringResource(R.string.vpn_scope_full),
+        detail = stringResource(R.string.vpn_scope_full_detail),
+        selected = vpnMode == VpnTrafficMode.FULL,
+        onClick = {
+            TransportLifecycleStore.setVpnMode(appContext, VpnTrafficMode.FULL)
+            vpnMode = VpnTrafficMode.FULL
+            if (vpnOn) startVpnModeService(appContext)
+        },
+    )
+    VpnModeOption(
+        title = stringResource(R.string.vpn_scope_split),
+        detail = stringResource(R.string.vpn_scope_split_detail),
+        selected = vpnMode == VpnTrafficMode.SPLIT,
+        onClick = {
+            TransportLifecycleStore.setVpnMode(appContext, VpnTrafficMode.SPLIT)
+            vpnMode = VpnTrafficMode.SPLIT
+            if (vpnOn) startVpnModeService(appContext)
+        },
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = stringResource(R.string.vpn_kill_switch_title),
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = stringResource(R.string.vpn_kill_switch_detail),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = killSwitchOn,
+            onCheckedChange = { enabled ->
+                TransportLifecycleStore.setVpnKillSwitchEnabled(appContext, enabled)
+                killSwitchOn = TransportLifecycleStore.vpnKillSwitchEnabled(appContext)
+                if (vpnOn) startVpnModeService(appContext)
+            },
+        )
+    }
+    if (vpnMode == VpnTrafficMode.SPLIT) {
+        Text(
+            text = stringResource(R.string.vpn_split_apps_title),
+            modifier = Modifier.padding(top = 12.dp),
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (TransportRuntime.apps.loading) {
+            Text(
+                text = stringResource(R.string.app_choice_loading),
+                modifier = Modifier.padding(top = 8.dp),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        } else {
+            val selectableApps = TransportRuntime.apps.apps.filter { it.packageName != appContext.packageName }
+            if (selectableApps.isEmpty()) {
+                Text(
+                    text = stringResource(R.string.vpn_split_no_apps),
+                    modifier = Modifier.padding(top = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            selectableApps.forEach { app ->
+                VpnSplitAppRow(
+                    app = app,
+                    checked = app.packageName in allowedApps,
+                    onCheckedChange = { checked ->
+                        val next = if (checked) allowedApps + app.packageName else allowedApps - app.packageName
+                        TransportLifecycleStore.setVpnAllowedApps(appContext, next)
+                        allowedApps = TransportLifecycleStore.vpnAllowedApps(appContext)
+                        if (vpnOn) startVpnModeService(appContext)
+                    },
+                )
+            }
+            if (allowedApps.isEmpty()) {
+                Text(
+                    text = stringResource(R.string.vpn_split_empty),
+                    modifier = Modifier.padding(top = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun VpnModeOption(title: String, detail: String, selected: Boolean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(top = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioButton(selected = selected, onClick = onClick)
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = detail,
+                modifier = Modifier.padding(top = 2.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun VpnSplitAppRow(app: InstalledAppInfo, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(top = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Checkbox(checked = checked, onCheckedChange = onCheckedChange)
+        Text(text = app.label, style = MaterialTheme.typography.bodyMedium)
     }
 }
 
@@ -3055,6 +3367,52 @@ private fun notifyHttpProxyPreferenceChanged(context: Context) {
     }
 }
 
+private fun setVpnPreference(
+    context: Context,
+    enabled: Boolean,
+    transition: VpnTransition = VpnTransition.NONE,
+) {
+    val appContext = context.applicationContext
+    TransportLifecycleStore.setVpnEnabled(appContext, enabled)
+    TransportRuntime.state = TransportRuntime.state.copy(
+        vpnEnabled = BuildConfig.VPN_ENABLED && enabled,
+        vpnActive = if (enabled) TransportRuntime.state.vpnActive else false,
+        vpnTransition = transition,
+    )
+    VPN_COMMAND_EXECUTOR.execute {
+        notifyVpnConfigPreferenceChanged(appContext)
+    }
+}
+
+private fun notifyVpnConfigPreferenceChanged(context: Context) {
+    if (!BuildConfig.VPN_ENABLED) return
+    val intent = Intent(context, AutoTransportService::class.java)
+        .setAction(AutoTransportService.ACTION_VPN_CONFIG_CHANGED)
+    if (Build.VERSION.SDK_INT >= 26) {
+        context.startForegroundService(intent)
+    } else {
+        context.startService(intent)
+    }
+}
+
+private fun startVpnModeService(context: Context) {
+    val appContext = context.applicationContext
+    VPN_COMMAND_EXECUTOR.execute {
+        VpnAutoRestore.startVpnService(appContext)
+    }
+}
+
+private fun stopVpnModeService(context: Context) {
+    if (!BuildConfig.VPN_ENABLED) return
+    val appContext = context.applicationContext
+    VPN_COMMAND_EXECUTOR.execute {
+        appContext.startService(vpnModeServiceIntent(appContext, TW_VPN_ACTION_STOP))
+    }
+}
+
+private fun vpnModeServiceIntent(context: Context, action: String): Intent =
+    Intent(action).setClassName(context.packageName, TW_VPN_SERVICE_CLASS)
+
 fun recoverStoredTransportKeys(context: Context) {
     val appContext = context.applicationContext
     if (!TransportLifecycleStore.shouldKeepAlive(appContext)) return
@@ -3310,6 +3668,9 @@ private const val TELEGRAM_SCHEME = "tg"
 private const val TELEGRAM_SOCKS_AUTHORITY = "socks"
 private const val TELEGRAM_SERVER_PARAM = "server"
 private const val TELEGRAM_PORT_PARAM = "port"
+private const val TW_VPN_SERVICE_CLASS = "pro.trafficwrapper.TwVpnService"
+private const val TW_VPN_ACTION_STOP = "pro.trafficwrapper.action.VPN_STOP"
+private val VPN_COMMAND_EXECUTOR = Executors.newSingleThreadExecutor()
 
 private const val JSON_OK = "ok"
 private const val JSON_PROVISION_ADDR = "provision_addr"

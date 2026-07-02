@@ -96,4 +96,44 @@ class MainActivityUiPolicyTest {
         assertEquals(carrying, startupAutoconnectSourceState(TransportUiState(), carrying))
         assertEquals("AWG", startupAutoconnectUiState(carrying).carryingTransport)
     }
+
+    @Test
+    fun vpnAutoRestoreOnlyWhenFeatureAndPreferenceOnAndInactive() {
+        assertTrue(
+            shouldAttemptVpnAutoRestore(
+                vpnFeatureEnabled = true,
+                vpnPreferenceEnabled = true,
+                vpnActive = false,
+            ),
+        )
+        assertFalse(
+            shouldAttemptVpnAutoRestore(
+                vpnFeatureEnabled = false,
+                vpnPreferenceEnabled = true,
+                vpnActive = false,
+            ),
+        )
+        assertFalse(
+            shouldAttemptVpnAutoRestore(
+                vpnFeatureEnabled = true,
+                vpnPreferenceEnabled = false,
+                vpnActive = false,
+            ),
+        )
+        assertFalse(
+            shouldAttemptVpnAutoRestore(
+                vpnFeatureEnabled = true,
+                vpnPreferenceEnabled = true,
+                vpnActive = true,
+            ),
+        )
+        assertFalse(
+            shouldAttemptVpnAutoRestore(
+                vpnFeatureEnabled = true,
+                vpnPreferenceEnabled = true,
+                vpnActive = false,
+                vpnTransition = VpnTransition.STARTING,
+            ),
+        )
+    }
 }

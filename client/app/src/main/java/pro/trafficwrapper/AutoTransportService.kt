@@ -485,6 +485,8 @@ class AutoTransportService : Service() {
     @Volatile
     private var httpProxy: LocalHttpProxy? = null
 
+    private val currentVpnUdpRoute = AtomicReference<Route?>(null)
+
     private var serviceTunnelDownSinceMs: Long = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -525,6 +527,14 @@ class AutoTransportService : Service() {
                 stopSelf()
                 return START_NOT_STICKY
             }
+        }
+        if (action == ACTION_VPN_CONFIG_CHANGED) {
+            applyVpnPreference()
+            if (!TransportLifecycleStore.shouldKeepAlive(this) && !workerActive.get()) {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            return START_STICKY
         }
         if (action == ACTION_START) {
             TransportLifecycleStore.rememberActiveTransport(this, requestedMode)
@@ -2611,6 +2621,7 @@ class AutoTransportService : Service() {
                 workerActive.set(false)
                 routeHealthSnapshot.set(null)
                 stopHttpProxy()
+                setVpnBridgeUdpRoute(null)
                 router?.stop()
                 router = null
                 xrayProcess?.destroy()
@@ -2653,6 +2664,7 @@ class AutoTransportService : Service() {
         unregisterNetworkCallback()
         unregisterScreenReceiver()
         stopHttpProxy()
+        setVpnBridgeUdpRoute(null)
         router?.stop()
         router = null
         xrayProcess?.destroy()
@@ -4342,7 +4354,8 @@ class AutoTransportService : Service() {
         }
 
     private fun publishState(state: TransportUiState) {
-        val enriched = withHttpProxyState(state)
+        val enriched = withVpnState(withHttpProxyState(state))
+        setVpnBridgeUdpRoute(routeForVpnUdp(enriched))
         latestCarryingState.set(enriched.takeIf { it.carryingTransport.isNotBlank() || it.handshakeEstablished })
         mainHandler.post {
             TransportRuntime.state = enriched
@@ -4351,7 +4364,7 @@ class AutoTransportService : Service() {
 
     private fun publishHttpProxyState() {
         mainHandler.post {
-            TransportRuntime.state = withHttpProxyState(TransportRuntime.state)
+            TransportRuntime.state = withVpnState(withHttpProxyState(TransportRuntime.state))
         }
     }
 
@@ -4364,6 +4377,49 @@ class AutoTransportService : Service() {
             httpProxyListen = if (enabled) LOCAL_HTTP_PROXY_LISTEN else "",
         )
     }
+
+    private fun withVpnState(state: TransportUiState): TransportUiState {
+        if (!BuildConfig.VPN_ENABLED) {
+            return state.copy(vpnEnabled = false, vpnActive = false, vpnTransition = VpnTransition.NONE)
+        }
+        return state.copy(
+            vpnEnabled = TransportLifecycleStore.vpnEnabled(applicationContext),
+            vpnActive = TransportRuntime.state.vpnActive,
+            vpnTransition = TransportRuntime.state.vpnTransition,
+        )
+    }
+
+    private fun applyVpnPreference() {
+        setVpnBridgeUdpRoute(routeForVpnUdp(TransportRuntime.state))
+        mainHandler.post {
+            TransportRuntime.state = withVpnState(TransportRuntime.state)
+        }
+    }
+
+    private fun routeForVpnUdp(state: TransportUiState): Route? {
+        if (!BuildConfig.VPN_ENABLED || !TransportLifecycleStore.vpnEnabled(applicationContext)) return null
+        val label = state.carryingTransport.ifBlank { state.activeTransport }
+        return routeFromLabel(label)?.takeIf { it == Route.AWG || it == Route.AWG_RU }
+    }
+
+    private fun setVpnBridgeUdpRoute(route: Route?) {
+        if (!BuildConfig.VPN_ENABLED) return
+        val descriptor = vpnUdpRouteDescriptor(route)
+        currentVpnUdpRoute.set(route)
+        TransportLifecycleStore.setLastVpnUdpRoute(applicationContext, descriptor)
+        runCatching { Transport.setVpnBridgeUDPRoute(descriptor.ifBlank { "disabled" }) }
+            .onFailure { Log.w(LOG_TAG, "VPN UDP route update failed: ${it.message}") }
+    }
+
+    private fun vpnUdpRouteDescriptor(route: Route?): String =
+        when (route) {
+            Route.AWG -> "netstack:default"
+            Route.AWG_RU -> "netstack:awg_ru"
+            else -> ""
+        }
+
+    private fun routeFromLabel(label: String): Route? =
+        Route.values().firstOrNull { routeLabel(it) == label }
 
     private fun drainProcessOutput(route: Route, generation: Long, process: Process) {
         Thread {
@@ -5098,6 +5154,7 @@ class AutoTransportService : Service() {
         const val ACTION_RESYNC = "pro.trafficwrapper.action.AUTO_RESYNC"
         const val ACTION_BACKSTOP = "pro.trafficwrapper.action.AUTO_BACKSTOP"
         const val ACTION_HTTP_PROXY_CHANGED = "pro.trafficwrapper.action.HTTP_PROXY_CHANGED"
+        const val ACTION_VPN_CONFIG_CHANGED = "pro.trafficwrapper.action.VPN_CONFIG_CHANGED"
         const val EXTRA_MODE = "pro.trafficwrapper.extra.TRANSPORT_MODE"
         const val EXTRA_KEEP_ALIVE_AFTER_STOP = "pro.trafficwrapper.extra.KEEP_ALIVE_AFTER_STOP"
 

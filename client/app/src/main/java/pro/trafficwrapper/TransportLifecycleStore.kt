@@ -21,6 +21,11 @@ object TransportLifecycleStore {
     private const val KEY_SERVICE_NOTIFICATION_TUNNEL_AT = "service_notification_tunnel_at"
     private const val KEY_SERVICE_NOTIFICATION_APPROVAL_AT = "service_notification_approval_at"
     private const val KEY_SERVICE_NOTIFICATION_QUOTA_AT = "service_notification_quota_at"
+    private const val KEY_VPN = "vpn"
+    private const val KEY_VPN_MODE = "vpn_mode"
+    private const val KEY_VPN_ALLOWED_APPS = "vpn_allowed_apps"
+    private const val KEY_VPN_KILL_SWITCH = "vpn_kill_switch"
+    private const val KEY_VPN_LAST_UDP_ROUTE = "vpn_last_udp_route"
 
     fun rememberActiveTransport(context: Context, mode: TransportChoice) {
         prefs(context).edit()
@@ -206,6 +211,71 @@ object TransportLifecycleStore {
             .apply()
     }
 
+    fun vpnEnabled(context: Context): Boolean =
+        vpnPreference(
+            if (prefs(context).contains(KEY_VPN)) {
+                prefs(context).getBoolean(KEY_VPN, false)
+            } else {
+                null
+            },
+        )
+
+    fun setVpnEnabled(context: Context, on: Boolean) {
+        prefs(context).edit()
+            .putBoolean(KEY_VPN, on)
+            .apply()
+    }
+
+    fun vpnMode(context: Context): VpnTrafficMode =
+        VpnTrafficMode.fromWireName(prefs(context).getString(KEY_VPN_MODE, null))
+
+    fun setVpnMode(context: Context, mode: VpnTrafficMode) {
+        prefs(context).edit()
+            .putString(KEY_VPN_MODE, mode.wireName)
+            .apply()
+    }
+
+    fun vpnAllowedApps(context: Context): Set<String> {
+        val stored = prefs(context).getStringSet(KEY_VPN_ALLOWED_APPS, null)
+        return vpnAllowedAppsPreference(stored)
+    }
+
+    fun setVpnAllowedApps(context: Context, packages: Set<String>) {
+        prefs(context).edit()
+            .putStringSet(
+                KEY_VPN_ALLOWED_APPS,
+                packages
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .toSortedSet(),
+            )
+            .apply()
+    }
+
+    fun vpnKillSwitchEnabled(context: Context): Boolean =
+        vpnKillSwitchPreference(
+            if (prefs(context).contains(KEY_VPN_KILL_SWITCH)) {
+                prefs(context).getBoolean(KEY_VPN_KILL_SWITCH, true)
+            } else {
+                null
+            },
+        )
+
+    fun setVpnKillSwitchEnabled(context: Context, on: Boolean) {
+        prefs(context).edit()
+            .putBoolean(KEY_VPN_KILL_SWITCH, on)
+            .apply()
+    }
+
+    fun lastVpnUdpRoute(context: Context): String =
+        prefs(context).getString(KEY_VPN_LAST_UDP_ROUTE, "")?.trim().orEmpty()
+
+    fun setLastVpnUdpRoute(context: Context, route: String) {
+        prefs(context).edit()
+            .putString(KEY_VPN_LAST_UDP_ROUTE, route.trim())
+            .apply()
+    }
+
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -236,3 +306,25 @@ enum class ServiceNotificationKind {
     APPROVAL_REQUIRED,
     QUOTA_LOW,
 }
+
+enum class VpnTrafficMode(val wireName: String) {
+    FULL("full"),
+    SPLIT("split"),
+    ;
+
+    companion object {
+        fun fromWireName(value: String?): VpnTrafficMode =
+            entries.firstOrNull { it.wireName == value } ?: FULL
+    }
+}
+
+internal fun vpnPreference(stored: Boolean?): Boolean = stored ?: false
+
+internal fun vpnKillSwitchPreference(stored: Boolean?): Boolean = stored ?: true
+
+internal fun vpnAllowedAppsPreference(stored: Set<String>?): Set<String> =
+    stored
+        ?.map { it.trim() }
+        ?.filter { it.isNotBlank() }
+        ?.toSortedSet()
+        ?: setOf(TELEGRAM_PACKAGE)

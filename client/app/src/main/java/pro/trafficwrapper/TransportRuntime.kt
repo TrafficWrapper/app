@@ -18,12 +18,21 @@ data class TransportUiState(
     val httpProxyEnabled: Boolean = false,
     val httpProxyRunning: Boolean = false,
     val httpProxyListen: String = "",
+    val vpnEnabled: Boolean = false,
+    val vpnActive: Boolean = false,
+    val vpnTransition: VpnTransition = VpnTransition.NONE,
     val rxBytes: Long = 0,
     val txBytes: Long = 0,
     val outboundIp: String = "",
     val lastExchangeAgeSeconds: Long? = null,
     val stableSinceElapsedRealtimeMs: Long? = null,
 )
+
+enum class VpnTransition {
+    NONE,
+    STARTING,
+    STOPPING,
+}
 
 data class QuotaUiState(
     val limitBytes: Long = 0,

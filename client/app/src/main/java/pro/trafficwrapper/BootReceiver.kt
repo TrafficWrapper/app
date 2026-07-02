@@ -25,6 +25,7 @@ class BootReceiver : BroadcastReceiver() {
                 context.startService(serviceIntent)
             }
             Log.i(LOG_TAG, "autostart requested: action=$action mode=$mode")
+            VpnAutoRestore.maybeRestore(context.applicationContext, action)
         }.onFailure {
             Log.w(LOG_TAG, "autostart failed: action=$action message=${it.message}")
         }

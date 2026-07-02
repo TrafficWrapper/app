@@ -6,6 +6,9 @@ plugins {
 fun String.asBuildConfigString(): String =
     "\"" + replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
 
+fun String.asBuildConfigBoolean(): String =
+    if (equals("true", ignoreCase = true) || this == "1") "true" else "false"
+
 android {
     namespace = "pro.trafficwrapper"
     compileSdk = 36
@@ -32,6 +35,12 @@ android {
             .orElse(providers.gradleProperty("tw.publicSigningCertSha256"))
             .getOrElse("")
         buildConfigField("String", "PUBLIC_UPDATE_SIGNING_CERT_SHA256", publicSigningCertSha256.asBuildConfigString())
+
+        val vpnEnabled = providers.environmentVariable("TW_VPN_ENABLED")
+            .orElse(providers.gradleProperty("tw.vpnEnabled"))
+            .getOrElse("false")
+        buildConfigField("boolean", "VPN_ENABLED", vpnEnabled.asBuildConfigBoolean())
+        manifestPlaceholders["twVpnServiceEnabled"] = vpnEnabled.asBuildConfigBoolean()
 
         ndk {
             abiFilters += "arm64-v8a"
