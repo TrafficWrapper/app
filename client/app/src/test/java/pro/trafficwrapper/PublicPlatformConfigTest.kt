@@ -245,6 +245,7 @@ class PublicPlatformConfigTest {
         assertEquals("reality-pub", slots.reality?.publicKey)
         assertEquals("short-id", slots.reality?.shortId)
         assertEquals("www.microsoft.com", slots.reality?.serverName)
+        assertEquals("utls-modern", slots.reality?.fingerprint)
         assertEquals("awg-server-pub", slots.awgRu?.params?.optString("public_key"))
         assertEquals("dialect-1", slots.awgRu?.dialectId)
     }
@@ -271,7 +272,7 @@ class PublicPlatformConfigTest {
         """{"schema":1,"ns":"client-config-v1","seq":1,"issued_at":"2030-01-01T00:00:00Z","workers":[{"id":"worker-p1","priority":10,"weight":100,"routes":["REALITY","AWG"],"expected_egress_ip":"203.0.113.5","reality":{"address":"203.0.113.5","port":8444,"publicKey":"pub","shortId":"sid"},"awg":{"endpoint":"203.0.113.5:51888","public_key":"awgpub","port":51888}}]}"""
 
     private fun nestedParamsClientConfig(): String =
-        """{"schema":1,"ns":"client-config-v1","seq":2,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-nested","label":"Nested","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":2053,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","flow":"xtls-rprx-vision","security":"reality","network":"tcp"}},{"type":"awg","enabled":true,"address":"worker.example","port":51888,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"awg-server-pub","endpoint":"worker.example:51888","dialect_id":"dialect-1"}}]}]}"""
+        """{"schema":1,"ns":"client-config-v1","seq":2,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-nested","label":"Nested","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":2053,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","flow":"xtls-rprx-vision","security":"reality","network":"tcp","fingerprint":"utls-modern"}},{"type":"awg","enabled":true,"address":"worker.example","port":51888,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"awg-server-pub","endpoint":"worker.example:51888","dialect_id":"dialect-1"}}]}]}"""
 
     private fun envelope(configJson: String, signature: String): String =
         JSONObject()
