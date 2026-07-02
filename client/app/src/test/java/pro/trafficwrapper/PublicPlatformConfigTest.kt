@@ -75,6 +75,7 @@ class PublicPlatformConfigTest {
             nowMs = 0,
         )
         assertEquals(7, parsed.seq)
+        assertEquals(listOf("9.9.9.9", "149.112.112.112"), parsed.dnsServers)
         assertEquals("worker-a", parsed.workers.single().workerId)
         assertEquals("198.51.100.10", parsed.workers.single().routes.single().expectedEgressIp)
 
@@ -245,9 +246,40 @@ class PublicPlatformConfigTest {
         assertEquals("reality-pub", slots.reality?.publicKey)
         assertEquals("short-id", slots.reality?.shortId)
         assertEquals("www.microsoft.com", slots.reality?.serverName)
-        assertEquals("utls-modern", slots.reality?.fingerprint)
+        assertEquals("firefox", slots.reality?.fingerprint)
         assertEquals("awg-server-pub", slots.awgRu?.params?.optString("public_key"))
         assertEquals("dialect-1", slots.awgRu?.dialectId)
+    }
+
+    @Test
+    fun realityFingerprintIsClampedToXrayUtlsSet() {
+        val parsed = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = JSONObject()
+                .put("config_json", nestedParamsClientConfig().replace("\"firefox\"", "\"utls-modern\""))
+                .put("minisig", "sig")
+                .toString(),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 0,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        val slots = PublicPlatformConfigParser.routeSlots(
+            config = parsed,
+            deviceId = "device-a",
+            credentials = PublicPlatformCredentials(
+                deviceID = "device-a",
+                realityUUID = "22222222-2222-4222-8222-222222222222",
+                internalIP = "10.13.13.3/32",
+                psk2 = "psk",
+                serverAWGPublic = "server-awg",
+                awgPrivateKey = "private",
+                awgPublicKey = "public",
+            ),
+        )
+
+        assertEquals("chrome", slots.reality?.fingerprint)
+        assertEquals("chrome", clampRealityFingerprint("typo"))
+        assertEquals("android", clampRealityFingerprint(" Android "))
     }
 
     private fun fakeVerifier(ok: Boolean): PublicMinisignVerifier =
@@ -260,7 +292,7 @@ class PublicPlatformConfigTest {
         """{"orchestrator_url":"https://orch.dev","config_pubkey_pin":"$PUBLIC_KEY","orch_noise_public":"orch-noise","seed_workers":["https://worker-a.dev/tw/v1"],"bootstrap_token":"once-token","expires":"$expires","limits":{"devices":1}}"""
 
     private fun clientConfig(seq: Long): String =
-        """{"schema":1,"ns":"client-config-v1","seq":$seq,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-a","label":"A","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker-a.dev","port":443,"expected_egress_ip":"198.51.100.10","dialect_id":"dialect-a","publicKey":"pub","shortId":"sid"}]}]}"""
+        """{"schema":1,"ns":"client-config-v1","seq":$seq,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","dns_servers":["9.9.9.9","149.112.112.112"],"workers":[{"worker_id":"worker-a","label":"A","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker-a.dev","port":443,"expected_egress_ip":"198.51.100.10","dialect_id":"dialect-a","publicKey":"pub","shortId":"sid"}]}]}"""
 
     private fun clientConfigWithWorkers(): String =
         """{"schema":1,"ns":"client-config-v1","seq":11,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"a","label":"A","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"a.dev","port":443,"expected_egress_ip":"198.51.100.1","dialect_id":"d"}]},{"worker_id":"b","label":"B","priority":0,"weight":40,"routes":[{"type":"reality","enabled":true,"address":"b.dev","port":443,"expected_egress_ip":"198.51.100.2","dialect_id":"d"}]},{"worker_id":"c","label":"C","priority":0,"weight":80,"routes":[{"type":"awg","enabled":true,"address":"c.dev","port":51821,"expected_egress_ip":"198.51.100.3","dialect_id":"d"}]}]}"""
@@ -272,7 +304,7 @@ class PublicPlatformConfigTest {
         """{"schema":1,"ns":"client-config-v1","seq":1,"issued_at":"2030-01-01T00:00:00Z","workers":[{"id":"worker-p1","priority":10,"weight":100,"routes":["REALITY","AWG"],"expected_egress_ip":"203.0.113.5","reality":{"address":"203.0.113.5","port":8444,"publicKey":"pub","shortId":"sid"},"awg":{"endpoint":"203.0.113.5:51888","public_key":"awgpub","port":51888}}]}"""
 
     private fun nestedParamsClientConfig(): String =
-        """{"schema":1,"ns":"client-config-v1","seq":2,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-nested","label":"Nested","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":2053,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","flow":"xtls-rprx-vision","security":"reality","network":"tcp","fingerprint":"utls-modern"}},{"type":"awg","enabled":true,"address":"worker.example","port":51888,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"awg-server-pub","endpoint":"worker.example:51888","dialect_id":"dialect-1"}}]}]}"""
+        """{"schema":1,"ns":"client-config-v1","seq":2,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-nested","label":"Nested","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":2053,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","flow":"xtls-rprx-vision","security":"reality","network":"tcp","fingerprint":"firefox"}},{"type":"awg","enabled":true,"address":"worker.example","port":51888,"expected_egress_ip":"198.51.100.20","dialect_id":"dialect-1","params":{"public_key":"awg-server-pub","endpoint":"worker.example:51888","dialect_id":"dialect-1"}}]}]}"""
 
     private fun envelope(configJson: String, signature: String): String =
         JSONObject()

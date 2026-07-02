@@ -80,6 +80,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import org.json.JSONArray
 import org.json.JSONObject
 import pro.trafficwrapper.go.transport.Transport
 import kotlinx.coroutines.delay
@@ -2453,6 +2454,7 @@ private fun applyPublicPlatformState(
         .put(JSON_SOCKS_LISTEN, DEFAULT_AWG_INTERNAL_SOCKS_LISTEN)
         .put(JSON_AWG_RU_SOCKS_LISTEN, DEFAULT_AWG_RU_INTERNAL_SOCKS_LISTEN)
         .put(JSON_MTU, DEFAULT_MTU)
+        .put(JSON_DNS_SERVERS, JSONArray(config.dnsServers))
     slots.awgRu?.let { applyRequest.put(JSON_AWG_RU, PublicPlatformConfigParser.awgRouteJson(it)) }
     slots.awg?.let { applyRequest.put(JSON_AWG, PublicPlatformConfigParser.awgRouteJson(it)) }
     val applyResponse = JSONObject(Transport.applyPublicPlatformConfig(applyRequest.toString()))
@@ -3280,7 +3282,7 @@ private fun JSONObject.toRealityUiConfig(): RealityUiConfig =
         serverName = optString(JSON_REALITY_SERVER_NAME),
         publicKey = optString(JSON_REALITY_PUBLIC_KEY),
         shortId = optString(JSON_REALITY_SHORT_ID),
-        fingerprint = optString(JSON_REALITY_FINGERPRINT),
+        fingerprint = clampRealityFingerprint(optString(JSON_REALITY_FINGERPRINT)),
         spiderX = optString(JSON_REALITY_SPIDER_X),
         dest = optString(JSON_REALITY_DEST),
     )
@@ -3402,6 +3404,7 @@ private const val JSON_REQUEST_KEYS = "request_keys"
 private const val JSON_SOCKS_LISTEN = "socks_listen"
 private const val JSON_AWG_RU_SOCKS_LISTEN = "awg_ru_socks_listen"
 private const val JSON_MTU = "mtu"
+private const val JSON_DNS_SERVERS = "dns_servers"
 private const val JSON_INTERNAL_IP = "internal_ip"
 private const val JSON_ENDPOINT = "endpoint"
 private const val JSON_SERVER_PUBLIC_KEY = "server_public_key"

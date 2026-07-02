@@ -30,28 +30,29 @@ type identityAPIResult struct {
 }
 
 type deviceEnrollAPIRequest struct {
-	Addr                    string `json:"provision_addr,omitempty"`
-	ServerPublicKey         string `json:"provision_server_public"`
-	NoisePrivateKey         string `json:"noise_private_key"`
-	NoisePublicKey          string `json:"noise_public_key"`
-	DeviceID                string `json:"device_id"`
-	AndroidID               string `json:"android_id,omitempty"`
-	Model                   string `json:"model,omitempty"`
-	IdentityPubKey          string `json:"identity_pubkey"`
-	IdentityKeyType         string `json:"identity_key_type"`
-	EnrollmentSecret        string `json:"enrollment_secret"`
-	EnrollmentSignature     string `json:"enrollment_signature"`
-	EnrollmentNonce         string `json:"enrollment_nonce"`
-	ClientVersion           string `json:"client_version,omitempty"`
-	RequestKeys             bool   `json:"request_keys,omitempty"`
-	SOCKSListen             string `json:"socks_listen,omitempty"`
-	AWGRUSOCKSListen        string `json:"awg_ru_socks_listen,omitempty"`
-	MTU                     int    `json:"mtu,omitempty"`
-	TimeoutSeconds          int64  `json:"timeout_seconds,omitempty"`
-	ExpectedServerAWGKey    string `json:"expected_server_awg_public,omitempty"`
-	RequireExpectedAWGKey   bool   `json:"require_expected_awg_public,omitempty"`
-	ExpectedServerAWGRUKey  string `json:"expected_server_awg_ru_public,omitempty"`
-	RequireExpectedAWGRUKey bool   `json:"require_expected_awg_ru_public,omitempty"`
+	Addr                    string   `json:"provision_addr,omitempty"`
+	ServerPublicKey         string   `json:"provision_server_public"`
+	NoisePrivateKey         string   `json:"noise_private_key"`
+	NoisePublicKey          string   `json:"noise_public_key"`
+	DeviceID                string   `json:"device_id"`
+	AndroidID               string   `json:"android_id,omitempty"`
+	Model                   string   `json:"model,omitempty"`
+	IdentityPubKey          string   `json:"identity_pubkey"`
+	IdentityKeyType         string   `json:"identity_key_type"`
+	EnrollmentSecret        string   `json:"enrollment_secret"`
+	EnrollmentSignature     string   `json:"enrollment_signature"`
+	EnrollmentNonce         string   `json:"enrollment_nonce"`
+	ClientVersion           string   `json:"client_version,omitempty"`
+	RequestKeys             bool     `json:"request_keys,omitempty"`
+	SOCKSListen             string   `json:"socks_listen,omitempty"`
+	AWGRUSOCKSListen        string   `json:"awg_ru_socks_listen,omitempty"`
+	MTU                     int      `json:"mtu,omitempty"`
+	TimeoutSeconds          int64    `json:"timeout_seconds,omitempty"`
+	ExpectedServerAWGKey    string   `json:"expected_server_awg_public,omitempty"`
+	RequireExpectedAWGKey   bool     `json:"require_expected_awg_public,omitempty"`
+	ExpectedServerAWGRUKey  string   `json:"expected_server_awg_ru_public,omitempty"`
+	RequireExpectedAWGRUKey bool     `json:"require_expected_awg_ru_public,omitempty"`
+	DNSServers              []string `json:"dns_servers,omitempty"`
 }
 
 type provisionAPIResult struct {
@@ -236,16 +237,14 @@ func deviceEnroll(req deviceEnrollAPIRequest) (provisionAPIResult, error) {
 		AWGPreset:       preset(resp.AWGPreset),
 		SOCKSListen:     req.SOCKSListen,
 		MTU:             req.MTU,
+		DNSServers:      req.DNSServers,
 	}
-	raw, err := json.Marshal(cfg)
+	configJSON, err := validatedConfigJSON(cfg)
 	if err != nil {
 		return provisionAPIResult{}, err
 	}
-	if _, err := parseConfig(string(raw)); err != nil {
-		return provisionAPIResult{}, err
-	}
 	pendingProvision.Lock()
-	pendingProvision.configJSON = string(raw)
+	pendingProvision.configJSON = configJSON
 	pendingProvision.awgRUConfigJSON = ""
 	pendingProvision.Unlock()
 	result.ConfigStored = true
@@ -263,16 +262,14 @@ func deviceEnroll(req deviceEnrollAPIRequest) (provisionAPIResult, error) {
 			AWGPreset:       preset(resp.AWGRU.AWGPreset),
 			SOCKSListen:     req.AWGRUSOCKSListen,
 			MTU:             req.MTU,
+			DNSServers:      req.DNSServers,
 		}
-		raw, err := json.Marshal(cfg)
+		configJSON, err := validatedConfigJSON(cfg)
 		if err != nil {
 			return provisionAPIResult{}, err
 		}
-		if _, err := parseConfig(string(raw)); err != nil {
-			return provisionAPIResult{}, err
-		}
 		pendingProvision.Lock()
-		pendingProvision.awgRUConfigJSON = string(raw)
+		pendingProvision.awgRUConfigJSON = configJSON
 		pendingProvision.Unlock()
 		result.AWGRUConfigStored = true
 	}

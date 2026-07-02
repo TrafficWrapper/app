@@ -2946,6 +2946,7 @@ class AutoTransportService : Service() {
             .put("socks_listen", AWG_UPSTREAM.host + ":" + AWG_UPSTREAM.port)
             .put("awg_ru_socks_listen", AWG_RU_UPSTREAM.host + ":" + AWG_RU_UPSTREAM.port)
             .put("mtu", 1420)
+            .put("dns_servers", JSONArray(config.dnsServers))
         slots.awgRu?.let { applyRequest.put("awg_ru", PublicPlatformConfigParser.awgRouteJson(it)) }
         slots.awg?.let { applyRequest.put("awg", PublicPlatformConfigParser.awgRouteJson(it)) }
         val applyResponse = JSONObject(Transport.applyPublicPlatformConfig(applyRequest.toString()))

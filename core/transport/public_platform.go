@@ -112,6 +112,7 @@ type publicApplyAPIRequest struct {
 	InternalIP       string           `json:"internal_ip"`
 	PSK2             string           `json:"psk2"`
 	ServerAWGPublic  string           `json:"server_awg_public"`
+	DNSServers       []string         `json:"dns_servers,omitempty"`
 	AWGRU            *publicRouteSpec `json:"awg_ru,omitempty"`
 	AWG              *publicRouteSpec `json:"awg,omitempty"`
 	AWGRUSOCKSListen string           `json:"awg_ru_socks_listen,omitempty"`
@@ -430,15 +431,9 @@ func publicAWGConfigJSON(route *publicRouteSpec, req publicApplyAPIRequest, sock
 		AWGPreset:       presetValue,
 		SOCKSListen:     socksListen,
 		MTU:             req.MTU,
+		DNSServers:      req.DNSServers,
 	}
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		return "", err
-	}
-	if _, err := parseConfig(string(raw)); err != nil {
-		return "", err
-	}
-	return string(raw), nil
+	return validatedConfigJSON(cfg)
 }
 
 func (r *publicRouteSpec) preset() (preset, error) {

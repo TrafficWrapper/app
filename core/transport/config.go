@@ -20,6 +20,8 @@ const (
 	keySize                 = 32
 )
 
+var defaultDNSServers = []string{"1.1.1.1", "1.0.0.1"}
+
 type preset = awgdialect.Dialect
 
 type config struct {
@@ -83,6 +85,7 @@ func parseConfig(configJSON string) (normalizedConfig, error) {
 	if !prefix.Addr().Is4() {
 		return normalizedConfig{}, fmt.Errorf("internal_ip must be IPv4, got %s", cfg.InternalIP)
 	}
+	cfg.DNSServers = effectiveDNSServerStrings(cfg.DNSServers)
 	dns := make([]netip.Addr, 0, len(cfg.DNSServers))
 	for _, value := range cfg.DNSServers {
 		addr, err := netip.ParseAddr(strings.TrimSpace(value))
@@ -92,6 +95,31 @@ func parseConfig(configJSON string) (normalizedConfig, error) {
 		dns = append(dns, addr)
 	}
 	return normalizedConfig{config: cfg, localAddr: prefix.Addr(), dnsServers: dns}, nil
+}
+
+func effectiveDNSServerStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return append([]string(nil), defaultDNSServers...)
+	}
+	return out
+}
+
+func validatedConfigJSON(cfg config) (string, error) {
+	cfg.DNSServers = effectiveDNSServerStrings(cfg.DNSServers)
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return "", err
+	}
+	if _, err := parseConfig(string(raw)); err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }
 
 func normalizeEndpoint(endpoint string) (string, error) {
