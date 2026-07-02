@@ -29,7 +29,12 @@ class MainActivityUiPolicyTest {
 
     @Test
     fun routeRegionUsesCarryingRouteAndOmitsBlankRegion() {
-        val regions = mapOf("AWG" to "Operator West", "REALITY2" to "Operator East")
+        val regions = mapOf(
+            "AWG_RU" to "Operator Entry",
+            "AWG" to "Operator West",
+            "REALITY" to "Operator Core",
+            "REALITY2" to "Operator East",
+        )
         val route = statusRouteForUi(
             TransportUiState(activeTransport = "AWG", carryingTransport = "REALITY2"),
             TransportChoice.AWG,
@@ -37,7 +42,10 @@ class MainActivityUiPolicyTest {
 
         assertEquals("REALITY2", route)
         assertEquals("Operator East", routeRegionForUi(route, regions))
-        assertEquals("", routeRegionForUi("REALITY", regions))
+        assertEquals("Operator Entry", routeRegionForUi("awg-ru", regions))
+        assertEquals("Operator West", routeRegionForUi("AWG", regions))
+        assertEquals("Operator Core", routeRegionForUi("REALITY", regions))
+        assertEquals("", routeRegionForUi("UNKNOWN", regions))
     }
 
     @Test

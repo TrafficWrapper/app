@@ -2447,7 +2447,12 @@ private fun transportChoiceRegion(choice: TransportChoice, regions: Map<String, 
     routeRegionForUi(defaultRouteForChoice(choice), regions)
 
 internal fun routeRegionForUi(route: String, regions: Map<String, String>): String =
-    regions[route].orEmpty()
+    regions[route].orEmpty().ifBlank {
+        regions[routeRegionLookupKey(route)].orEmpty()
+    }
+
+private fun routeRegionLookupKey(route: String): String =
+    route.trim().uppercase(Locale.ROOT).replace('-', '_')
 
 internal fun transportModeCardSubtitle(detail: String?, region: String): String? =
     detail ?: region.trim().ifBlank { null }
