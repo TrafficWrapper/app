@@ -13,6 +13,7 @@ data class TransportUiState(
     val handshakeEstablished: Boolean = false,
     val tunnelStable: Boolean = false,
     val activeTransport: String = "",
+    val carryingTransport: String = "",
     val socksListen: String = "",
     val httpProxyEnabled: Boolean = false,
     val httpProxyRunning: Boolean = false,
@@ -23,6 +24,20 @@ data class TransportUiState(
     val lastExchangeAgeSeconds: Long? = null,
     val stableSinceElapsedRealtimeMs: Long? = null,
 )
+
+data class QuotaUiState(
+    val limitBytes: Long = 0,
+    val usedBytes: Long? = null,
+    val remainingBytes: Long? = null,
+    val rateLimit: String = "",
+    val expiresAt: String = "",
+) {
+    val hasTrafficLimit: Boolean
+        get() = limitBytes > 0
+
+    val hasUsage: Boolean
+        get() = usedBytes != null || remainingBytes != null
+}
 
 enum class TransportChoice {
     AUTO,
@@ -93,6 +108,7 @@ data class AuthUiState(
     val awgRu: AwgUiConfig? = null,
     val reality: RealityUiConfig? = null,
     val reality2: RealityUiConfig? = null,
+    val quota: QuotaUiState = QuotaUiState(),
 )
 
 enum class ProxySupport {

@@ -17,6 +17,10 @@ object TransportLifecycleStore {
     private const val KEY_HTTP_PROXY = "http_proxy"
     private const val KEY_DIRECT_UPDATE_FALLBACK = "direct_update_fallback"
     private const val KEY_DISCOVERY_SUBSCRIPTION = "discovery_subscription"
+    private const val KEY_SERVICE_NOTIFICATIONS = "service_notifications"
+    private const val KEY_SERVICE_NOTIFICATION_TUNNEL_AT = "service_notification_tunnel_at"
+    private const val KEY_SERVICE_NOTIFICATION_APPROVAL_AT = "service_notification_approval_at"
+    private const val KEY_SERVICE_NOTIFICATION_QUOTA_AT = "service_notification_quota_at"
 
     fun rememberActiveTransport(context: Context, mode: TransportChoice) {
         prefs(context).edit()
@@ -176,10 +180,44 @@ object TransportLifecycleStore {
             .apply()
     }
 
+    fun serviceNotificationsEnabled(context: Context): Boolean =
+        serviceNotificationsPreference(
+            if (prefs(context).contains(KEY_SERVICE_NOTIFICATIONS)) {
+                prefs(context).getBoolean(KEY_SERVICE_NOTIFICATIONS, true)
+            } else {
+                null
+            },
+        )
+
+    fun setServiceNotificationsEnabled(context: Context, on: Boolean) {
+        prefs(context).edit()
+            .putBoolean(KEY_SERVICE_NOTIFICATIONS, on)
+            .apply()
+    }
+
+    fun shouldShowServiceNotification(context: Context, kind: ServiceNotificationKind, nowMs: Long): Boolean {
+        val shownAt = prefs(context).getLong(serviceNotificationKey(kind), 0L)
+        return shouldShowServiceNotificationAt(shownAt, nowMs, SERVICE_NOTIFICATION_MIN_INTERVAL_MS)
+    }
+
+    fun markServiceNotificationShown(context: Context, kind: ServiceNotificationKind, nowMs: Long) {
+        prefs(context).edit()
+            .putLong(serviceNotificationKey(kind), nowMs)
+            .apply()
+    }
+
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    private fun serviceNotificationKey(kind: ServiceNotificationKind): String =
+        when (kind) {
+            ServiceNotificationKind.TUNNEL_DOWN -> KEY_SERVICE_NOTIFICATION_TUNNEL_AT
+            ServiceNotificationKind.APPROVAL_REQUIRED -> KEY_SERVICE_NOTIFICATION_APPROVAL_AT
+            ServiceNotificationKind.QUOTA_LOW -> KEY_SERVICE_NOTIFICATION_QUOTA_AT
+        }
+
     private const val BATTERY_NOTIFICATION_MIN_INTERVAL_MS = 24L * 60L * 60L * 1000L
+    private const val SERVICE_NOTIFICATION_MIN_INTERVAL_MS = 6L * 60L * 60L * 1000L
 }
 
 internal fun httpProxyPreference(stored: Boolean?): Boolean = stored ?: false
@@ -187,3 +225,14 @@ internal fun httpProxyPreference(stored: Boolean?): Boolean = stored ?: false
 internal fun directUpdateFallbackPreference(stored: Boolean?): Boolean = stored ?: false
 
 internal fun discoverySubscriptionPreference(stored: Boolean?): Boolean = stored ?: false
+
+internal fun serviceNotificationsPreference(stored: Boolean?): Boolean = stored ?: true
+
+internal fun shouldShowServiceNotificationAt(lastShownAtMs: Long, nowMs: Long, minIntervalMs: Long): Boolean =
+    lastShownAtMs <= 0L || nowMs - lastShownAtMs >= minIntervalMs
+
+enum class ServiceNotificationKind {
+    TUNNEL_DOWN,
+    APPROVAL_REQUIRED,
+    QUOTA_LOW,
+}

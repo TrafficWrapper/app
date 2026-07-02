@@ -1,4 +1,23 @@
 <resources>
+    <string name="transport_mode_awg_ru">AWG A</string>
+    <string name="transport_mode_awg">AWG B</string>
+    <string name="transport_mode_reality">REALITY A</string>
+    <string name="transport_mode_reality2">REALITY B</string>
+    <string name="transport_mode_auto_detail">Auto: operator routes by priority</string>
+    <string name="main_status_traffic">Traffic: ↓ %1$s / ↑ %2$s</string>
+    <string name="main_status_speed">Speed: ↓ %1$s / ↑ %2$s</string>
+    <string name="main_status_quality">Quality: %1$s</string>
+    <string name="main_status_quota_remaining">Remaining: %1$s of %2$s</string>
+    <string name="main_status_quota_limit">Limit: %1$s · rate %2$s · expires %3$s</string>
+    <string name="service_notifications_switch">Important notifications</string>
+    <string name="service_notifications_description">Notify when the tunnel is not carrying in the background, the device needs approval, or quota is almost exhausted.</string>
+    <string name="service_alert_channel">Connection status</string>
+    <string name="service_alert_tunnel_title">TrafficWrapper is not carrying traffic</string>
+    <string name="service_alert_tunnel_text">The tunnel has not connected in the background for a while. Open the app to check status.</string>
+    <string name="service_alert_approval_title">Device approval required</string>
+    <string name="service_alert_approval_text">The operator needs to approve or unblock this device.</string>
+    <string name="service_alert_quota_title">Traffic quota is almost exhausted</string>
+    <string name="service_alert_quota_text">Quota remaining: %1$s of %2$s.</string>
     <string name="http_proxy_title">HTTP proxy (for Wi-Fi)</string>
     <string name="http_proxy_description">Local HTTP/CONNECT proxy for Android Wi-Fi proxy settings. Disabled by default.</string>
     <string name="http_proxy_listen">HTTP proxy: %1$s</string>

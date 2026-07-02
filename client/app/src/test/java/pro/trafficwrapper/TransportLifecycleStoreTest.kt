@@ -25,4 +25,28 @@ class TransportLifecycleStoreTest {
         assertFalse(discoverySubscriptionPreference(false))
         assertTrue(discoverySubscriptionPreference(true))
     }
+
+    @Test
+    fun serviceNotificationsPreferenceDefaultsTrueAndThrottleIsPerTimestamp() {
+        assertTrue(serviceNotificationsPreference(null))
+        assertFalse(serviceNotificationsPreference(false))
+        assertTrue(serviceNotificationsPreference(true))
+
+        val minIntervalMs = 6L * 60L * 60L * 1000L
+        assertTrue(shouldShowServiceNotificationAt(lastShownAtMs = 0L, nowMs = 1_000L, minIntervalMs = minIntervalMs))
+        assertFalse(
+            shouldShowServiceNotificationAt(
+                lastShownAtMs = 1_000L,
+                nowMs = 1_000L + minIntervalMs - 1L,
+                minIntervalMs = minIntervalMs,
+            ),
+        )
+        assertTrue(
+            shouldShowServiceNotificationAt(
+                lastShownAtMs = 1_000L,
+                nowMs = 1_000L + minIntervalMs,
+                minIntervalMs = minIntervalMs,
+            ),
+        )
+    }
 }

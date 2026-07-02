@@ -17,7 +17,6 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.util.Base64
 import android.util.Log
-import android.widget.ImageView
 import android.widget.Toast
 import androidx.annotation.StringRes
 import androidx.activity.ComponentActivity
@@ -83,7 +82,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import org.json.JSONArray
 import org.json.JSONObject
 import pro.trafficwrapper.go.transport.Transport
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import java.security.SecureRandom
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -601,6 +602,7 @@ private fun MainScreen(
     val connectInProgress = CONNECT_IN_PROGRESS
     val connecting = (connectInProgress || transportRunning) &&
         !transportConnected &&
+        transport.carryingTransport.isBlank() &&
         !isTransportTerminalForConnect(transport)
     LaunchedEffect(connectInProgress, transportConnected, transport.stateTextRes) {
         if (!connectInProgress) return@LaunchedEffect
@@ -618,7 +620,9 @@ private fun MainScreen(
     AppHeader()
     Spacer(modifier = Modifier.height(18.dp))
     ConnectionStatusCard(
+        auth = auth,
         transport = transport,
+        selectedTransport = selectedTransport,
         connected = transportConnected,
         connecting = connecting,
         stableDurationText = stableDurationText,
@@ -680,7 +684,9 @@ private fun AppHeader() {
 
 @Composable
 private fun ConnectionStatusCard(
+    auth: AuthUiState,
     transport: TransportUiState,
+    selectedTransport: TransportChoice,
     connected: Boolean,
     connecting: Boolean,
     stableDurationText: String?,
@@ -689,12 +695,14 @@ private fun ConnectionStatusCard(
     val textColor: Color
     val titleRes: Int
     val detail: String
+    val route = statusRouteForUi(transport, selectedTransport)
+    val traffic = rememberSessionTrafficSnapshot(connected, route)
     when {
         connected -> {
             backgroundColor = Color(0xFFE6F4EA)
             textColor = Color(0xFF14532D)
             titleRes = R.string.main_status_connected
-            detail = "${displayTransportLabel(transport.activeTransport)} · ${stringResource(R.string.main_status_connected_hint)}"
+            detail = "${displayTransportLabel(route)} · ${stringResource(R.string.main_status_connected_hint)}"
         }
         connecting -> {
             backgroundColor = Color(0xFFFFF4D6)
@@ -748,9 +756,162 @@ private fun ConnectionStatusCard(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            if (connected) {
+                Text(
+                    text = stringResource(
+                        R.string.main_status_traffic,
+                        formatTrafficBytes(traffic.sessionRxBytes),
+                        formatTrafficBytes(traffic.sessionTxBytes),
+                    ),
+                    modifier = Modifier.padding(top = 8.dp),
+                    color = textColor,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                )
+                Text(
+                    text = stringResource(
+                        R.string.main_status_speed,
+                        formatTrafficSpeed(traffic.rxBytesPerSecond),
+                        formatTrafficSpeed(traffic.txBytesPerSecond),
+                    ),
+                    modifier = Modifier.padding(top = 3.dp),
+                    color = textColor,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    text = stringResource(
+                        R.string.main_status_quality,
+                        formatExchangeRecency(transport.lastExchangeAgeSeconds),
+                    ),
+                    modifier = Modifier.padding(top = 3.dp),
+                    color = textColor,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                QuotaIndicator(
+                    quota = auth.quota,
+                    textColor = textColor,
+                )
+            }
         }
     }
 }
+
+@Composable
+private fun QuotaIndicator(quota: QuotaUiState, textColor: Color) {
+    if (!quota.hasTrafficLimit) return
+    val limit = quota.limitBytes.coerceAtLeast(1L)
+    val remaining = quota.remainingBytes?.coerceIn(0L, limit)
+    if (remaining != null) {
+        val usedFraction = 1f - (remaining.toFloat() / limit.toFloat()).coerceIn(0f, 1f)
+        Text(
+            text = stringResource(
+                R.string.main_status_quota_remaining,
+                formatTrafficBytes(remaining),
+                formatTrafficBytes(limit),
+            ),
+            modifier = Modifier.padding(top = 8.dp),
+            color = textColor,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium,
+        )
+        LinearProgressIndicator(
+            progress = { usedFraction },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 4.dp),
+            color = textColor,
+        )
+        return
+    }
+    Text(
+        text = stringResource(
+            R.string.main_status_quota_limit,
+            formatTrafficBytes(limit),
+            quota.rateLimit.ifBlank { stringResource(R.string.value_empty) },
+            quota.expiresAt.ifBlank { stringResource(R.string.value_empty) },
+        ),
+        modifier = Modifier.padding(top = 8.dp),
+        color = textColor,
+        style = MaterialTheme.typography.bodyMedium,
+    )
+}
+
+private data class SessionTrafficSnapshot(
+    val sessionRxBytes: Long = 0L,
+    val sessionTxBytes: Long = 0L,
+    val rxBytesPerSecond: Long = 0L,
+    val txBytesPerSecond: Long = 0L,
+)
+
+@Composable
+private fun rememberSessionTrafficSnapshot(connected: Boolean, route: String): SessionTrafficSnapshot {
+    var snapshot by remember { mutableStateOf(SessionTrafficSnapshot()) }
+    LaunchedEffect(connected, route) {
+        if (!connected) {
+            snapshot = SessionTrafficSnapshot()
+            return@LaunchedEffect
+        }
+        var baselineRx = TransportRuntime.state.rxBytes.coerceAtLeast(0L)
+        var baselineTx = TransportRuntime.state.txBytes.coerceAtLeast(0L)
+        var lastRx = baselineRx
+        var lastTx = baselineTx
+        var lastAtMs = SystemClock.elapsedRealtime()
+        snapshot = SessionTrafficSnapshot()
+        while (currentCoroutineContext().isActive) {
+            delay(1000)
+            val nowMs = SystemClock.elapsedRealtime()
+            val state = TransportRuntime.state
+            val rx = state.rxBytes.coerceAtLeast(0L)
+            val tx = state.txBytes.coerceAtLeast(0L)
+            if (rx < baselineRx || tx < baselineTx || rx < lastRx || tx < lastTx) {
+                baselineRx = rx
+                baselineTx = tx
+                lastRx = rx
+                lastTx = tx
+                lastAtMs = nowMs
+                snapshot = SessionTrafficSnapshot()
+                continue
+            }
+            val elapsedMs = (nowMs - lastAtMs).coerceAtLeast(1L)
+            snapshot = SessionTrafficSnapshot(
+                sessionRxBytes = (rx - baselineRx).coerceAtLeast(0L),
+                sessionTxBytes = (tx - baselineTx).coerceAtLeast(0L),
+                rxBytesPerSecond = ((rx - lastRx).coerceAtLeast(0L) * 1000L) / elapsedMs,
+                txBytesPerSecond = ((tx - lastTx).coerceAtLeast(0L) * 1000L) / elapsedMs,
+            )
+            lastRx = rx
+            lastTx = tx
+            lastAtMs = nowMs
+        }
+    }
+    return snapshot
+}
+
+internal fun formatTrafficBytes(bytes: Long): String {
+    val units = arrayOf("B", "KB", "MB", "GB", "TB")
+    var value = bytes.coerceAtLeast(0L).toDouble()
+    var unitIndex = 0
+    while (value >= 1024.0 && unitIndex < units.lastIndex) {
+        value /= 1024.0
+        unitIndex += 1
+    }
+    return if (unitIndex == 0) {
+        String.format(Locale.US, "%d %s", value.toLong(), units[unitIndex])
+    } else {
+        String.format(Locale.US, "%.1f %s", value, units[unitIndex])
+    }
+}
+
+internal fun formatTrafficSpeed(bytesPerSecond: Long): String =
+    "${formatTrafficBytes(bytesPerSecond)}/s"
+
+internal fun formatExchangeRecency(seconds: Long?): String =
+    when {
+        seconds == null -> "exchange now"
+        seconds <= 2L -> "exchange now"
+        seconds < 60L -> "exchange ${seconds}s ago"
+        else -> "exchange ${seconds / 60L}m ago"
+    }
 
 @Composable
 private fun PrimaryTransportButton(
@@ -760,12 +921,15 @@ private fun PrimaryTransportButton(
     connecting: Boolean,
 ) {
     Button(
-        enabled = !connecting && (auth.authorized || transportRunning),
+        enabled = connecting || auth.authorized || transportRunning,
         onClick = {
-            if (transportRunning) {
-                stopAllTransports(context.applicationContext)
-            } else {
-                connectSelectedTransport(context.applicationContext)
+            when (primaryTransportAction(connecting, transportRunning)) {
+                PrimaryTransportAction.CANCEL_CONNECTING -> {
+                    CONNECT_IN_PROGRESS = false
+                    stopAllTransports(context.applicationContext)
+                }
+                PrimaryTransportAction.DISCONNECT -> stopAllTransports(context.applicationContext)
+                PrimaryTransportAction.CONNECT -> connectSelectedTransport(context.applicationContext)
             }
         },
         modifier = Modifier
@@ -794,6 +958,19 @@ private fun PrimaryTransportButton(
         )
     }
 }
+
+internal enum class PrimaryTransportAction {
+    CANCEL_CONNECTING,
+    DISCONNECT,
+    CONNECT,
+}
+
+internal fun primaryTransportAction(connecting: Boolean, transportRunning: Boolean): PrimaryTransportAction =
+    when {
+        connecting -> PrimaryTransportAction.CANCEL_CONNECTING
+        transportRunning -> PrimaryTransportAction.DISCONNECT
+        else -> PrimaryTransportAction.CONNECT
+    }
 
 @Composable
 private fun AttentionBanners(
@@ -1233,6 +1410,9 @@ private fun SettingsScreen(
     var discoverySubscriptionOn by remember {
         mutableStateOf(TransportLifecycleStore.discoverySubscriptionEnabled(context.applicationContext))
     }
+    var serviceNotificationsOn by remember {
+        mutableStateOf(TransportLifecycleStore.serviceNotificationsEnabled(context.applicationContext))
+    }
 
     LaunchedEffect(permissionCheckRequested) {
         if (permissionCheckRequested == 0) return@LaunchedEffect
@@ -1394,6 +1574,13 @@ private fun SettingsScreen(
     }
 
     SettingsSection(title = stringResource(R.string.settings_permissions_title)) {
+        ServiceNotificationsPanel(
+            notificationsOn = serviceNotificationsOn,
+            onChanged = { enabled ->
+                TransportLifecycleStore.setServiceNotificationsEnabled(context.applicationContext, enabled)
+                serviceNotificationsOn = TransportLifecycleStore.serviceNotificationsEnabled(context.applicationContext)
+            },
+        )
         Button(
             enabled = !permissionChecking,
             onClick = { permissionCheckRequested += 1 },
@@ -1518,6 +1705,37 @@ private fun PermissionResultRow(context: Context, result: PermissionCheckResult)
                 Text(text = stringResource(R.string.attention_fix))
             }
         }
+    }
+}
+
+@Composable
+private fun ServiceNotificationsPanel(
+    notificationsOn: Boolean,
+    onChanged: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = stringResource(R.string.service_notifications_switch),
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Text(
+                text = stringResource(R.string.service_notifications_description),
+                modifier = Modifier.padding(top = 4.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = notificationsOn,
+            onCheckedChange = onChanged,
+        )
     }
 }
 
@@ -1709,386 +1927,6 @@ private fun OemBatteryGuideDialog(context: Context) {
 }
 
 @Composable
-private fun Header() {
-    Text(
-        text = stringResource(R.string.app_name),
-        style = MaterialTheme.typography.headlineMedium,
-    )
-    Text(
-        text = stringResource(R.string.version_label, BuildConfig.VERSION_NAME),
-        modifier = Modifier.padding(top = 6.dp),
-        style = MaterialTheme.typography.bodyLarge,
-    )
-}
-
-@Composable
-private fun EnrollmentPanel(auth: AuthUiState) {
-    Text(
-        text = stringResource(R.string.enrollment_title),
-        modifier = Modifier.padding(top = 18.dp),
-        style = MaterialTheme.typography.titleLarge,
-    )
-    Row(
-        modifier = Modifier.padding(top = 10.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(text = stringResource(auth.statusTextRes))
-    }
-    auth.errorTextRes?.let { errorRes ->
-        Text(
-            text = stringResource(errorRes),
-            modifier = Modifier.padding(top = 8.dp),
-            color = MaterialTheme.colorScheme.error,
-        )
-    }
-    Text(
-        text = stringResource(R.string.keystore_status, stringResource(auth.keystoreTextRes)),
-        modifier = Modifier.padding(top = 8.dp),
-        style = MaterialTheme.typography.bodyMedium,
-    )
-    if (auth.deviceID.isNotBlank()) {
-        Text(
-            text = stringResource(R.string.enrollment_device_id, auth.deviceID),
-            modifier = Modifier.padding(top = 4.dp),
-            style = MaterialTheme.typography.bodyMedium,
-        )
-    }
-    if (auth.alias.isNotBlank()) {
-        Text(
-            text = stringResource(R.string.enrollment_alias, auth.alias),
-            modifier = Modifier.padding(top = 4.dp),
-            style = MaterialTheme.typography.bodyMedium,
-        )
-    }
-    if (auth.model.isNotBlank()) {
-        Text(
-            text = stringResource(R.string.enrollment_model, auth.model),
-            modifier = Modifier.padding(top = 4.dp),
-            style = MaterialTheme.typography.bodyMedium,
-        )
-    }
-    if (auth.deviceIdentityPublicSuffix.isNotBlank()) {
-        Text(
-            text = stringResource(R.string.identity_suffix, auth.deviceIdentityPublicSuffix),
-            modifier = Modifier.padding(top = 4.dp),
-            style = MaterialTheme.typography.bodyMedium,
-        )
-    }
-    if (auth.message.isNotBlank()) {
-        Text(
-            text = auth.message,
-            modifier = Modifier.padding(top = 4.dp),
-            style = MaterialTheme.typography.bodyMedium,
-        )
-    }
-    if (auth.internalIP.isNotBlank()) {
-        Text(
-            text = stringResource(R.string.provisioned_internal_ip, auth.internalIP),
-            modifier = Modifier.padding(top = 4.dp),
-            style = MaterialTheme.typography.bodyMedium,
-        )
-    }
-}
-
-@Composable
-private fun AppSelectionPanel(apps: AppSelectionState, selectedApp: InstalledAppInfo?, socksListen: String) {
-    val context = LocalContext.current
-    Text(
-        text = stringResource(R.string.app_choice_title),
-        style = MaterialTheme.typography.titleLarge,
-    )
-    if (apps.loading) {
-        Text(
-            text = stringResource(R.string.app_choice_loading),
-            modifier = Modifier.padding(top = 8.dp),
-        )
-        return
-    }
-    Text(
-        text = stringResource(R.string.app_choice_selected, selectedApp?.label ?: stringResource(R.string.value_empty)),
-        modifier = Modifier.padding(top = 8.dp),
-    )
-    Text(
-        text = supportText(selectedApp?.support, socksListen),
-        modifier = Modifier.padding(top = 6.dp),
-        style = MaterialTheme.typography.bodyMedium,
-    )
-    if (selectedApp?.packageName == TELEGRAM_PACKAGE) {
-        Button(
-            onClick = { openTelegramProxy(context.applicationContext, socksListen) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 10.dp),
-        ) {
-            Text(text = stringResource(R.string.telegram_proxy_button))
-        }
-    }
-    AppGroup(
-        titleRes = R.string.app_group_auto,
-        emptyRes = R.string.app_group_auto_empty,
-        apps = apps.apps.filter { it.support == ProxySupport.AUTO_TELEGRAM },
-    )
-    AppGroup(
-        titleRes = R.string.app_group_manual,
-        emptyRes = R.string.app_group_manual_empty,
-        apps = apps.apps.filter { it.support == ProxySupport.MANUAL_PROXY },
-    )
-    AppGroup(
-        titleRes = R.string.app_group_unavailable,
-        emptyRes = R.string.app_group_unavailable_empty,
-        apps = apps.apps.filter { it.support == ProxySupport.UNSUPPORTED }.take(MAX_UNSUPPORTED_APPS_SHOWN),
-    )
-}
-
-@Composable
-private fun AppGroup(titleRes: Int, emptyRes: Int, apps: List<InstalledAppInfo>) {
-    Text(
-        text = stringResource(titleRes),
-        modifier = Modifier.padding(top = 14.dp),
-        style = MaterialTheme.typography.titleMedium,
-    )
-    if (apps.isEmpty()) {
-        Text(
-            text = stringResource(emptyRes),
-            modifier = Modifier.padding(top = 6.dp),
-            style = MaterialTheme.typography.bodyMedium,
-        )
-        return
-    }
-    apps.forEach { app ->
-        AppRow(app)
-    }
-}
-
-@Composable
-private fun AppRow(app: InstalledAppInfo) {
-    val selected = TransportRuntime.apps.selectedPackage == app.packageName
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 6.dp)
-            .clickable {
-                TransportRuntime.apps = TransportRuntime.apps.copy(selectedPackage = app.packageName)
-            },
-        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
-        shape = MaterialTheme.shapes.small,
-    ) {
-        Row(
-            modifier = Modifier.padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            AndroidView(
-                factory = { viewContext ->
-                    ImageView(viewContext).apply {
-                        setImageDrawable(app.icon)
-                        scaleType = ImageView.ScaleType.CENTER_INSIDE
-                    }
-                },
-                update = { it.setImageDrawable(app.icon) },
-                modifier = Modifier.size(36.dp),
-            )
-            Column {
-                Text(text = app.label, style = MaterialTheme.typography.bodyLarge)
-                Text(text = app.packageName, style = MaterialTheme.typography.bodySmall)
-            }
-        }
-    }
-}
-
-@Composable
-private fun TransportPanel(
-    context: Context,
-    transport: TransportUiState,
-    auth: AuthUiState,
-    selectedTransport: TransportChoice,
-    empty: String,
-    clockText: String,
-    handshakeText: String,
-    stabilityText: String,
-    stableDurationText: String?,
-    lastExchangeText: String,
-) {
-    val transportRunning = isTransportRunningForToggle(transport)
-    val transportConnected = isTransportConnectedForToggle(transport)
-    val connectInProgress = CONNECT_IN_PROGRESS
-    val connecting = connectInProgress && !transportConnected && !isTransportTerminalForConnect(transport)
-    LaunchedEffect(connectInProgress, transportConnected, transport.stateTextRes) {
-        if (!connectInProgress) return@LaunchedEffect
-        if (transportConnected || isTransportTerminalForConnect(transport)) {
-            CONNECT_IN_PROGRESS = false
-            return@LaunchedEffect
-        }
-        delay(CONNECT_TIMEOUT_MS)
-        val current = TransportRuntime.state
-        if (CONNECT_IN_PROGRESS && !isTransportConnectedForToggle(current)) {
-            CONNECT_IN_PROGRESS = false
-        }
-    }
-    Text(
-        text = stringResource(R.string.state_title),
-        style = MaterialTheme.typography.titleLarge,
-    )
-    Text(
-        text = stringResource(R.string.transport_mode_title),
-        modifier = Modifier.padding(top = 10.dp),
-        style = MaterialTheme.typography.bodyMedium,
-    )
-    Column(
-        modifier = Modifier.padding(top = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            TransportModeButton(
-                context = context,
-                choice = TransportChoice.AUTO,
-                selectedTransport = selectedTransport,
-                auth = auth,
-                labelRes = R.string.transport_mode_auto,
-                enabled = !connecting && transportChoiceConfigured(TransportChoice.AUTO, auth),
-            )
-            TransportModeButton(
-                context = context,
-                choice = TransportChoice.AWG_RU,
-                selectedTransport = selectedTransport,
-                auth = auth,
-                labelRes = R.string.transport_mode_awg_ru,
-                enabled = !connecting && transportChoiceConfigured(TransportChoice.AWG_RU, auth),
-            )
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            TransportModeButton(
-                context = context,
-                choice = TransportChoice.REALITY2,
-                selectedTransport = selectedTransport,
-                auth = auth,
-                labelRes = R.string.transport_mode_reality2,
-                enabled = !connecting && transportChoiceConfigured(TransportChoice.REALITY2, auth),
-            )
-            TransportModeButton(
-                context = context,
-                choice = TransportChoice.AWG,
-                selectedTransport = selectedTransport,
-                auth = auth,
-                labelRes = R.string.transport_mode_awg,
-                enabled = !connecting && transportChoiceConfigured(TransportChoice.AWG, auth),
-            )
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            TransportModeButton(
-                context = context,
-                choice = TransportChoice.REALITY,
-                selectedTransport = selectedTransport,
-                auth = auth,
-                labelRes = R.string.transport_mode_reality,
-                enabled = !connecting && transportChoiceConfigured(TransportChoice.REALITY, auth),
-            )
-        }
-    }
-    Text(
-        text = stringResource(R.string.transport_mode_auto_detail),
-        modifier = Modifier.padding(top = 6.dp),
-        style = MaterialTheme.typography.bodySmall,
-    )
-    if (selectedTransport == TransportChoice.REALITY && auth.reality?.isComplete() != true) {
-        Text(
-            text = stringResource(R.string.reality_tw_config_missing),
-            modifier = Modifier.padding(top = 8.dp),
-            color = MaterialTheme.colorScheme.error,
-        )
-    }
-    if (selectedTransport == TransportChoice.AWG_RU && auth.awgRu?.isComplete() != true) {
-        Text(
-            text = stringResource(R.string.awg_ru_config_missing),
-            modifier = Modifier.padding(top = 8.dp),
-            color = MaterialTheme.colorScheme.error,
-        )
-    }
-    if (selectedTransport == TransportChoice.REALITY2 && auth.reality2?.isComplete() != true) {
-        Text(
-            text = stringResource(R.string.reality2_config_missing),
-            modifier = Modifier.padding(top = 8.dp),
-            color = MaterialTheme.colorScheme.error,
-        )
-    }
-    Button(
-        enabled = !connecting && (auth.authorized || transportRunning),
-        onClick = {
-            if (transportRunning) {
-                stopAllTransports(context.applicationContext)
-            } else {
-                connectSelectedTransport(context.applicationContext)
-            }
-        },
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 10.dp),
-    ) {
-        Text(
-            text = stringResource(
-                when {
-                    connecting -> R.string.connecting_button
-                    transportRunning -> R.string.disconnect_button
-                    else -> R.string.connect_button
-                },
-            ),
-        )
-    }
-    Text(
-        text = stringResource(transport.stateTextRes),
-        modifier = Modifier.padding(top = 12.dp),
-        style = MaterialTheme.typography.bodyLarge,
-    )
-    Text(
-        text = if (transport.clockSkewSeconds != null) {
-            stringResource(R.string.status_clock_skew, clockText, transport.clockSkewSeconds)
-        } else {
-            stringResource(R.string.status_clock, clockText)
-        },
-        modifier = Modifier.padding(top = 8.dp),
-    )
-    Text(
-        text = stringResource(R.string.status_handshake, handshakeText),
-        modifier = Modifier.padding(top = 8.dp),
-    )
-    Text(
-        text = stringResource(R.string.status_transport, transport.activeTransport.ifBlank { empty }),
-        modifier = Modifier.padding(top = 6.dp),
-    )
-    Text(
-        text = stringResource(R.string.status_stability, stabilityText),
-        modifier = Modifier.padding(top = 6.dp),
-    )
-    stableDurationText?.let {
-        Text(
-            text = stringResource(R.string.status_stable_duration, it),
-            modifier = Modifier.padding(top = 6.dp),
-        )
-    }
-    Text(
-        text = stringResource(R.string.status_last_exchange, lastExchangeText),
-        modifier = Modifier.padding(top = 6.dp),
-    )
-    Text(
-        text = stringResource(R.string.status_socks, activeSocks(transport, auth).ifBlank { empty }),
-        modifier = Modifier.padding(top = 6.dp),
-    )
-    Text(
-        text = stringResource(R.string.status_rx, transport.rxBytes),
-        modifier = Modifier.padding(top = 6.dp),
-    )
-    Text(
-        text = stringResource(R.string.status_tx, transport.txBytes),
-        modifier = Modifier.padding(top = 6.dp),
-    )
-    Text(
-        text = stringResource(R.string.status_ip, transport.outboundIp.ifBlank { empty }),
-        modifier = Modifier.padding(top = 6.dp),
-    )
-}
-
-@Composable
 private fun rememberStableDurationText(stableSinceElapsedRealtimeMs: Long?): String? {
     var nowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
     LaunchedEffect(stableSinceElapsedRealtimeMs) {
@@ -2113,55 +1951,6 @@ private fun formatStableDuration(totalSeconds: Long): String {
         String.format(Locale.ROOT, "%02d:%02d", minutes, seconds)
     }
 }
-
-@Composable
-private fun TransportModeButton(
-    context: Context,
-    choice: TransportChoice,
-    selectedTransport: TransportChoice,
-    auth: AuthUiState,
-    labelRes: Int,
-    enabled: Boolean = true,
-) {
-    val selected = selectedTransport == choice
-    if (selected) {
-        Button(
-            enabled = enabled,
-            onClick = {
-                TransportRuntime.selectedTransport = choice
-                if (auth.authorized) {
-                    connectSelectedTransport(context.applicationContext)
-                }
-            },
-        ) {
-            Text(text = stringResource(labelRes))
-        }
-    } else {
-        OutlinedButton(
-            enabled = enabled,
-            onClick = {
-                TransportRuntime.selectedTransport = choice
-                if (auth.authorized) {
-                    connectSelectedTransport(context.applicationContext)
-                }
-            },
-        ) {
-            Text(text = stringResource(labelRes))
-        }
-    }
-}
-
-@Composable
-private fun supportText(support: ProxySupport?, socksListen: String): String =
-    when (support) {
-        ProxySupport.AUTO_TELEGRAM -> stringResource(R.string.app_support_auto)
-        ProxySupport.MANUAL_PROXY -> stringResource(
-            R.string.app_support_manual,
-            socksListen.ifBlank { DEFAULT_SOCKS_LISTEN },
-        )
-        ProxySupport.UNSUPPORTED -> stringResource(R.string.app_support_unavailable)
-        null -> stringResource(R.string.app_support_none)
-    }
 
 private data class PermissionCheckResult(
     @StringRes val titleRes: Int,
@@ -2201,11 +1990,11 @@ private fun transportChoiceConfigured(choice: TransportChoice, auth: AuthUiState
 
 private fun displayTransportLabel(raw: String): String =
     when (raw) {
-        TRANSPORT_LABEL_AWG_RU -> "AWG-RU"
-        TRANSPORT_LABEL_AWG -> "AWG-NL"
-        TRANSPORT_LABEL_REALITY -> "REALITY-TW"
-        TRANSPORT_LABEL_REALITY2 -> "REALITY-RU"
-        else -> raw.ifBlank { "Авто" }
+        TRANSPORT_LABEL_AWG_RU -> "AWG A"
+        TRANSPORT_LABEL_AWG -> "AWG B"
+        TRANSPORT_LABEL_REALITY -> "REALITY A"
+        TRANSPORT_LABEL_REALITY2 -> "REALITY B"
+        else -> raw.ifBlank { "AUTO" }
     }
 
 private fun refreshAttentionState(context: Context) {
@@ -2459,6 +2248,7 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRaw: String =
                 serverAWGPublic = response.getString(JSON_PUBLIC_SERVER_AWG_PUBLIC),
                 awgPrivateKey = response.optString(JSON_PUBLIC_AWG_PRIVATE_KEY).ifBlank { awgKeyPair.privateKey },
                 awgPublicKey = response.optString(JSON_PUBLIC_AWG_PUBLIC_KEY).ifBlank { awgKeyPair.publicKey },
+                limitsJson = (config.limits ?: parsed.limits)?.toString().orEmpty(),
             )
             applyPublicPlatformState(
                 context = context.applicationContext,
@@ -2549,6 +2339,7 @@ private fun applyPublicPlatformState(
         awgRu = publicAwgUiConfig(slots.awgRu, stored),
         reality = slots.reality,
         reality2 = slots.reality2,
+        quota = (config.limits ?: stored.limitsJson.toJsonObjectOrNull())?.toQuotaUiState() ?: QuotaUiState(),
     )
 }
 
@@ -2857,19 +2648,34 @@ private fun requestStartupAutoconnect(context: Context) {
     if (!TransportLifecycleStore.shouldKeepAlive(context)) return
     TransportRuntime.selectedTransport = TransportLifecycleStore.preferredMode(context)
     TRANSPORT_KEEP_ALIVE.set(true)
-    CONNECT_IN_PROGRESS = true
-    TransportRuntime.state = TransportRuntime.state.copy(
-        stateTextRes = R.string.state_starting,
-        socksListen = DEFAULT_ROUTER_SOCKS_LISTEN,
+    val current = startupAutoconnectSourceState(
+        runtimeState = TransportRuntime.state,
+        serviceSnapshot = AutoTransportService.latestCarryingUiState(),
     )
+    CONNECT_IN_PROGRESS = shouldMarkConnectInProgressOnStartup(current)
+    TransportRuntime.state = startupAutoconnectUiState(current)
 }
 
 private fun connectSelectedTransport(context: Context) {
     TRANSPORT_KEEP_ALIVE.set(true)
     TransportLifecycleStore.rememberActiveTransport(context.applicationContext, TransportRuntime.selectedTransport)
+    val selectedTransport = TransportRuntime.selectedTransport
+    val current = TransportRuntime.state
+    val requestedRoute = defaultRouteForChoice(selectedTransport)
+    val keepExistingCarry = selectedTransport == TransportChoice.AUTO ||
+        current.carryingTransport.isBlank() ||
+        current.carryingTransport == requestedRoute
     CONNECT_IN_PROGRESS = true
-    TransportRuntime.state = TransportRuntime.state.copy(
+    TransportRuntime.state = current.copy(
         stateTextRes = R.string.state_starting,
+        handshakeEstablished = if (keepExistingCarry) current.handshakeEstablished else false,
+        tunnelStable = if (keepExistingCarry) current.tunnelStable else false,
+        activeTransport = if (keepExistingCarry) {
+            current.carryingTransport.ifBlank { current.activeTransport }
+        } else {
+            requestedRoute
+        },
+        carryingTransport = if (keepExistingCarry) current.carryingTransport else "",
         socksListen = DEFAULT_ROUTER_SOCKS_LISTEN,
     )
     if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
@@ -2937,6 +2743,42 @@ private fun isRunningOnCurrentRoute(choice: TransportChoice): Boolean {
     }
 }
 
+internal fun statusRouteForUi(state: TransportUiState, selectedTransport: TransportChoice): String =
+    state.carryingTransport.ifBlank {
+        state.activeTransport.ifBlank { defaultRouteForChoice(selectedTransport) }
+    }
+
+internal fun defaultRouteForChoice(choice: TransportChoice): String =
+    when (choice) {
+        TransportChoice.AUTO -> ""
+        TransportChoice.AWG_RU -> TRANSPORT_LABEL_AWG_RU
+        TransportChoice.AWG -> TRANSPORT_LABEL_AWG
+        TransportChoice.REALITY -> TRANSPORT_LABEL_REALITY
+        TransportChoice.REALITY2 -> TRANSPORT_LABEL_REALITY2
+    }
+
+internal fun shouldMarkConnectInProgressOnStartup(state: TransportUiState): Boolean =
+    state.carryingTransport.isBlank() &&
+        !state.handshakeEstablished &&
+        !state.tunnelStable
+
+internal fun startupAutoconnectSourceState(
+    runtimeState: TransportUiState,
+    serviceSnapshot: TransportUiState?,
+): TransportUiState =
+    serviceSnapshot?.takeIf { it.carryingTransport.isNotBlank() || it.handshakeEstablished }
+        ?: runtimeState
+
+internal fun startupAutoconnectUiState(state: TransportUiState): TransportUiState =
+    if (shouldMarkConnectInProgressOnStartup(state)) {
+        state.copy(
+            stateTextRes = R.string.state_starting,
+            socksListen = DEFAULT_ROUTER_SOCKS_LISTEN,
+        )
+    } else {
+        state.copy(socksListen = DEFAULT_ROUTER_SOCKS_LISTEN)
+    }
+
 private fun isTransportRunningForToggle(state: TransportUiState): Boolean =
     state.socksListen == DEFAULT_ROUTER_SOCKS_LISTEN &&
         state.stateTextRes != R.string.state_idle &&
@@ -2947,6 +2789,7 @@ private fun isTransportConnectedForToggle(state: TransportUiState): Boolean =
         (
             state.handshakeEstablished ||
                 state.tunnelStable ||
+                state.carryingTransport.isNotBlank() ||
                 state.stateTextRes == R.string.state_connected ||
                 state.stateTextRes == R.string.state_connected_stable
             )
@@ -3107,6 +2950,7 @@ private fun postEnrollmentBaseState(
     awgRu: AwgUiConfig? = null,
     reality: RealityUiConfig? = null,
     reality2: RealityUiConfig? = null,
+    quota: QuotaUiState? = null,
 ) {
     mainHandler.post {
         val current = TransportRuntime.auth
@@ -3116,6 +2960,7 @@ private fun postEnrollmentBaseState(
         val effectiveAWGRU = if (authorized) awgRu ?: current.awgRu else awgRu
         val effectiveReality = if (authorized) reality ?: current.reality else reality
         val effectiveReality2 = if (authorized) reality2 ?: current.reality2 else reality2
+        val effectiveQuota = if (authorized) quota ?: current.quota else quota ?: QuotaUiState()
         TransportRuntime.auth = AuthUiState(
             authorized = authorized,
             inProgress = !authorized,
@@ -3139,6 +2984,7 @@ private fun postEnrollmentBaseState(
             awgRu = effectiveAWGRU,
             reality = effectiveReality,
             reality2 = effectiveReality2,
+            quota = effectiveQuota,
         )
         if (authorized && effectiveSOCKS.isNotBlank()) {
             TransportRuntime.state = TransportRuntime.state.copy(socksListen = DEFAULT_ROUTER_SOCKS_LISTEN)
@@ -3349,6 +3195,32 @@ private fun JSONObject.toRealityUiConfig(): RealityUiConfig =
         dest = optString(JSON_REALITY_DEST),
     )
 
+private fun String.toJsonObjectOrNull(): JSONObject? =
+    takeIf { it.isNotBlank() }?.let { raw ->
+        runCatching { JSONObject(raw) }.getOrNull()
+    }
+
+internal fun JSONObject.toQuotaUiState(): QuotaUiState {
+    val limit = optLong(JSON_QUOTA_TRAFFIC_BYTES, optLong(JSON_QUOTA_LIMIT_BYTES, 0L)).coerceAtLeast(0L)
+    val used = if (has(JSON_QUOTA_USED_BYTES)) {
+        optLong(JSON_QUOTA_USED_BYTES, 0L).coerceAtLeast(0L)
+    } else {
+        null
+    }
+    val remaining = if (has(JSON_QUOTA_REMAINING_BYTES)) {
+        optLong(JSON_QUOTA_REMAINING_BYTES, 0L).coerceAtLeast(0L)
+    } else {
+        used?.let { (limit - it).coerceAtLeast(0L) }
+    }
+    return QuotaUiState(
+        limitBytes = limit,
+        usedBytes = used,
+        remainingBytes = remaining,
+        rateLimit = optString(JSON_QUOTA_RATE_LIMIT),
+        expiresAt = optString(JSON_EXPIRES_AT),
+    )
+}
+
 private fun JSONObject.preferredTransportChoice(): TransportChoice? {
     val raw = optString(JSON_PREFERRED_TRANSPORT).ifBlank {
         optString(JSON_TRANSPORT_PRIORITY)
@@ -3491,6 +3363,13 @@ private const val JSON_REALITY_SHORT_ID = "shortId"
 private const val JSON_REALITY_FINGERPRINT = "fingerprint"
 private const val JSON_REALITY_SPIDER_X = "spiderX"
 private const val JSON_REALITY_DEST = "dest"
+private const val JSON_LIMITS = "limits"
+private const val JSON_QUOTA_TRAFFIC_BYTES = "traffic_quota_bytes"
+private const val JSON_QUOTA_LIMIT_BYTES = "limit_bytes"
+private const val JSON_QUOTA_USED_BYTES = "used_bytes"
+private const val JSON_QUOTA_REMAINING_BYTES = "remaining_bytes"
+private const val JSON_QUOTA_RATE_LIMIT = "rate_limit"
+private const val JSON_EXPIRES_AT = "expires_at"
 private const val JSON_PUBLIC_ORCHESTRATOR_URL = "orchestrator_url"
 private const val JSON_PUBLIC_ORCH_NOISE_PUBLIC = "orch_noise_public"
 private const val JSON_PUBLIC_BOOTSTRAP_TOKEN = "bootstrap_token"

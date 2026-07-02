@@ -53,6 +53,7 @@ data class PublicClientConfig(
     val updatePubkey: String,
     val discoveryPubkey: String,
     val dnsServers: List<String>,
+    val limits: JSONObject?,
     val workers: List<PublicWorkerConfig>,
 )
 
@@ -294,6 +295,7 @@ object PublicPlatformConfigParser {
             updatePubkey = root.optString(JSON_UPDATE_PUBKEY),
             discoveryPubkey = root.optString(JSON_DISCOVERY_PUBKEY),
             dnsServers = root.optJSONArray(JSON_DNS_SERVERS).toStringList(),
+            limits = root.optJSONObject(JSON_LIMITS),
             workers = root.getJSONArray(JSON_WORKERS).toWorkers(),
         )
 

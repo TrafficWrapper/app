@@ -64,6 +64,7 @@ data class StoredPublicPlatformState(
     val serverAWGPublic: String = "",
     val awgPrivateKey: String = "",
     val awgPublicKey: String = "",
+    val limitsJson: String = "",
 )
 
 data class StoredPublicAWGKeyPair(
@@ -359,6 +360,7 @@ class SecureIdentityStore(context: Context) {
             serverAWGPublic = root.optString(JSON_SERVER_AWG_PUBLIC),
             awgPrivateKey = root.optString(JSON_AWG_PRIVATE_KEY),
             awgPublicKey = root.optString(JSON_AWG_PUBLIC_KEY),
+            limitsJson = root.optString(JSON_LIMITS_JSON),
         )
     }
 
@@ -382,6 +384,7 @@ class SecureIdentityStore(context: Context) {
             .put(JSON_SERVER_AWG_PUBLIC, state.serverAWGPublic)
             .put(JSON_AWG_PRIVATE_KEY, state.awgPrivateKey)
             .put(JSON_AWG_PUBLIC_KEY, state.awgPublicKey)
+            .put(JSON_LIMITS_JSON, state.limitsJson)
         if (!prefs.edit().putString(KEY_PUBLIC_PLATFORM_STATE, seal(root.toString(), keyState.key)).commit()) {
             throw IllegalStateException("failed to persist public platform state")
         }
@@ -598,5 +601,6 @@ class SecureIdentityStore(context: Context) {
         private const val JSON_SERVER_AWG_PUBLIC = "server_awg_public"
         private const val JSON_AWG_PRIVATE_KEY = "awg_private_key"
         private const val JSON_AWG_PUBLIC_KEY = "awg_public_key"
+        private const val JSON_LIMITS_JSON = "limits_json"
     }
 }
