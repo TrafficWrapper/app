@@ -498,7 +498,7 @@ object Telemetry {
             val statusLine = header.lineSequence().firstOrNull().orEmpty()
             val code = statusLine.split(' ').firstOrNull { it.toIntOrNull() != null }?.toIntOrNull() ?: 0
             val responseText = input.readBytes().toString(Charsets.UTF_8).take(MAX_RESPONSE_CHARS)
-            if (code in 400..499 && isDeviceNotApprovedMessage(responseText)) {
+            if (isExplicitDeviceNotApprovedResponse(code, responseText)) {
                 markPublicDeviceReauthRequired(context, "telemetry")
             }
             val disable = header.lineSequence().any { line ->

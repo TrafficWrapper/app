@@ -10,8 +10,17 @@ class ReauthStateTest {
     fun detectsDeviceNotApprovedError() {
         assertTrue(isDeviceNotApprovedMessage("device is not approved"))
         assertTrue(isDeviceNotApprovedMessage("HTTP 403: Device is not approved"))
+        assertTrue(isDeviceNotApprovedMessage("""{"error":"device_not_approved"}"""))
         assertFalse(isDeviceNotApprovedMessage("temporary network error"))
         assertFalse(isDeviceNotApprovedMessage(null))
+    }
+
+    @Test
+    fun explicitDeviceNotApprovedRequiresForbiddenMarker() {
+        assertTrue(isExplicitDeviceNotApprovedResponse(403, """{"error":"device_not_approved"}"""))
+        assertTrue(isExplicitDeviceNotApprovedResponse(403, "device is not approved"))
+        assertFalse(isExplicitDeviceNotApprovedResponse(502, """{"error":"device_not_approved"}"""))
+        assertFalse(isExplicitDeviceNotApprovedResponse(403, "temporary forward error"))
     }
 
     @Test

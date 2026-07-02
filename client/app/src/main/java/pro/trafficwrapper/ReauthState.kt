@@ -9,7 +9,12 @@ import android.util.Log
 internal fun isDeviceNotApprovedMessage(value: String?): Boolean =
     value
         ?.lowercase()
-        ?.contains("device is not approved") == true
+        ?.let { text ->
+            text.contains("device is not approved") || text.contains("device_not_approved")
+        } == true
+
+internal fun isExplicitDeviceNotApprovedResponse(httpCode: Int, body: String): Boolean =
+    httpCode == 403 && isDeviceNotApprovedMessage(body)
 
 internal fun reauthRequiredAuthState(current: AuthUiState): AuthUiState =
     current.copy(
