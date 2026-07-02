@@ -168,7 +168,7 @@ The public APK is available on GitHub Releases:
 
 - Release: <https://github.com/TrafficWrapper/app/releases/tag/v0.1.21>
 - File: `TrafficWrapper-app-v0.1.21.apk`
-- APK SHA-256: `6828f50d0b308bf1c75778c3ef95f06a215d2a97bc0c55db9768bfb7dd759f9d`
+- APK SHA-256: `7638894d42e7e5db29be7fc7830f40633d2ae1560ccd8f8c76c3ce83311864c6`
 - Signing certificate SHA-256: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
 - Application ID: `org.trafficwrapper.app`
 - Version: `0.1.21` (`versionCode=22`)
@@ -190,7 +190,7 @@ manifest signature, and optional rebuild from a git tag.
 
 ```sh
 APK=TrafficWrapper-app-v0.1.21.apk \
-EXPECTED_APK_SHA256=6828f50d0b308bf1c75778c3ef95f06a215d2a97bc0c55db9768bfb7dd759f9d \
+EXPECTED_APK_SHA256=7638894d42e7e5db29be7fc7830f40633d2ae1560ccd8f8c76c3ce83311864c6 \
 EXPECTED_CERT_SHA256=bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8 \
 ./build/verify-release.sh
 ```

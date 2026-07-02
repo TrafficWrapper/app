@@ -39,7 +39,7 @@ class TwVpnService : VpnService() {
                     startVpnForeground()
                     vpnExecutor.execute { establishAndStart() }
                 } else {
-                    stopSelf(startId)
+                    stopStartRequestAfterForeground(startId, "vpn_disabled")
                 }
             }
             ACTION_VPN_STOP -> {
@@ -405,6 +405,13 @@ class TwVpnService : VpnService() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+    }
+
+    private fun stopStartRequestAfterForeground(startId: Int, reason: String) {
+        Log.i(LOG_TAG, "VPN start request ignored after foreground promotion: $reason")
+        startVpnForeground()
+        stopVpnForeground()
+        stopSelf(startId)
     }
 
     private fun stopVpnForeground() {
