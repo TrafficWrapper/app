@@ -32,7 +32,7 @@ internal fun realityXhttpSettingsJson(
 ): JSONObject =
     JSONObject()
         .put("path", cfg.xhttpPath)
-        .put("mode", cfg.xhttpMode)
+        .put("mode", realityXhttpOutboundMode(cfg.xhttpMode))
         .apply {
             val host = cfg.xhttpHost.ifBlank { cfg.serverName }.trim()
             if (host.isNotBlank()) {
@@ -51,3 +51,14 @@ internal fun realityOutboundFlow(cfg: RealityUiConfig): String =
     } else {
         cfg.flow.trim()
     }
+
+internal fun realityXhttpOutboundMode(mode: String): String {
+    val normalized = mode.trim()
+    return if (normalized.isBlank() || normalized.equals("auto", ignoreCase = true)) {
+        XHTTP_DEFAULT_OUTBOUND_MODE
+    } else {
+        normalized
+    }
+}
+
+private const val XHTTP_DEFAULT_OUTBOUND_MODE = "stream-up"

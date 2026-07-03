@@ -4424,7 +4424,11 @@ class AutoTransportService : Service() {
         Thread {
             runCatching {
                 process.inputStream.bufferedReader().useLines { lines ->
-                    lines.forEach { _ -> }
+                    lines.forEach { line ->
+                        if (line.isNotBlank()) {
+                            Log.i(XRAY_LOG_TAG, "route=${routeLabel(route)} gen=$generation $line")
+                        }
+                    }
                 }
                 val runtime = routeRuntime(route)
                 if (
@@ -5245,6 +5249,7 @@ class AutoTransportService : Service() {
         private const val TELEMETRY_HEARTBEAT_JITTER_MS = 15_000L
         private const val BATTERY_RESTRICTION_NOTIFY_CHECK_INTERVAL_MS = 60L * 60L * 1000L
         private const val LOG_TAG = "TWSocksRouter"
+        private const val XRAY_LOG_TAG = "XrayCore"
         private const val WAKE_LOCK_TAG = "TrafficWrapper:transport"
         private const val BACKSTOP_REQUEST_CODE = 1304
         private const val ROUTE_REASON_AWG_NOT_CARRYING = "awg_not_carrying"

@@ -36,7 +36,7 @@ class RealityXrayConfigTest {
         val xhttp = stream.getJSONObject("xhttpSettings")
         assertEquals("cdn.operator.example", xhttp.getString("host"))
         assertEquals("/operator-path", xhttp.getString("path"))
-        assertEquals("auto", xhttp.getString("mode"))
+        assertEquals("stream-up", xhttp.getString("mode"))
         assertEquals("1", xhttp.getJSONObject("extra").getJSONObject("headers").getString("X-Test"))
     }
 
@@ -49,6 +49,13 @@ class RealityXrayConfigTest {
 
         val xhttp = stream.getJSONObject("xhttpSettings")
         assertEquals("www.microsoft.com", xhttp.getString("host"))
+    }
+
+    @Test
+    fun xhttpOutboundModeAutoOrBlankUsesStreamUp() {
+        assertEquals("stream-up", realityXhttpOutboundMode("auto"))
+        assertEquals("stream-up", realityXhttpOutboundMode(""))
+        assertEquals("packet-up", realityXhttpOutboundMode(" packet-up "))
     }
 
     @Test

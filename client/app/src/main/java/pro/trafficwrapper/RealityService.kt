@@ -8,6 +8,7 @@ import android.content.Intent
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -239,7 +240,11 @@ class RealityService : Service() {
         Thread {
             runCatching {
                 process.inputStream.bufferedReader().useLines { lines ->
-                    lines.forEach { _ -> }
+                    lines.forEach { line ->
+                        if (line.isNotBlank()) {
+                            Log.i(XRAY_LOG_TAG, line)
+                        }
+                    }
                 }
             }
         }.apply {
@@ -255,6 +260,7 @@ class RealityService : Service() {
         private const val CHANNEL_ID = "transport"
         private const val NOTIFICATION_ID = 1302
         private const val XRAY_LIB_NAME = "libxray.so"
+        private const val XRAY_LOG_TAG = "XrayCore"
         private const val TRANSPORT_NAME = "xray-reality"
         private const val DEFAULT_REALITY_HOST = "127.0.0.1"
         private const val DEFAULT_REALITY_PORT = 18081
