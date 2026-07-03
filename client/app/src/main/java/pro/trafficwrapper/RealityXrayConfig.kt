@@ -44,3 +44,10 @@ internal fun realityXhttpSettingsJson(
                     .onFailure { onInvalidXhttpExtra?.invoke(it.message.orEmpty()) }
             }
         }
+
+internal fun realityOutboundFlow(cfg: RealityUiConfig): String =
+    if (cfg.network.equals("xhttp", ignoreCase = true)) {
+        ""
+    } else {
+        cfg.flow.trim()
+    }

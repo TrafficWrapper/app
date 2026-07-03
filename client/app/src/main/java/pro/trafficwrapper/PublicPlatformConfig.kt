@@ -389,17 +389,18 @@ object PublicPlatformConfigParser {
         )
     }
 
-    private fun PublicRouteConfig.toRealityUiConfig(credentials: PublicPlatformCredentials): RealityUiConfig =
-        RealityUiConfig(
+    private fun PublicRouteConfig.toRealityUiConfig(credentials: PublicPlatformCredentials): RealityUiConfig {
+        val network = params.optString(JSON_REALITY_NETWORK, "tcp")
+        return RealityUiConfig(
             transport = params.optString(JSON_REALITY_TRANSPORT, "REALITY"),
             address = address,
             ip = params.optString(JSON_REALITY_IP),
             port = port,
             uuid = credentials.realityUUID,
             email = credentials.deviceID,
-            flow = params.optString(JSON_REALITY_FLOW),
+            flow = realityConfigFlow(network, params.optString(JSON_REALITY_FLOW)),
             security = params.optString(JSON_REALITY_SECURITY, "reality"),
-            network = params.optString(JSON_REALITY_NETWORK, "tcp"),
+            network = network,
             serverName = params.optString(JSON_REALITY_SERVER_NAME).ifBlank {
                 params.optString(JSON_REALITY_SERVER_NAME_SNAKE, "example.com")
             },
@@ -417,6 +418,10 @@ object PublicPlatformConfigParser {
             xhttpMode = params.xhttpString(JSON_REALITY_XHTTP_MODE, JSON_REALITY_XHTTP_MODE_SNAKE),
             xhttpExtraJson = params.xhttpObjectString(JSON_REALITY_XHTTP_EXTRA, JSON_REALITY_XHTTP_EXTRA_SNAKE),
         )
+    }
+
+    private fun realityConfigFlow(network: String, flow: String): String =
+        if (network.equals("xhttp", ignoreCase = true)) "" else flow.trim()
 
     private fun JSONObject.xhttpString(camelKey: String, snakeKey: String): String {
         val xhttp = optJSONObject(JSON_REALITY_XHTTP)

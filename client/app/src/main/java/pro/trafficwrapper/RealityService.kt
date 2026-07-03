@@ -161,8 +161,9 @@ class RealityService : Service() {
         val user = JSONObject()
             .put("id", cfg.uuid)
             .put("encryption", "none")
-        if (cfg.flow.isNotBlank()) {
-            user.put("flow", cfg.flow)
+        val flow = realityOutboundFlow(cfg)
+        if (flow.isNotBlank()) {
+            user.put("flow", flow)
         }
         val vnext = JSONObject()
             .put("address", cfg.address)

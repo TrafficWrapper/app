@@ -66,8 +66,23 @@ class RealityXrayConfigTest {
         assertTrue(warning.isNotBlank())
     }
 
+    @Test
+    fun xhttpRealityOutboundFlowIsAlwaysBlank() {
+        val cfg = baseConfig(network = "xhttp", xhttpPath = "/x", xhttpMode = "auto", flow = "xtls-rprx-vision")
+
+        assertEquals("", realityOutboundFlow(cfg))
+    }
+
+    @Test
+    fun tcpRealityOutboundFlowIsPreserved() {
+        val cfg = baseConfig(network = "tcp", flow = "xtls-rprx-vision")
+
+        assertEquals("xtls-rprx-vision", realityOutboundFlow(cfg))
+    }
+
     private fun baseConfig(
         network: String,
+        flow: String = "",
         xhttpHost: String = "",
         xhttpPath: String = "",
         xhttpMode: String = "",
@@ -79,6 +94,7 @@ class RealityXrayConfigTest {
             port = 443,
             uuid = "33333333-3333-4333-8333-333333333333",
             email = "device",
+            flow = flow,
             security = "reality",
             network = network,
             serverName = "www.microsoft.com",

@@ -3706,17 +3706,18 @@ private fun JSONObject.toAwgUiConfig(): AwgUiConfig =
         serverPublicKey = optString(JSON_SERVER_PUBLIC_KEY),
     )
 
-private fun JSONObject.toRealityUiConfig(): RealityUiConfig =
-    RealityUiConfig(
+private fun JSONObject.toRealityUiConfig(): RealityUiConfig {
+    val network = optString(JSON_REALITY_NETWORK)
+    return RealityUiConfig(
         transport = optString(JSON_REALITY_TRANSPORT),
         address = optString(JSON_REALITY_ADDRESS),
         ip = optString(JSON_REALITY_IP),
         port = optInt(JSON_REALITY_PORT, 0),
         uuid = optString(JSON_REALITY_UUID),
         email = optString(JSON_REALITY_EMAIL),
-        flow = optString(JSON_REALITY_FLOW),
+        flow = runtimeRealityFlow(network, optString(JSON_REALITY_FLOW)),
         security = optString(JSON_REALITY_SECURITY),
-        network = optString(JSON_REALITY_NETWORK),
+        network = network,
         serverName = optString(JSON_REALITY_SERVER_NAME),
         publicKey = optString(JSON_REALITY_PUBLIC_KEY),
         shortId = optString(JSON_REALITY_SHORT_ID),
@@ -3728,6 +3729,10 @@ private fun JSONObject.toRealityUiConfig(): RealityUiConfig =
         xhttpMode = xhttpString(JSON_REALITY_XHTTP_MODE),
         xhttpExtraJson = xhttpObjectString(JSON_REALITY_XHTTP_EXTRA),
     )
+}
+
+private fun runtimeRealityFlow(network: String, flow: String): String =
+    if (network.equals("xhttp", ignoreCase = true)) "" else flow.trim()
 
 private fun JSONObject.xhttpString(key: String): String {
     val xhttp = optJSONObject(JSON_REALITY_XHTTP)
