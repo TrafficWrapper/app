@@ -83,6 +83,7 @@ data class RealityUiConfig(
     val fingerprint: String = "",
     val spiderX: String = "",
     val dest: String = "",
+    val xhttpHost: String = "",
     val xhttpPath: String = "",
     val xhttpMode: String = "",
     val xhttpExtraJson: String = "",

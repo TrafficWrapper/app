@@ -326,6 +326,7 @@ class PublicPlatformConfigTest {
         val reality = slots.reality
         assertTrue(reality?.isComplete() == true)
         assertEquals("xhttp", reality?.network)
+        assertEquals("cdn.operator.example", reality?.xhttpHost)
         assertEquals("/operator-path", reality?.xhttpPath)
         assertEquals("auto", reality?.xhttpMode)
         assertEquals("""{"headers":{"X-Test":"1"}}""", reality?.xhttpExtraJson)
@@ -460,7 +461,7 @@ class PublicPlatformConfigTest {
         """{"schema":1,"ns":"client-config-v1","seq":12,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-region","label":"Region","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":443,"expected_egress_ip":"198.51.100.22","region":"Operator Edge","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","security":"reality","network":"tcp","fingerprint":"chrome"}},{"type":"awg","enabled":true,"address":"worker.example","port":51888,"expected_egress_ip":"198.51.100.22","params":{"public_key":"awg-server-pub","endpoint":"worker.example:51888"}}]}]}"""
 
     private fun xhttpClientConfig(): String =
-        """{"schema":1,"ns":"client-config-v1","seq":3,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-xhttp","label":"XHTTP","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":443,"expected_egress_ip":"198.51.100.21","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","security":"reality","network":"xhttp","fingerprint":"chrome","xhttp":{"path":"/operator-path","mode":"auto","extra":{"headers":{"X-Test":"1"}}}}}]}]}"""
+        """{"schema":1,"ns":"client-config-v1","seq":3,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[{"worker_id":"worker-xhttp","label":"XHTTP","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":443,"expected_egress_ip":"198.51.100.21","params":{"public_key":"reality-pub","short_id":"short-id","server_name":"www.microsoft.com","security":"reality","network":"xhttp","fingerprint":"chrome","xhttp":{"host":"cdn.operator.example","path":"/operator-path","mode":"auto","extra":{"headers":{"X-Test":"1"}}}}}]}]}"""
 
     private fun discoveryClientConfig(): String =
         """{"schema":1,"ns":"client-config-v1","seq":9,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","discovery_pubkey":"RWQdiscovery","workers":[{"worker_id":"worker-discovery","label":"Discovery","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":443,"expected_egress_ip":"198.51.100.30","params":{"discovery_urls":["https://worker.example/discovery"],"config_url":"http://awg-gw:8080/tw","public_key":"reality-pub","short_id":"sid","server_name":"www.microsoft.com"}}]}]}"""

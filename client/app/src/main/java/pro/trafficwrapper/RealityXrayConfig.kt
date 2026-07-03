@@ -34,6 +34,10 @@ internal fun realityXhttpSettingsJson(
         .put("path", cfg.xhttpPath)
         .put("mode", cfg.xhttpMode)
         .apply {
+            val host = cfg.xhttpHost.ifBlank { cfg.serverName }.trim()
+            if (host.isNotBlank()) {
+                put("host", host)
+            }
             val extra = cfg.xhttpExtraJson.trim()
             if (extra.isNotBlank()) {
                 runCatching { put("extra", JSONObject(extra)) }

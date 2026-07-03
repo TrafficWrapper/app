@@ -412,6 +412,7 @@ object PublicPlatformConfigParser {
             fingerprint = clampRealityFingerprint(params.optString(JSON_REALITY_FINGERPRINT, "chrome")),
             spiderX = params.optString(JSON_REALITY_SPIDER_X, "/"),
             dest = params.optString(JSON_REALITY_DEST),
+            xhttpHost = params.xhttpString(JSON_REALITY_XHTTP_HOST, JSON_REALITY_XHTTP_HOST_SNAKE),
             xhttpPath = params.xhttpString(JSON_REALITY_XHTTP_PATH, JSON_REALITY_XHTTP_PATH_SNAKE),
             xhttpMode = params.xhttpString(JSON_REALITY_XHTTP_MODE, JSON_REALITY_XHTTP_MODE_SNAKE),
             xhttpExtraJson = params.xhttpObjectString(JSON_REALITY_XHTTP_EXTRA, JSON_REALITY_XHTTP_EXTRA_SNAKE),
@@ -557,6 +558,8 @@ object PublicPlatformConfigParser {
     private const val JSON_REALITY_SPIDER_X = "spiderX"
     private const val JSON_REALITY_DEST = "dest"
     private const val JSON_REALITY_XHTTP = "xhttp"
+    private const val JSON_REALITY_XHTTP_HOST = "host"
+    private const val JSON_REALITY_XHTTP_HOST_SNAKE = "host"
     private const val JSON_REALITY_XHTTP_PATH = "path"
     private const val JSON_REALITY_XHTTP_PATH_SNAKE = "path"
     private const val JSON_REALITY_XHTTP_MODE = "mode"

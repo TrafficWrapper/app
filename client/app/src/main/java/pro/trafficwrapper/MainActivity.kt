@@ -3723,7 +3723,27 @@ private fun JSONObject.toRealityUiConfig(): RealityUiConfig =
         fingerprint = clampRealityFingerprint(optString(JSON_REALITY_FINGERPRINT)),
         spiderX = optString(JSON_REALITY_SPIDER_X),
         dest = optString(JSON_REALITY_DEST),
+        xhttpHost = xhttpString(JSON_REALITY_XHTTP_HOST),
+        xhttpPath = xhttpString(JSON_REALITY_XHTTP_PATH),
+        xhttpMode = xhttpString(JSON_REALITY_XHTTP_MODE),
+        xhttpExtraJson = xhttpObjectString(JSON_REALITY_XHTTP_EXTRA),
     )
+
+private fun JSONObject.xhttpString(key: String): String {
+    val xhttp = optJSONObject(JSON_REALITY_XHTTP)
+    return xhttp?.optString(key).orEmpty()
+        .ifBlank { optString("xhttp_$key") }
+        .ifBlank { optString("xhttp${key.replaceFirstChar { it.uppercaseChar() }}") }
+        .trim()
+}
+
+private fun JSONObject.xhttpObjectString(key: String): String {
+    val xhttp = optJSONObject(JSON_REALITY_XHTTP)
+    return xhttp?.optJSONObject(key)?.toString().orEmpty()
+        .ifBlank { optJSONObject("xhttp_$key")?.toString().orEmpty() }
+        .ifBlank { optJSONObject("xhttp${key.replaceFirstChar { it.uppercaseChar() }}")?.toString().orEmpty() }
+        .trim()
+}
 
 private fun String.toJsonObjectOrNull(): JSONObject? =
     takeIf { it.isNotBlank() }?.let { raw ->
@@ -3896,6 +3916,11 @@ private const val JSON_REALITY_SHORT_ID = "shortId"
 private const val JSON_REALITY_FINGERPRINT = "fingerprint"
 private const val JSON_REALITY_SPIDER_X = "spiderX"
 private const val JSON_REALITY_DEST = "dest"
+private const val JSON_REALITY_XHTTP = "xhttp"
+private const val JSON_REALITY_XHTTP_HOST = "host"
+private const val JSON_REALITY_XHTTP_PATH = "path"
+private const val JSON_REALITY_XHTTP_MODE = "mode"
+private const val JSON_REALITY_XHTTP_EXTRA = "extra"
 private const val JSON_LIMITS = "limits"
 private const val JSON_QUOTA_TRAFFIC_BYTES = "traffic_quota_bytes"
 private const val JSON_QUOTA_LIMIT_BYTES = "limit_bytes"

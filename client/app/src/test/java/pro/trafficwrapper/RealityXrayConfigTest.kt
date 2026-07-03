@@ -24,6 +24,7 @@ class RealityXrayConfigTest {
         val stream = realityStreamSettingsJson(
             baseConfig(
                 network = "xhttp",
+                xhttpHost = "cdn.operator.example",
                 xhttpPath = "/operator-path",
                 xhttpMode = "auto",
                 xhttpExtraJson = """{"headers":{"X-Test":"1"}}""",
@@ -33,9 +34,21 @@ class RealityXrayConfigTest {
 
         assertEquals("xhttp", stream.getString("network"))
         val xhttp = stream.getJSONObject("xhttpSettings")
+        assertEquals("cdn.operator.example", xhttp.getString("host"))
         assertEquals("/operator-path", xhttp.getString("path"))
         assertEquals("auto", xhttp.getString("mode"))
         assertEquals("1", xhttp.getJSONObject("extra").getJSONObject("headers").getString("X-Test"))
+    }
+
+    @Test
+    fun xhttpHostDefaultsToServerNameForOlderBundles() {
+        val stream = realityStreamSettingsJson(
+            baseConfig(network = "xhttp", xhttpPath = "/x", xhttpMode = "stream-up"),
+            JSONObject(),
+        )
+
+        val xhttp = stream.getJSONObject("xhttpSettings")
+        assertEquals("www.microsoft.com", xhttp.getString("host"))
     }
 
     @Test
@@ -55,6 +68,7 @@ class RealityXrayConfigTest {
 
     private fun baseConfig(
         network: String,
+        xhttpHost: String = "",
         xhttpPath: String = "",
         xhttpMode: String = "",
         xhttpExtraJson: String = "",
@@ -72,6 +86,7 @@ class RealityXrayConfigTest {
             shortId = "sid",
             fingerprint = "chrome",
             spiderX = "/",
+            xhttpHost = xhttpHost,
             xhttpPath = xhttpPath,
             xhttpMode = xhttpMode,
             xhttpExtraJson = xhttpExtraJson,
