@@ -52,6 +52,7 @@ data class PublicClientConfig(
     val expiresAt: String,
     val updatePubkey: String,
     val discoveryPubkey: String,
+    val discoveryRescuePointers: List<String>,
     val dnsServers: List<String>,
     val limits: JSONObject?,
     val workers: List<PublicWorkerConfig>,
@@ -320,6 +321,7 @@ object PublicPlatformConfigParser {
             expiresAt = root.optString(JSON_EXPIRES_AT, DEFAULT_CONFIG_EXPIRES_AT),
             updatePubkey = root.optString(JSON_UPDATE_PUBKEY),
             discoveryPubkey = root.optString(JSON_DISCOVERY_PUBKEY),
+            discoveryRescuePointers = root.optJSONArray(JSON_DISCOVERY_RESCUE_POINTERS).toStringList(),
             dnsServers = root.optJSONArray(JSON_DNS_SERVERS).toStringList(),
             limits = root.optJSONObject(JSON_LIMITS),
             workers = root.getJSONArray(JSON_WORKERS).toWorkers(),
@@ -505,6 +507,7 @@ object PublicPlatformConfigParser {
     private const val JSON_ORCH_NOISE_PUBLIC = "orch_noise_public"
     private const val JSON_UPDATE_PUBKEY = "update_pubkey"
     private const val JSON_DISCOVERY_PUBKEY = "discovery_pubkey"
+    private const val JSON_DISCOVERY_RESCUE_POINTERS = "discovery_rescue_pointers"
     private const val JSON_DNS_SERVERS = "dns_servers"
     private const val JSON_SEED_WORKERS = "seed_workers"
     private const val JSON_BOOTSTRAP_TOKEN = "bootstrap_token"

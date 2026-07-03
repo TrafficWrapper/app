@@ -7,6 +7,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.security.keystore.StrongBoxUnavailableException
 import android.util.Base64
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.KeyStore
 import java.security.KeyPairGenerator
@@ -45,6 +46,7 @@ data class StoredRendezvousState(
     val trustedWallTimeMs: Long = 0,
     val trustedElapsedRealtimeMs: Long = 0,
     val lastValidIssuedAtMs: Long = 0,
+    val discoverySinks: List<String> = emptyList(),
 )
 
 data class StoredPublicPlatformState(
@@ -77,6 +79,11 @@ internal enum class PublicAWGKeyPairSource {
     EXISTING,
     LEGACY,
     GENERATED,
+}
+
+private fun JSONArray?.toStringList(): List<String> {
+    if (this == null) return emptyList()
+    return List(length()) { index -> optString(index).trim() }.filter { it.isNotBlank() }
 }
 
 internal data class PublicAWGKeyPairResolution(
@@ -402,6 +409,7 @@ class SecureIdentityStore(context: Context) {
         trustedWallTimeMs: Long,
         trustedElapsedRealtimeMs: Long,
         issuedAtMs: Long,
+        discoverySinks: List<String> = emptyList(),
     ): StoredRendezvousState {
         val keyState = getOrCreateWrappingKey()
         val current = readRendezvousState(keyState.key)
@@ -413,12 +421,14 @@ class SecureIdentityStore(context: Context) {
             trustedWallTimeMs = maxOf(current.trustedWallTimeMs, trustedWallTimeMs, issuedAtMs),
             trustedElapsedRealtimeMs = trustedElapsedRealtimeMs,
             lastValidIssuedAtMs = maxOf(current.lastValidIssuedAtMs, issuedAtMs),
+            discoverySinks = discoverySinks.ifEmpty { current.discoverySinks },
         )
         val root = JSONObject()
             .put(JSON_MAX_SEEN_RENDEZVOUS_SEQ, next.maxSeenRendezvousSeq)
             .put(JSON_TRUSTED_WALL_TIME_MS, next.trustedWallTimeMs)
             .put(JSON_TRUSTED_ELAPSED_REALTIME_MS, next.trustedElapsedRealtimeMs)
             .put(JSON_LAST_VALID_ISSUED_AT_MS, next.lastValidIssuedAtMs)
+            .put(JSON_DISCOVERY_SINKS, JSONArray(next.discoverySinks))
         if (!prefs.edit().putString(KEY_RENDEZVOUS_STATE, seal(root.toString(), keyState.key)).commit()) {
             throw IllegalStateException("failed to persist rendezvous state")
         }
@@ -434,6 +444,7 @@ class SecureIdentityStore(context: Context) {
             trustedWallTimeMs = root.optLong(JSON_TRUSTED_WALL_TIME_MS, 0),
             trustedElapsedRealtimeMs = root.optLong(JSON_TRUSTED_ELAPSED_REALTIME_MS, 0),
             lastValidIssuedAtMs = root.optLong(JSON_LAST_VALID_ISSUED_AT_MS, 0),
+            discoverySinks = root.optJSONArray(JSON_DISCOVERY_SINKS).toStringList(),
         )
     }
 
@@ -586,6 +597,7 @@ class SecureIdentityStore(context: Context) {
         private const val JSON_MAX_SEEN_RENDEZVOUS_SEQ = "max_seen_rendezvous_seq"
         private const val JSON_MAX_SEEN_CONFIG_SEQ = "max_seen_config_seq"
         private const val JSON_MAX_SEEN_UPDATE_SEQ = "max_seen_update_seq"
+        private const val JSON_DISCOVERY_SINKS = "discovery_sinks"
         private const val JSON_TRUSTED_WALL_TIME_MS = "trusted_wall_time_ms"
         private const val JSON_TRUSTED_ELAPSED_REALTIME_MS = "trusted_elapsed_realtime_ms"
         private const val JSON_LAST_VALID_ISSUED_AT_MS = "last_valid_issued_at_ms"

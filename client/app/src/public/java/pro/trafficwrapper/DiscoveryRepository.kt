@@ -21,6 +21,7 @@ data class DiscoverySink(
     val name: String,
     val baseUrl: String,
     val socksListen: String = "",
+    val pointerUrl: String = "",
 )
 
 data class DiscoveryRefreshResult(
@@ -48,7 +49,8 @@ class DiscoveryRepository(private val context: Context) {
         )
         val publicKey = config.discoveryPubkey.ifBlank { stored.updatePubkeyPin }
         if (publicKey.isBlank()) return null
-        val sinks = discoverySinks(stored, config, socksListen)
+        val rendezvousState = store.readRendezvousState()
+        val sinks = discoverySinks(stored, config, socksListen, rendezvousState)
         if (sinks.isEmpty()) return null
         ensureCoreConfig(stored, config)
 
@@ -75,8 +77,8 @@ class DiscoveryRepository(private val context: Context) {
         publicKey: String,
         sink: DiscoverySink,
     ): DiscoveryRefreshResult {
-        val jsonResponse = fetchString(sink, ENDPOINTS_JSON)
-        val minisig = fetchString(sink, ENDPOINTS_MINISIG).body
+        val jsonResponse = fetchDiscoveryJSON(sink, publicKey)
+        val minisig = jsonResponse.minisig
         val state = store.readRendezvousState()
         val request = JSONObject()
             .put("endpoints_json", jsonResponse.body)
@@ -96,6 +98,7 @@ class DiscoveryRepository(private val context: Context) {
             trustedWallTimeMs = trusted.first,
             trustedElapsedRealtimeMs = trusted.second,
             issuedAtMs = issuedAtMs,
+            discoverySinks = signedNextSinks(jsonResponse.body),
         )
         response.optJSONObject("reality")?.optString("egress_ip")?.takeIf { it.isNotBlank() }?.let {
             TransportRuntime.publicRealityEgressIp = it
@@ -139,6 +142,10 @@ class DiscoveryRepository(private val context: Context) {
 
     private fun fetchString(sink: DiscoverySink, fileName: String): FetchResponse {
         val url = sink.baseUrl.trimEnd('/') + "/" + fileName
+        return fetchURL(sink, url)
+    }
+
+    private fun fetchURL(sink: DiscoverySink, url: String): FetchResponse {
         if (sink.socksListen.isBlank() && !url.startsWith(HTTPS_PREFIX, ignoreCase = true)) {
             throw IllegalArgumentException("direct discovery sink must be https")
         }
@@ -158,8 +165,60 @@ class DiscoveryRepository(private val context: Context) {
         }
     }
 
+    private fun fetchDiscoveryJSON(sink: DiscoverySink, publicKey: String): DiscoveryPayload {
+        if (sink.pointerUrl.isBlank()) {
+            val json = fetchString(sink, ENDPOINTS_JSON)
+            return DiscoveryPayload(
+                body = json.body,
+                minisig = fetchString(sink, ENDPOINTS_MINISIG).body,
+                dateHeaderMs = json.dateHeaderMs,
+            )
+        }
+        val pointer = fetchURL(sink, sink.pointerUrl)
+        val pointerSig = fetchURL(sink, sink.pointerUrl.trimEnd('/') + ".minisig").body
+        if (!verifyMinisign(pointer.body, pointerSig, publicKey)) {
+            throw IllegalStateException("rescue pointer signature invalid")
+        }
+        validateRescuePointer(pointer.body, pointer.dateHeaderMs)
+        val pointerRoot = JSONObject(pointer.body)
+        val endpointsURL = pointerRoot.optString("endpoints_url").trim()
+        val minisigURL = pointerRoot.optString("minisig_url").trim()
+        if (!endpointsURL.startsWith(HTTPS_PREFIX, ignoreCase = true) ||
+            !minisigURL.startsWith(HTTPS_PREFIX, ignoreCase = true)
+        ) {
+            throw IllegalStateException("rescue pointer urls must be https")
+        }
+        val json = fetchURL(sink, endpointsURL)
+        return DiscoveryPayload(
+            body = json.body,
+            minisig = fetchURL(sink, minisigURL).body,
+            dateHeaderMs = json.dateHeaderMs ?: pointer.dateHeaderMs,
+        )
+    }
+
+    private fun verifyMinisign(message: String, signature: String, publicKey: String): Boolean {
+        val result = JSONObject(Transport.verifyMinisign(message, signature, publicKey))
+        return result.optBoolean("ok", false)
+    }
+
+    private fun validateRescuePointer(body: String, dateHeaderMs: Long?) {
+        val expires = JSONObject(body).optString("expires_at").trim()
+        if (expires.isBlank()) return
+        val expiresAtMs = runCatching { Instant.parse(expires).toEpochMilli() }.getOrNull()
+            ?: throw IllegalStateException("rescue pointer expires_at invalid")
+        if (discoveryNowMs(dateHeaderMs) >= expiresAtMs) {
+            throw IllegalStateException("rescue pointer expired")
+        }
+    }
+
     private data class FetchResponse(
         val body: String,
+        val dateHeaderMs: Long?,
+    )
+
+    private data class DiscoveryPayload(
+        val body: String,
+        val minisig: String,
         val dateHeaderMs: Long?,
     )
 
@@ -199,6 +258,7 @@ internal fun discoverySinks(
     stored: StoredPublicPlatformState,
     config: PublicClientConfig,
     socksListen: String,
+    rendezvousState: StoredRendezvousState = StoredRendezvousState(),
 ): List<DiscoverySink> {
     val tunnelSinks = linkedMapOf<String, DiscoverySink>()
     val directSinks = linkedMapOf<String, DiscoverySink>()
@@ -224,6 +284,16 @@ internal fun discoverySinks(
                 }
             }
         }
+    rendezvousState.discoverySinks.forEachIndexed { index, raw ->
+        normalizeDiscoveryUrl(raw)?.let { url ->
+            addDiscoverySink(tunnelSinks, directSinks, "signed-next-$index", url, tunnelSocks)
+        }
+    }
+    config.discoveryRescuePointers.forEachIndexed { index, raw ->
+        normalizeDiscoveryUrl(raw)?.takeIf { it.startsWith("https://", ignoreCase = true) }?.let { url ->
+            directSinks.putIfAbsent("rescue|$url", DiscoverySink("rescue-pointer-$index", url, pointerUrl = url))
+        }
+    }
     val bootstrapBase = runCatching {
         PublicPlatformConfigParser.parseBootstrap(stored.bootstrapRaw, nowMs = 0).orchestratorUrl
     }.getOrDefault("")
@@ -252,6 +322,25 @@ private fun collectDiscoveryUrls(array: JSONArray?): List<String> {
     val out = mutableListOf<String>()
     for (index in 0 until array.length()) {
         normalizeDiscoveryUrl(array.optString(index))?.let(out::add)
+    }
+    return out
+}
+
+internal fun signedNextSinks(bundleJSON: String): List<String> =
+    runCatching {
+        sanitizedDiscoverySinkUrls(JSONObject(bundleJSON).optJSONArray("next_sinks"))
+    }.getOrDefault(emptyList())
+
+internal fun sanitizedDiscoverySinkUrls(array: JSONArray?, maxItems: Int = 16): List<String> {
+    if (array == null) return emptyList()
+    val out = mutableListOf<String>()
+    val seen = mutableSetOf<String>()
+    for (index in 0 until array.length()) {
+        val url = normalizeDiscoveryUrl(array.optString(index)) ?: continue
+        if (seen.add(url)) {
+            out += url
+            if (out.size >= maxItems) break
+        }
     }
     return out
 }

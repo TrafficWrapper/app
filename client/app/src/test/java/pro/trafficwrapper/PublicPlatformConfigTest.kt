@@ -397,6 +397,41 @@ class PublicPlatformConfigTest {
         assertTrue(sinks.none { it.baseUrl.contains("netcloud", ignoreCase = true) })
     }
 
+    @Test
+    fun discoveryNextSinksAndRescuePointersAreOperatorControlled() {
+        assertEquals(
+            listOf("http://worker.local/tw", "https://operator.example/discovery"),
+            signedNextSinks(
+                """{"next_sinks":["http://worker.local/tw","https://operator.example/discovery","https://operator.example/discovery","ftp://bad"]}""",
+            ),
+        )
+        val parsed = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = JSONObject()
+                .put("config_json", discoveryClientConfigWithRescue())
+                .put("minisig", "sig")
+                .toString(),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 0,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        val sinks = discoverySinks(
+            stored = StoredPublicPlatformState(
+                bootstrapRaw = bootstrapJson("2035-01-01T00:00:00Z"),
+                configPubkeyPin = PUBLIC_KEY,
+            ),
+            config = parsed,
+            socksListen = "127.0.0.1:18080",
+            rendezvousState = StoredRendezvousState(
+                discoverySinks = listOf("http://next.local/tw", "https://next.example/discovery"),
+            ),
+        )
+
+        assertTrue(sinks.any { it.name == "signed-next-0" && it.baseUrl == "http://next.local/tw" && it.socksListen == "127.0.0.1:18080" })
+        assertTrue(sinks.any { it.name == "signed-next-1" && it.baseUrl == "https://next.example/discovery" && it.socksListen.isBlank() })
+        assertTrue(sinks.any { it.name == "rescue-pointer-0" && it.pointerUrl == "https://operator.example/rescue-pointer.json" })
+    }
+
     private fun fakeVerifier(ok: Boolean): PublicMinisignVerifier =
         object : PublicMinisignVerifier {
             override fun verify(message: String, signature: String, publicKey: String): Boolean =
@@ -429,6 +464,9 @@ class PublicPlatformConfigTest {
 
     private fun discoveryClientConfig(): String =
         """{"schema":1,"ns":"client-config-v1","seq":9,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","discovery_pubkey":"RWQdiscovery","workers":[{"worker_id":"worker-discovery","label":"Discovery","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":443,"expected_egress_ip":"198.51.100.30","params":{"discovery_urls":["https://worker.example/discovery"],"config_url":"http://awg-gw:8080/tw","public_key":"reality-pub","short_id":"sid","server_name":"www.microsoft.com"}}]}]}"""
+
+    private fun discoveryClientConfigWithRescue(): String =
+        """{"schema":1,"ns":"client-config-v1","seq":10,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","discovery_pubkey":"RWQdiscovery","discovery_rescue_pointers":["https://operator.example/rescue-pointer.json"],"workers":[{"worker_id":"worker-discovery","label":"Discovery","priority":0,"weight":100,"routes":[{"type":"reality","enabled":true,"address":"worker.example","port":443,"expected_egress_ip":"198.51.100.30","params":{"discovery_urls":["https://worker.example/discovery"],"config_url":"http://awg-gw:8080/tw","public_key":"reality-pub","short_id":"sid","server_name":"www.microsoft.com"}}]}]}"""
 
     private fun envelope(configJson: String, signature: String): String =
         JSONObject()
