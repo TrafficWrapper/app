@@ -3527,7 +3527,7 @@ class AutoTransportService : Service() {
                 },
             )
         val config = JSONObject()
-            .put("log", JSONObject().put("loglevel", "warning"))
+            .put("log", JSONObject().put("loglevel", realityXrayLogLevel(cfg)))
             .put("inbounds", JSONArray().put(inbound))
             .put("outbounds", JSONArray().put(outbound))
             .put(

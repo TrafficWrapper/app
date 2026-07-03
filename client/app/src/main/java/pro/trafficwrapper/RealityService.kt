@@ -176,7 +176,7 @@ class RealityService : Service() {
             .put("settings", JSONObject().put("vnext", JSONArray().put(vnext)))
             .put("streamSettings", realityStreamSettingsJson(cfg, realitySockopt()))
         val config = JSONObject()
-            .put("log", JSONObject().put("loglevel", "warning"))
+            .put("log", JSONObject().put("loglevel", realityXrayLogLevel(cfg)))
             .put("inbounds", JSONArray().put(inbound))
             .put("outbounds", JSONArray().put(outbound))
             .put(

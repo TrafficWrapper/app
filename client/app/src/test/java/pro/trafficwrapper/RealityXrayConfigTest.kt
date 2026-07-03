@@ -34,21 +34,21 @@ class RealityXrayConfigTest {
 
         assertEquals("xhttp", stream.getString("network"))
         val xhttp = stream.getJSONObject("xhttpSettings")
-        assertEquals("cdn.operator.example", xhttp.getString("host"))
+        assertFalse(xhttp.has("host"))
         assertEquals("/operator-path", xhttp.getString("path"))
         assertEquals("stream-up", xhttp.getString("mode"))
         assertEquals("1", xhttp.getJSONObject("extra").getJSONObject("headers").getString("X-Test"))
     }
 
     @Test
-    fun xhttpHostDefaultsToServerNameForOlderBundles() {
+    fun xhttpHostIsNotEmittedForOutboundDialSafety() {
         val stream = realityStreamSettingsJson(
             baseConfig(network = "xhttp", xhttpPath = "/x", xhttpMode = "stream-up"),
             JSONObject(),
         )
 
         val xhttp = stream.getJSONObject("xhttpSettings")
-        assertEquals("www.microsoft.com", xhttp.getString("host"))
+        assertFalse(xhttp.has("host"))
     }
 
     @Test
@@ -85,6 +85,12 @@ class RealityXrayConfigTest {
         val cfg = baseConfig(network = "tcp", flow = "xtls-rprx-vision")
 
         assertEquals("xtls-rprx-vision", realityOutboundFlow(cfg))
+    }
+
+    @Test
+    fun xhttpXrayConfigUsesDebugLogLevelForDialDiagnostics() {
+        assertEquals("debug", realityXrayLogLevel(baseConfig(network = "xhttp")))
+        assertEquals("warning", realityXrayLogLevel(baseConfig(network = "tcp")))
     }
 
     private fun baseConfig(
