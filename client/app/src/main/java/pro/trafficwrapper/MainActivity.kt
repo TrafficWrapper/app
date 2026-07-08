@@ -212,7 +212,7 @@ class MainActivity : ComponentActivity() {
         if (raw.isBlank()) return
         try {
             val parsed = PublicPlatformConfigParser.parseBootstrap(raw)
-            PENDING_EXTERNAL_BOOTSTRAP = pendingExternalBootstrap(applicationContext, raw, parsed)
+            handleParsedExternalBootstrap(applicationContext, raw, parsed)
             PUBLIC_BOOTSTRAP_ERROR = null
         } catch (_: Throwable) {
             PUBLIC_BOOTSTRAP_ERROR = getString(R.string.public_bootstrap_invalid)
@@ -224,7 +224,7 @@ class MainActivity : ComponentActivity() {
         val raw = publicEnrollDeepLinkBootstrap(intent.dataString) ?: return
         try {
             val parsed = PublicPlatformConfigParser.parseBootstrap(raw)
-            PENDING_EXTERNAL_BOOTSTRAP = pendingExternalBootstrap(applicationContext, raw, parsed)
+            handleParsedExternalBootstrap(applicationContext, raw, parsed)
             PUBLIC_BOOTSTRAP_ERROR = null
         } catch (_: Throwable) {
             PUBLIC_BOOTSTRAP_ERROR = getString(R.string.public_bootstrap_invalid)
@@ -2535,15 +2535,32 @@ private fun publicBootstrapRaw(context: Context): String =
             .orEmpty()
     }
 
+private fun handleParsedExternalBootstrap(context: Context, raw: String, parsed: PublicBootstrapConfig) {
+    when (externalBootstrapDecision(publicBootstrapRaw(context), parsed)) {
+        ExternalBootstrapDecision.IGNORE -> {
+            PENDING_EXTERNAL_BOOTSTRAP = null
+        }
+        ExternalBootstrapDecision.REFRESH -> {
+            savePublicBootstrap(context, raw)
+            PUBLIC_BOOTSTRAP_IMPORTED = true
+            PENDING_EXTERNAL_BOOTSTRAP = null
+        }
+        ExternalBootstrapDecision.CONFIRM_NEW -> {
+            PENDING_EXTERNAL_BOOTSTRAP = pendingExternalBootstrap(context, raw, parsed, replacesExisting = false)
+        }
+        ExternalBootstrapDecision.CONFIRM_REPLACE -> {
+            PENDING_EXTERNAL_BOOTSTRAP = pendingExternalBootstrap(context, raw, parsed, replacesExisting = true)
+        }
+    }
+}
+
 private fun pendingExternalBootstrap(
     context: Context,
     raw: String,
     parsed: PublicBootstrapConfig,
+    replacesExisting: Boolean,
 ): PendingExternalBootstrap? {
     val currentRaw = publicBootstrapRaw(context)
-    if (publicBootstrapMatchesActive(currentRaw, parsed)) {
-        return null
-    }
     val current = runCatching {
         currentRaw.takeIf { it.isNotBlank() }?.let { PublicPlatformConfigParser.parseBootstrap(it) }
     }.getOrNull()
@@ -2552,7 +2569,7 @@ private fun pendingExternalBootstrap(
         orchestratorUrl = parsed.orchestratorUrl,
         configPubkeyPin = parsed.configPubkeyPin,
         orchNoisePublic = parsed.orchNoisePublic,
-        replacesExisting = currentRaw.isNotBlank(),
+        replacesExisting = replacesExisting,
         currentOrchestratorUrl = current?.orchestratorUrl.orEmpty(),
     )
 }
@@ -2562,8 +2579,32 @@ internal fun publicBootstrapMatchesActive(currentRaw: String, incoming: PublicBo
     val current = runCatching { PublicPlatformConfigParser.parseBootstrap(currentRaw) }.getOrNull() ?: return false
     return current.orchestratorUrl == incoming.orchestratorUrl &&
         current.configPubkeyPin == incoming.configPubkeyPin &&
-        current.orchNoisePublic == incoming.orchNoisePublic &&
-        current.bootstrapToken == incoming.bootstrapToken
+        current.orchNoisePublic == incoming.orchNoisePublic
+}
+
+internal fun externalBootstrapDecision(
+    currentRaw: String,
+    incoming: PublicBootstrapConfig,
+): ExternalBootstrapDecision {
+    if (currentRaw.isBlank()) return ExternalBootstrapDecision.CONFIRM_NEW
+    if (!publicBootstrapMatchesActive(currentRaw, incoming)) return ExternalBootstrapDecision.CONFIRM_REPLACE
+    val current = runCatching { PublicPlatformConfigParser.parseBootstrap(currentRaw) }.getOrNull()
+    return if (
+        current != null &&
+        current.bootstrapToken == incoming.bootstrapToken &&
+        current.expiresAt == incoming.expiresAt
+    ) {
+        ExternalBootstrapDecision.IGNORE
+    } else {
+        ExternalBootstrapDecision.REFRESH
+    }
+}
+
+internal enum class ExternalBootstrapDecision {
+    IGNORE,
+    REFRESH,
+    CONFIRM_NEW,
+    CONFIRM_REPLACE,
 }
 
 private fun savePublicBootstrap(context: Context, raw: String) {

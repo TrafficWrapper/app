@@ -252,6 +252,7 @@ object PublicPlatformConfigParser {
             .put(JSON_TYPE, route.type)
             .put(JSON_ADDRESS, route.address)
             .put(JSON_PORT, route.port)
+            .put(JSON_EGRESS_IP, route.expectedEgressIp)
 
     private fun publicRoutePriorities(
         ordered: List<PublicResolvedRoute>,
@@ -354,8 +355,11 @@ object PublicPlatformConfigParser {
                         address = value.getString(JSON_ADDRESS),
                         port = value.getInt(JSON_PORT),
                         expectedEgressIp = value.optString(
-                            JSON_EXPECTED_EGRESS_IP,
-                            worker.optString(JSON_EXPECTED_EGRESS_IP),
+                            JSON_EGRESS_IP,
+                            value.optString(
+                                JSON_EXPECTED_EGRESS_IP,
+                                worker.optString(JSON_EGRESS_IP, worker.optString(JSON_EXPECTED_EGRESS_IP)),
+                            ),
                         ),
                         dialectId = value.optString(JSON_DIALECT_ID).ifBlank { params.optString(JSON_DIALECT_ID) },
                         region = value.optString(JSON_REGION).ifBlank { params.optString(JSON_REGION) }.trim(),
@@ -382,7 +386,7 @@ object PublicPlatformConfigParser {
             enabled = true,
             address = params.optString(JSON_ADDRESS).ifBlank { endpointHost },
             port = params.optInt(JSON_PORT, endpointPort ?: 0),
-            expectedEgressIp = worker.getString(JSON_EXPECTED_EGRESS_IP),
+            expectedEgressIp = worker.optString(JSON_EGRESS_IP, worker.getString(JSON_EXPECTED_EGRESS_IP)),
             dialectId = params.optString(JSON_DIALECT_ID),
             region = params.optString(JSON_REGION).trim(),
             params = params,
@@ -543,6 +547,7 @@ object PublicPlatformConfigParser {
     private const val JSON_ADDRESS = "address"
     private const val JSON_ENDPOINT = "endpoint"
     private const val JSON_PORT = "port"
+    private const val JSON_EGRESS_IP = "egress_ip"
     private const val JSON_EXPECTED_EGRESS_IP = "expected_egress_ip"
     private const val JSON_DIALECT_ID = "dialect_id"
     private const val JSON_PARAMS = "params"

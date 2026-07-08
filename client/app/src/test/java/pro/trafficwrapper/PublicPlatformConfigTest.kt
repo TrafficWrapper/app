@@ -77,23 +77,55 @@ class PublicPlatformConfigTest {
     }
 
     @Test
-    fun externalBootstrapNoopsOnlyWhenActiveBootstrapMatchesSemantically() {
+    fun externalBootstrapDecisionUsesTrustRootNotTokenForWarnings() {
         val activeRaw = bootstrapJson("2035-01-01T00:00:00Z")
         val activeEncoded = Base64.getEncoder().encodeToString(activeRaw.toByteArray(Charsets.UTF_8))
         val parsed = PublicPlatformConfigParser.parseBootstrap(activeRaw, nowMs = 0)
         assertTrue(publicBootstrapMatchesActive(activeEncoded, parsed))
+        assertEquals(ExternalBootstrapDecision.IGNORE, externalBootstrapDecision(activeEncoded, parsed))
+
+        val refreshedRaw = activeRaw
+            .replace("once-token", "fresh-token")
+            .replace("2035-01-01T00:00:00Z", "2036-01-01T00:00:00Z")
+        val refreshedParsed = PublicPlatformConfigParser.parseBootstrap(refreshedRaw, nowMs = 0)
+        assertTrue(publicBootstrapMatchesActive(activeEncoded, refreshedParsed))
+        assertEquals(
+            ExternalBootstrapDecision.REFRESH,
+            externalBootstrapDecision(activeEncoded, refreshedParsed),
+        )
 
         val replacement = PublicPlatformConfigParser.parseBootstrap(
             activeRaw.replace("https://orch.dev", "https://other-orch.dev"),
             nowMs = 0,
         )
         assertEquals(false, publicBootstrapMatchesActive(activeEncoded, replacement))
+        assertEquals(
+            ExternalBootstrapDecision.CONFIRM_REPLACE,
+            externalBootstrapDecision(activeEncoded, replacement),
+        )
 
         val differentNoise = PublicPlatformConfigParser.parseBootstrap(
             activeRaw.replace("orch-noise", "other-noise"),
             nowMs = 0,
         )
         assertEquals(false, publicBootstrapMatchesActive(activeEncoded, differentNoise))
+    }
+
+    @Test
+    fun awgRouteJsonEmitsCanonicalEgressIPForCoreApply() {
+        val route = PublicRouteConfig(
+            type = "awg",
+            enabled = true,
+            address = "worker.example",
+            port = 51821,
+            expectedEgressIp = "198.51.100.44",
+            dialectId = "dialect-a",
+            params = JSONObject("""{"endpoint":"worker.example:51821","public_key":"awg-pub"}"""),
+        )
+
+        val json = PublicPlatformConfigParser.awgRouteJson(route)
+        assertEquals("198.51.100.44", json.getString("egress_ip"))
+        assertEquals("", json.optString("expected_egress_ip"))
     }
 
     @Test
