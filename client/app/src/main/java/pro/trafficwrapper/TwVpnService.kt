@@ -27,10 +27,13 @@ class TwVpnService : VpnService() {
     private val vpnExecutor = Executors.newSingleThreadExecutor()
     private var bridgeStarted = false
     private var blackholePfd: ParcelFileDescriptor? = null
+    private var activeNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var currentUnderlyingNetwork: Network? = null
     private var blackholeNetworkCallback: ConnectivityManager.NetworkCallback? = null
     private var blackholeReconnectRunnable: Runnable? = null
     private var blackholeReconnectDelayMs = BLACKHOLE_RECONNECT_MIN_MS
     private val blackholeReconnectInFlight = AtomicBoolean(false)
+    private val activeRebindInFlight = AtomicBoolean(false)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -106,6 +109,8 @@ class TwVpnService : VpnService() {
                 throw IllegalStateException(result.optString("error", "StartVpnBridge failed"))
             }
             bridgeStarted = true
+            currentUnderlyingNetwork = underlying
+            registerActiveNetworkCallback()
             pushLastUdpRoute()
             publishVpnActive(true)
             Log.i(LOG_TAG, "VPN bridge started")
@@ -139,6 +144,7 @@ class TwVpnService : VpnService() {
             TransportLifecycleStore.vpnKillSwitchEnabled(applicationContext)
 
     private fun establishBlackholeVpn(reason: String) {
+        unregisterActiveNetworkCallback()
         closeBlackholeVpn(resetRecovery = false)
         val pfd = Builder()
             .setSession("TrafficWrapper (blocked)")
@@ -250,22 +256,107 @@ class TwVpnService : VpnService() {
 
     private fun bindToUnderlyingNetwork(): Network? {
         val connectivity = getSystemService(ConnectivityManager::class.java) ?: return null
-        val network = connectivity.allNetworks.firstOrNull { candidate ->
-            val caps = connectivity.getNetworkCapabilities(candidate) ?: return@firstOrNull false
-            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
-                !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
-        }
+        val active = connectivity.activeNetwork
+        val network = active
+            ?.takeIf { isUsableUnderlyingNetwork(connectivity, it) }
+            ?: connectivity.allNetworks.firstOrNull { candidate ->
+                isUsableUnderlyingNetwork(connectivity, candidate)
+            }
         if (network == null) {
             Log.w(LOG_TAG, "No NOT_VPN underlying network available for VPN bind")
+            currentUnderlyingNetwork = null
             return null
         }
         if (!connectivity.bindProcessToNetwork(network)) {
             Log.w(LOG_TAG, "Unable to bind process to underlying network")
+            currentUnderlyingNetwork = null
             return null
         }
+        currentUnderlyingNetwork = network
         Log.i(LOG_TAG, "Process bound to underlying network for VPN")
         return network
+    }
+
+    private fun isUsableUnderlyingNetwork(connectivity: ConnectivityManager, network: Network): Boolean {
+        val caps = connectivity.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+    }
+
+    private fun registerActiveNetworkCallback() {
+        if (activeNetworkCallback != null) return
+        val connectivity = getSystemService(ConnectivityManager::class.java) ?: return
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                requestActiveNetworkRebind("underlying_available")
+            }
+
+            override fun onLost(network: Network) {
+                if (network == currentUnderlyingNetwork) {
+                    requestActiveNetworkRebind("underlying_lost")
+                }
+            }
+
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                if (
+                    networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                    !networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                ) {
+                    requestActiveNetworkRebind("underlying_capable")
+                } else if (network == currentUnderlyingNetwork) {
+                    requestActiveNetworkRebind("underlying_no_longer_capable")
+                }
+            }
+        }
+        runCatching {
+            connectivity.registerNetworkCallback(request, callback)
+            activeNetworkCallback = callback
+        }.onFailure {
+            Log.w(LOG_TAG, "Unable to register VPN active network callback", it)
+        }
+    }
+
+    private fun unregisterActiveNetworkCallback() {
+        val callback = activeNetworkCallback ?: return
+        activeNetworkCallback = null
+        runCatching {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(callback)
+        }.onFailure {
+            Log.w(LOG_TAG, "Unable to unregister VPN active network callback", it)
+        }
+    }
+
+    private fun requestActiveNetworkRebind(reason: String) {
+        if (!activeRebindInFlight.compareAndSet(false, true)) return
+        vpnExecutor.execute {
+            try {
+                if (!bridgeStarted || blackholePfd != null || !TransportLifecycleStore.vpnEnabled(applicationContext)) {
+                    return@execute
+                }
+                val network = bindToUnderlyingNetwork()
+                if (network == null) {
+                    if (shouldFailClosedWithoutUnderlying()) {
+                        Log.w(LOG_TAG, "VPN active underlying lost; entering blackhole reason=$reason")
+                        stopVpnBridgeOnly(publishInactive = false)
+                        establishBlackholeVpn("underlying_lost")
+                        notifyVpnConfigChanged()
+                    }
+                    return@execute
+                }
+                runCatching { setUnderlyingNetworks(arrayOf(network)) }
+                    .onFailure { Log.w(LOG_TAG, "Unable to update VPN underlying networks", it) }
+                pushLastUdpRoute()
+                Log.i(LOG_TAG, "VPN rebound to underlying network reason=$reason")
+            } finally {
+                activeRebindInFlight.set(false)
+            }
+        }
     }
 
     private fun unbindFromUnderlyingNetwork() {
@@ -274,6 +365,7 @@ class TwVpnService : VpnService() {
         }.onFailure {
             Log.w(LOG_TAG, "Unable to clear underlying network bind", it)
         }
+        currentUnderlyingNetwork = null
     }
 
     private fun Builder.captureIPv6(): Builder {
@@ -353,6 +445,9 @@ class TwVpnService : VpnService() {
     }
 
     private fun stopVpnBridgeOnly(publishInactive: Boolean = true) {
+        unregisterActiveNetworkCallback()
+        currentUnderlyingNetwork = null
+        activeRebindInFlight.set(false)
         if (bridgeStarted) {
             runCatching { Transport.stopVpnBridge() }
                 .onFailure { Log.w(LOG_TAG, "VPN bridge stop failed", it) }

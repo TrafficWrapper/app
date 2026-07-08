@@ -42,6 +42,7 @@ object Telemetry {
     private val bootID = UUID.randomUUID().toString()
     private val nextFlushAtElapsedMs = AtomicLong(0)
     private val backoffMs = AtomicLong(BACKOFF_MIN_MS)
+    private val effectiveMaxBatchBytes = AtomicLong(TELEMETRY_MAX_BATCH_BYTES.toLong())
     private val seq = AtomicLong(SEQ_UNINITIALIZED)
     private val seqLock = Any()
 
@@ -128,7 +129,9 @@ object Telemetry {
             if (!force && nowElapsed < nextFlushAtElapsedMs.get()) return
             val spool = spoolFile(context)
             val lines = if (spool.exists()) spool.readLines(Charsets.UTF_8) else emptyList()
-            val batch = readBatch(lines)
+            val batch = readBatch(lines, effectiveTelemetryMaxBatchBytes()) { events ->
+                estimatedTelemetryPayloadBytes(events)
+            }
             if (batch.events.isEmpty()) {
                 if (batch.consumedLines > 0) {
                     removeConsumedLines(spool, lines, batch.consumedLines)
@@ -163,12 +166,33 @@ object Telemetry {
             }
             if (post.httpCode in 200..299) {
                 removeConsumedLines(spool, lines, batch.consumedLines)
+                resetTelemetryBatchLimitAfterSuccess()
                 backoffMs.set(BACKOFF_MIN_MS)
                 nextFlushAtElapsedMs.set(0)
                 if (post.disableTelemetry) {
                     TransportLifecycleStore.setTelemetryRemoteOff(context, true)
                 }
                 Log.i(LOG_TAG, "telemetry flush ok http=${post.httpCode} disable=${post.disableTelemetry}")
+            } else if (post.httpCode == HTTP_PAYLOAD_TOO_LARGE) {
+                val previousLimit = effectiveTelemetryMaxBatchBytes()
+                val nextLimit = shrinkTelemetryBatchLimitAfterPayloadTooLarge(previousLimit)
+                backoffMs.set(BACKOFF_MIN_MS)
+                if (nextLimit < previousLimit) {
+                    nextFlushAtElapsedMs.set(0)
+                    io.execute { maybeFlush(context, force = true) }
+                } else {
+                    scheduleBackoff("http_413")
+                }
+                Log.w(
+                    LOG_TAG,
+                    "telemetry payload too large http=413 batch_bytes=${bodyBytes.size} max_batch_bytes=$nextLimit retry=true",
+                )
+            } else if (isNonRetryableTelemetryHttpCode(post.httpCode)) {
+                removeConsumedLines(spool, lines, batch.consumedLines)
+                resetTelemetryBatchLimitAfterSuccess()
+                backoffMs.set(BACKOFF_MIN_MS)
+                nextFlushAtElapsedMs.set(0)
+                Log.w(LOG_TAG, "telemetry poison batch dropped http=${post.httpCode}")
             } else {
                 scheduleBackoff("http_${post.httpCode}")
             }
@@ -206,15 +230,26 @@ object Telemetry {
         writeLinesAtomically(spool, kept.toList())
     }
 
-    private fun readBatch(lines: List<String>): Batch {
+    private fun readBatch(
+        lines: List<String>,
+        maxPayloadBytes: Int,
+        payloadSizeBytes: (List<QueuedEvent>) -> Int,
+    ): Batch {
         val events = mutableListOf<QueuedEvent>()
         var consumed = 0
         for (line in lines) {
-            consumed++
             val event = parseQueuedEvent(line)
-            if (event != null) {
-                events += event
+            if (event == null) {
+                consumed++
+                continue
             }
+            val candidate = events + event
+            val candidateBytes = payloadSizeBytes(candidate)
+            if (events.isNotEmpty() && candidateBytes > maxPayloadBytes) {
+                break
+            }
+            consumed++
+            events += event
             if (events.size >= BATCH_LIMIT) break
         }
         return Batch(events = events, consumedLines = consumed)
@@ -610,11 +645,69 @@ object Telemetry {
         return next
     }
 
+    private fun effectiveTelemetryMaxBatchBytes(): Int =
+        effectiveMaxBatchBytes.get()
+            .coerceAtLeast(TELEMETRY_MIN_BATCH_BYTES.toLong())
+            .coerceAtMost(TELEMETRY_MAX_BATCH_BYTES.toLong())
+            .toInt()
+
+    private fun shrinkTelemetryBatchLimitAfterPayloadTooLarge(currentLimitBytes: Int): Int {
+        val nextLimit = telemetryBatchLimitAfterPayloadTooLarge(currentLimitBytes)
+        effectiveMaxBatchBytes.set(nextLimit.toLong())
+        return nextLimit
+    }
+
+    private fun resetTelemetryBatchLimitAfterSuccess() {
+        effectiveMaxBatchBytes.set(TELEMETRY_MAX_BATCH_BYTES.toLong())
+    }
+
+    private fun estimatedTelemetryPayloadBytes(events: List<QueuedEvent>): Int =
+        TELEMETRY_BATCH_BASE_BYTES +
+            events.sumOf { it.toJson().toString().toByteArray(Charsets.UTF_8).size + TELEMETRY_EVENT_ENVELOPE_BYTES }
+
     private fun telemetryDeviceID(context: Context): String =
         telemetryDeviceIDForPublicKey(SecureIdentityStore(context).deviceIdentityPublicKey())
 
     internal fun telemetryDeviceIDForPublicKey(publicKey: String): String =
         "twpk_" + sha256Hex(publicKey.toByteArray(Charsets.UTF_8)).take(32)
+
+    internal fun isNonRetryableTelemetryHttpCode(code: Int): Boolean =
+        code == 400 || code == 401 || code == 403 || code == 422
+
+    internal fun telemetryFlushDispositionForHttpCode(code: Int): TelemetryFlushDisposition =
+        when {
+            code in 200..299 -> TelemetryFlushDisposition.SUCCESS
+            code == HTTP_PAYLOAD_TOO_LARGE -> TelemetryFlushDisposition.SHRINK_RETRY
+            isNonRetryableTelemetryHttpCode(code) -> TelemetryFlushDisposition.DROP
+            else -> TelemetryFlushDisposition.RETRY
+        }
+
+    internal fun telemetryBatchLimitAfterPayloadTooLarge(currentLimitBytes: Int): Int =
+        (currentLimitBytes / 2)
+            .coerceAtLeast(TELEMETRY_MIN_BATCH_BYTES)
+            .coerceAtMost(TELEMETRY_MAX_BATCH_BYTES)
+
+    internal fun telemetryQueuedLineForTest(kind: String = "test", payloadBytes: Int = 0): String =
+        QueuedEvent(
+            kind = kind,
+            wallTimeMs = 1L,
+            monoMs = 1L,
+            fields = mapOf("err_msg" to "x".repeat(payloadBytes.coerceAtLeast(0))),
+        ).toJson().toString()
+
+    internal fun telemetryBatchSelectionForTest(
+        lines: List<String>,
+        maxPayloadBytes: Int,
+    ): TelemetryBatchSelectionForTest {
+        val batch = readBatch(lines, maxPayloadBytes) { events ->
+            estimatedTelemetryPayloadBytes(events)
+        }
+        return TelemetryBatchSelectionForTest(
+            events = batch.events.size,
+            consumedLines = batch.consumedLines,
+            payloadBytes = estimatedTelemetryPayloadBytes(batch.events),
+        )
+    }
 
     private fun networkSnapshot(context: Context): NetworkSnapshot =
         runCatching {
@@ -897,6 +990,19 @@ object Telemetry {
 
     private data class PostResult(val httpCode: Int, val disableTelemetry: Boolean)
 
+    enum class TelemetryFlushDisposition {
+        SUCCESS,
+        RETRY,
+        DROP,
+        SHRINK_RETRY,
+    }
+
+    data class TelemetryBatchSelectionForTest(
+        val events: Int,
+        val consumedLines: Int,
+        val payloadBytes: Int,
+    )
+
     private const val LOG_TAG = "TWTelemetry"
     private const val PREFS_NAME = "trafficwrapper_telemetry"
     private const val KEY_SEQ = "seq"
@@ -904,12 +1010,17 @@ object Telemetry {
     private const val SPOOL_MAX_BYTES = 256 * 1024
     private const val QUEUE_CAP = 200
     private const val BATCH_LIMIT = 20
+    internal const val TELEMETRY_MAX_BATCH_BYTES = 32 * 1024
+    internal const val TELEMETRY_MIN_BATCH_BYTES = 2 * 1024
+    private const val TELEMETRY_BATCH_BASE_BYTES = 512
+    private const val TELEMETRY_EVENT_ENVELOPE_BYTES = 512
     private const val DEDUP_WINDOW_MS = 30_000L
     private const val BACKOFF_MIN_MS = 5_000L
     private const val BACKOFF_MAX_MS = 5 * 60 * 1000L
     private const val HTTPS_TIMEOUT_MS = 5_000
     private const val PUBLIC_HTTP_TIMEOUT_MS = 5_000
     private const val PUBLIC_HTTP_HEADER_LIMIT_BYTES = 64 * 1024
+    private const val HTTP_PAYLOAD_TOO_LARGE = 413
     private const val PUBLIC_TELEMETRY_URL = "http://awg-gw:8080/tw/telemetry"
     private const val PUBLIC_ROUTER_HOST = "127.0.0.1"
     private const val PUBLIC_ROUTER_PORT = 18080

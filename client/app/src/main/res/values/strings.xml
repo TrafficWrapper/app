@@ -35,6 +35,7 @@
     <string name="public_bootstrap_pending_body">Bootstrap сохранён. Следующий шаг — приватный device-enroll к оркестратору и получение подписанного client-config.</string>
     <string name="public_bootstrap_external_title">Подтвердите bootstrap</string>
     <string name="public_bootstrap_external_body">Другое приложение передало bootstrap. Проверьте адрес оркестратора и ключ конфигурации перед импортом.</string>
+    <string name="public_bootstrap_external_replace_warning">Это заменит текущий сервер: %1$s → %2$s</string>
     <string name="public_bootstrap_external_confirm">Импортировать</string>
     <string name="public_enrollment_status_registering">Регистрация в платформе</string>
     <string name="public_enrollment_error">Не удалось зарегистрировать устройство в платформе</string>

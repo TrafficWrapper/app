@@ -77,6 +77,26 @@ class PublicPlatformConfigTest {
     }
 
     @Test
+    fun externalBootstrapNoopsOnlyWhenActiveBootstrapMatchesSemantically() {
+        val activeRaw = bootstrapJson("2035-01-01T00:00:00Z")
+        val activeEncoded = Base64.getEncoder().encodeToString(activeRaw.toByteArray(Charsets.UTF_8))
+        val parsed = PublicPlatformConfigParser.parseBootstrap(activeRaw, nowMs = 0)
+        assertTrue(publicBootstrapMatchesActive(activeEncoded, parsed))
+
+        val replacement = PublicPlatformConfigParser.parseBootstrap(
+            activeRaw.replace("https://orch.dev", "https://other-orch.dev"),
+            nowMs = 0,
+        )
+        assertEquals(false, publicBootstrapMatchesActive(activeEncoded, replacement))
+
+        val differentNoise = PublicPlatformConfigParser.parseBootstrap(
+            activeRaw.replace("orch-noise", "other-noise"),
+            nowMs = 0,
+        )
+        assertEquals(false, publicBootstrapMatchesActive(activeEncoded, differentNoise))
+    }
+
+    @Test
     fun clientConfigVerifiesSignatureAndRejectsUnsigned() {
         val config = clientConfig(seq = 7)
         val envelope = envelope(config, signature = "sig")

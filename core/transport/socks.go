@@ -19,10 +19,13 @@ import (
 )
 
 const (
-	socksVersion5       = 0x05
-	socksNoAuth         = 0x00
-	socksConnect        = 0x01
-	socksProxyBufferLen = 256 * 1024
+	socksVersion5               = 0x05
+	socksNoAuth                 = 0x00
+	socksConnect                = 0x01
+	socksProxyBufferLen         = 256 * 1024
+	socksShutdownGrace          = 2 * time.Second
+	socksClientHandshakeTimeout = 45 * time.Second
+	socksUpstreamDialTimeout    = 30 * time.Second
 )
 
 var (
@@ -41,6 +44,8 @@ var socksProxyBuffers = sync.Pool{
 type socksServer struct {
 	listener net.Listener
 	tnet     *netstacktun.Net
+	ctx      context.Context
+	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 }
 
@@ -49,9 +54,10 @@ func startSOCKSServer(listen string, tnet *netstacktun.Net) (*socksServer, error
 	if err != nil {
 		return nil, fmt.Errorf("listen socks %s: %w", listen, err)
 	}
-	server := &socksServer{listener: ln, tnet: tnet}
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &socksServer{listener: ln, tnet: tnet, ctx: ctx, cancel: cancel}
 	server.wg.Add(1)
-	go server.serve()
+	go server.serve(ctx)
 	return server, nil
 }
 
@@ -66,32 +72,33 @@ func (s *socksServer) close() {
 	if s == nil {
 		return
 	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-	}
+	s.wg.Wait()
 }
 
-func (s *socksServer) serve() {
+func (s *socksServer) serve(ctx context.Context) {
 	defer s.wg.Done()
 	backoff := socksAcceptBackoffMin
 	for {
 		client, err := s.listener.Accept()
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				return
 			}
 			if isTemporaryAcceptError(err) {
 				log.Printf("transport: socks accept temporary error: %v", err)
-				time.Sleep(backoff)
+				timer := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
 				backoff *= 2
 				if backoff > socksAcceptBackoffMax {
 					backoff = socksAcceptBackoffMax
@@ -105,15 +112,25 @@ func (s *socksServer) serve() {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			_ = s.handle(client)
+			_ = s.handle(ctx, client)
 		}()
 	}
 }
 
-func (s *socksServer) handle(client net.Conn) error {
+func (s *socksServer) handle(ctx context.Context, client net.Conn) error {
 	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = client.SetDeadline(time.Now().Add(socksShutdownGrace))
+			_ = client.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
 	tuneConn(client)
-	if err := client.SetDeadline(time.Now().Add(45 * time.Second)); err != nil {
+	if err := client.SetDeadline(time.Now().Add(socksClientHandshakeTimeout)); err != nil {
 		return err
 	}
 	if err := socksHandshake(client); err != nil {
@@ -124,9 +141,9 @@ func (s *socksServer) handle(client net.Conn) error {
 		_ = writeSOCKSReply(client, 0x07)
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, socksUpstreamDialTimeout)
 	defer cancel()
-	upstream, err := s.dial(ctx, target)
+	upstream, err := s.dial(dialCtx, target)
 	if err != nil {
 		if errors.Is(err, errUnsupportedAddrType) {
 			log.Printf("transport: socks refused IPv6/unsupported %q (fail-closed)", target.host)
@@ -142,7 +159,7 @@ func (s *socksServer) handle(client net.Conn) error {
 		return err
 	}
 	_ = client.SetDeadline(time.Time{})
-	return proxy(client, upstream)
+	return proxy(ctx, client, upstream)
 }
 
 func socksHandshake(rw io.ReadWriter) error {
@@ -222,7 +239,7 @@ func (s *socksServer) dial(ctx context.Context, target socksTarget) (net.Conn, e
 	if err != nil {
 		return nil, err
 	}
-	return s.tnet.DialContextTCPAddrPort(ctx, addr)
+	return dialSOCKSTargetTCP(ctx, s.tnet, addr)
 }
 
 var lookupSOCKSTargetHost = func(ctx context.Context, tnet *netstacktun.Net, host string) ([]string, error) {
@@ -230,6 +247,13 @@ var lookupSOCKSTargetHost = func(ctx context.Context, tnet *netstacktun.Net, hos
 		return nil, errors.New("netstack resolver is unavailable")
 	}
 	return tnet.LookupContextHost(ctx, host)
+}
+
+var dialSOCKSTargetTCP = func(ctx context.Context, tnet *netstacktun.Net, addr netip.AddrPort) (net.Conn, error) {
+	if tnet == nil {
+		return nil, errors.New("netstack dialer is unavailable")
+	}
+	return tnet.DialContextTCPAddrPort(ctx, addr)
 }
 
 var errUnsupportedAddrType = errors.New("unsupported address type")
@@ -259,9 +283,22 @@ func writeSOCKSReply(w io.Writer, code byte) error {
 	return err
 }
 
-func proxy(left, right net.Conn) error {
+func proxy(ctx context.Context, left, right net.Conn) error {
 	deadlines := newProxyDeadlines(left, right, socksProxyIdleTimeout)
 	deadlines.touchRead()
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			deadline := time.Now().Add(socksShutdownGrace)
+			_ = left.SetDeadline(deadline)
+			_ = right.SetDeadline(deadline)
+			_ = left.Close()
+			_ = right.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
 	type copyResult struct {
 		dst net.Conn
 		err error

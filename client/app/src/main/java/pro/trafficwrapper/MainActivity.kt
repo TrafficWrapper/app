@@ -212,11 +212,7 @@ class MainActivity : ComponentActivity() {
         if (raw.isBlank()) return
         try {
             val parsed = PublicPlatformConfigParser.parseBootstrap(raw)
-            PENDING_EXTERNAL_BOOTSTRAP = PendingExternalBootstrap(
-                raw = raw.trim(),
-                orchestratorUrl = parsed.orchestratorUrl,
-                configPubkeyPin = parsed.configPubkeyPin,
-            )
+            PENDING_EXTERNAL_BOOTSTRAP = pendingExternalBootstrap(applicationContext, raw, parsed)
             PUBLIC_BOOTSTRAP_ERROR = null
         } catch (_: Throwable) {
             PUBLIC_BOOTSTRAP_ERROR = getString(R.string.public_bootstrap_invalid)
@@ -228,11 +224,7 @@ class MainActivity : ComponentActivity() {
         val raw = publicEnrollDeepLinkBootstrap(intent.dataString) ?: return
         try {
             val parsed = PublicPlatformConfigParser.parseBootstrap(raw)
-            PENDING_EXTERNAL_BOOTSTRAP = PendingExternalBootstrap(
-                raw = raw.trim(),
-                orchestratorUrl = parsed.orchestratorUrl,
-                configPubkeyPin = parsed.configPubkeyPin,
-            )
+            PENDING_EXTERNAL_BOOTSTRAP = pendingExternalBootstrap(applicationContext, raw, parsed)
             PUBLIC_BOOTSTRAP_ERROR = null
         } catch (_: Throwable) {
             PUBLIC_BOOTSTRAP_ERROR = getString(R.string.public_bootstrap_invalid)
@@ -355,8 +347,19 @@ private fun ExternalBootstrapConfirmDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(text = stringResource(R.string.public_bootstrap_external_body))
+                if (pending.replacesExisting) {
+                    Text(
+                        text = stringResource(
+                            R.string.public_bootstrap_external_replace_warning,
+                            pending.currentOrchestratorUrl.ifBlank { stringResource(R.string.value_empty) },
+                            pending.orchestratorUrl,
+                        ),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
                 Text(text = "orchestrator_url: ${pending.orchestratorUrl}")
                 Text(text = "config_pubkey_pin: ${pending.configPubkeyPin}")
+                Text(text = "orch_noise_public: ${pending.orchNoisePublic}")
             }
         },
         confirmButton = {
@@ -2532,6 +2535,37 @@ private fun publicBootstrapRaw(context: Context): String =
             .orEmpty()
     }
 
+private fun pendingExternalBootstrap(
+    context: Context,
+    raw: String,
+    parsed: PublicBootstrapConfig,
+): PendingExternalBootstrap? {
+    val currentRaw = publicBootstrapRaw(context)
+    if (publicBootstrapMatchesActive(currentRaw, parsed)) {
+        return null
+    }
+    val current = runCatching {
+        currentRaw.takeIf { it.isNotBlank() }?.let { PublicPlatformConfigParser.parseBootstrap(it) }
+    }.getOrNull()
+    return PendingExternalBootstrap(
+        raw = raw.trim(),
+        orchestratorUrl = parsed.orchestratorUrl,
+        configPubkeyPin = parsed.configPubkeyPin,
+        orchNoisePublic = parsed.orchNoisePublic,
+        replacesExisting = currentRaw.isNotBlank(),
+        currentOrchestratorUrl = current?.orchestratorUrl.orEmpty(),
+    )
+}
+
+internal fun publicBootstrapMatchesActive(currentRaw: String, incoming: PublicBootstrapConfig): Boolean {
+    if (currentRaw.isBlank()) return false
+    val current = runCatching { PublicPlatformConfigParser.parseBootstrap(currentRaw) }.getOrNull() ?: return false
+    return current.orchestratorUrl == incoming.orchestratorUrl &&
+        current.configPubkeyPin == incoming.configPubkeyPin &&
+        current.orchNoisePublic == incoming.orchNoisePublic &&
+        current.bootstrapToken == incoming.bootstrapToken
+}
+
 private fun savePublicBootstrap(context: Context, raw: String) {
     context.applicationContext
         .getSharedPreferences(PUBLIC_PLATFORM_PREFS, Context.MODE_PRIVATE)
@@ -2552,6 +2586,9 @@ private data class PendingExternalBootstrap(
     val raw: String,
     val orchestratorUrl: String,
     val configPubkeyPin: String,
+    val orchNoisePublic: String,
+    val replacesExisting: Boolean,
+    val currentOrchestratorUrl: String,
 )
 
 private fun buildPermissionCheckResults(context: Context): List<PermissionCheckResult> {
