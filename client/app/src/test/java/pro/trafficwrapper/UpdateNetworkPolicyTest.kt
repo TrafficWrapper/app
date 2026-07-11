@@ -6,6 +6,52 @@ import org.junit.Test
 
 class UpdateNetworkPolicyTest {
     @Test
+    fun autoDownloadWaitsForCarryButMandatoryMinVersionCanProceed() {
+        val enabled = UpdateAutoDownloadPolicy(
+            autoDownloadEnabled = true,
+            wifiEnabled = true,
+            mobileEnabled = false,
+        )
+        val mandatoryByMinVersion = updateManifestForPolicyTest(
+            minSupportedVersion = BuildConfig.VERSION_CODE.toLong() + 1,
+        ).requiresInstalledUpdate()
+
+        assertFalse(
+            shouldAutoDownloadUpdateWithCarry(
+                enabled,
+                UpdateNetworkKind.WIFI,
+                carrying = false,
+                mandatory = false,
+            ),
+        )
+        assertTrue(
+            shouldAutoDownloadUpdateWithCarry(
+                enabled,
+                UpdateNetworkKind.WIFI,
+                carrying = true,
+                mandatory = false,
+            ),
+        )
+        assertTrue(mandatoryByMinVersion)
+        assertTrue(
+            shouldAutoDownloadUpdateWithCarry(
+                enabled,
+                UpdateNetworkKind.WIFI,
+                carrying = false,
+                mandatory = mandatoryByMinVersion,
+            ),
+        )
+        assertFalse(
+            shouldAutoDownloadUpdateWithCarry(
+                enabled.copy(autoDownloadEnabled = false),
+                UpdateNetworkKind.WIFI,
+                carrying = true,
+                mandatory = true,
+            ),
+        )
+    }
+
+    @Test
     fun autoDownloadPolicyKeepsDefaultBehaviorOff() {
         val policy = UpdateAutoDownloadPolicy(
             autoDownloadEnabled = false,
@@ -89,3 +135,22 @@ class UpdateNetworkPolicyTest {
         assertTrue(selected == UpdateNetworkKind.METERED)
     }
 }
+
+private fun updateManifestForPolicyTest(minSupportedVersion: Long): UpdateManifest =
+    UpdateManifest(
+        schema = 1,
+        namespace = "update-v1",
+        seq = 1,
+        versionCode = BuildConfig.VERSION_CODE.toLong() + 1,
+        versionName = "test",
+        apkUrl = "app.apk",
+        apkSize = 1,
+        sha256 = "sha256",
+        signingCertSha256 = "cert",
+        minSupportedVersion = minSupportedVersion,
+        mandatory = false,
+        changelogRu = "",
+        releasedAt = "2030-01-01T00:00:00Z",
+        timestamp = "2030-01-01T00:00:00Z",
+        expiresAt = "2030-01-02T00:00:00Z",
+    )

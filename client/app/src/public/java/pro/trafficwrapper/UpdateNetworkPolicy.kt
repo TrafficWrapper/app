@@ -31,6 +31,13 @@ internal fun shouldAutoDownloadUpdate(policy: UpdateAutoDownloadPolicy, network:
     }
 }
 
+internal fun shouldAutoDownloadUpdateWithCarry(
+    policy: UpdateAutoDownloadPolicy,
+    network: UpdateNetworkKind,
+    carrying: Boolean,
+    mandatory: Boolean,
+): Boolean = shouldAutoDownloadUpdate(policy, network) && (carrying || mandatory)
+
 object UpdateNetworkPolicy {
     fun currentPolicy(context: Context): UpdateAutoDownloadPolicy =
         UpdateAutoDownloadPolicy(

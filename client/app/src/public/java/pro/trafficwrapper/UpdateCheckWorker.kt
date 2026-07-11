@@ -49,9 +49,13 @@ class UpdateCheckWorker(
                     checkedAt = checkedAt,
                     showSheet = false,
                 )
-                if (shouldAutoDownloadUpdate(
+                val carrying = TransportRuntime.state.carryingTransport.isNotBlank()
+                val mandatory = outcome.manifest?.requiresInstalledUpdate() == true
+                if (shouldAutoDownloadUpdateWithCarry(
                         UpdateNetworkPolicy.currentPolicy(applicationContext),
                         UpdateNetworkPolicy.underlyingNetworkKind(applicationContext),
+                        carrying = carrying,
+                        mandatory = mandatory,
                     )
                 ) {
                     downloadAvailableUpdate(auth, socksListen, transport.activeTransport, checkedAt)
