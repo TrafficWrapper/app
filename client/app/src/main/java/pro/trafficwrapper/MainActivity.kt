@@ -295,7 +295,7 @@ private fun TrafficWrapperApp() {
                         onBack = { SHOW_SETTINGS_SCREEN = false },
                     )
                 } else if (DeploymentConfig.IS_PUBLIC_PLATFORM && !auth.authorized) {
-                    PublicBootstrapPendingScreen()
+                    PublicBootstrapPendingScreen(context = context, auth = auth)
                 } else {
                     MainScreen(
                         context = context,
@@ -376,7 +376,7 @@ private fun ExternalBootstrapConfirmDialog(
 }
 
 @Composable
-private fun PublicBootstrapPendingScreen() {
+private fun PublicBootstrapPendingScreen(context: Context, auth: AuthUiState) {
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -392,15 +392,36 @@ private fun PublicBootstrapPendingScreen() {
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
-                    text = stringResource(R.string.public_bootstrap_imported),
+                    text = stringResource(auth.statusTextRes),
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                 )
-                Text(
+                auth.errorTextRes?.let { errorTextRes ->
+                    Text(
+                        text = stringResource(errorTextRes),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                } ?: Text(
                     text = stringResource(R.string.public_bootstrap_pending_body),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (auth.inProgress) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                }
+                if (auth.enrollmentRetryAllowed && !auth.inProgress) {
+                    Button(
+                        onClick = {
+                            retryPublicEnrollmentIfAllowed(
+                                auth = TransportRuntime.auth,
+                                bootstrapRaw = publicBootstrapRaw(context),
+                            ) { raw -> startPublicDeviceEnrollment(context.applicationContext, raw) }
+                        },
+                    ) {
+                        Text(text = stringResource(R.string.public_enrollment_retry))
+                    }
+                }
             }
         }
     }
@@ -2749,16 +2770,26 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRaw: String =
     TransportRuntime.auth = TransportRuntime.auth.copy(
         inProgress = true,
         authorized = false,
+        enrollmentRetryAllowed = false,
         statusTextRes = R.string.public_enrollment_status_registering,
         errorTextRes = null,
     )
+    PUBLIC_BOOTSTRAP_ERROR = null
     ENROLLMENT_EXECUTOR.execute {
         val mainHandler = Handler(Looper.getMainLooper())
         try {
             val parsed = PublicPlatformConfigParser.parseBootstrap(bootstrapRaw)
             val androidID = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
             if (androidID.isBlank()) {
-                postEnrollmentFailure(mainHandler, R.string.enrollment_error_device_id)
+                postPublicEnrollmentFailure(
+                    mainHandler,
+                    PublicEnrollmentFailurePolicy(
+                        kind = PublicEnrollmentFailureKind.TERMINAL,
+                        statusTextRes = R.string.enrollment_status_error,
+                        errorTextRes = R.string.enrollment_error_device_id,
+                        retryAllowed = false,
+                    ),
+                )
                 return@execute
             }
             val store = SecureIdentityStore(context)
@@ -2826,13 +2857,23 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRaw: String =
             savePublicBootstrap(context, bootstrapRaw)
         } catch (error: Throwable) {
             Log.w(TAG, "public device enrollment failed", error)
+            val policy = publicEnrollmentFailurePolicy(error)
             mainHandler.post {
                 PUBLIC_BOOTSTRAP_ERROR = Telemetry.safeErrorMessage(error)
             }
-            postEnrollmentFailure(mainHandler, R.string.public_enrollment_error)
+            postPublicEnrollmentFailure(mainHandler, policy)
         } finally {
             ENROLLMENT_ACTIVE.set(false)
         }
+    }
+}
+
+private fun postPublicEnrollmentFailure(
+    mainHandler: Handler,
+    policy: PublicEnrollmentFailurePolicy,
+) {
+    mainHandler.post {
+        TransportRuntime.auth = publicEnrollmentFailureState(TransportRuntime.auth, policy)
     }
 }
 

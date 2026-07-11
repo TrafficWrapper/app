@@ -109,6 +109,7 @@ data class RealityUiConfig(
 data class AuthUiState(
     val authorized: Boolean = false,
     val inProgress: Boolean = false,
+    val enrollmentRetryAllowed: Boolean = false,
     @StringRes val statusTextRes: Int = R.string.enrollment_status_starting,
     @StringRes val errorTextRes: Int? = null,
     @StringRes val keystoreTextRes: Int = R.string.keystore_status_unknown,

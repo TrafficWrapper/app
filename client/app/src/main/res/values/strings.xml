@@ -39,6 +39,8 @@
     <string name="public_bootstrap_external_confirm">Импортировать</string>
     <string name="public_enrollment_status_registering">Регистрация в платформе</string>
     <string name="public_enrollment_error">Не удалось зарегистрировать устройство в платформе</string>
+    <string name="public_enrollment_terminal_error">Регистрация отклонена. Проверьте bootstrap или обратитесь к оператору.</string>
+    <string name="public_enrollment_retry">Повторить</string>
     <string name="public_config_applied">Конфигурация платформы применена: seq=%1$d</string>
     <string name="keystore_status">Хранилище ключа: %1$s</string>
     <string name="keystore_status_unknown">не проверено</string>

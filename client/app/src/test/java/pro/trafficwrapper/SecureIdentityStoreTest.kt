@@ -108,4 +108,23 @@ class SecureIdentityStoreTest {
         assertEquals(PublicAWGKeyPairSource.EXISTING, repeated.source)
         assertTrue(!repeated.newlyCreated)
     }
+
+    @Test
+    fun publicEnrollmentRetryReusesGeneratedAwgKeyPair() {
+        val initial = resolvePublicAWGKeyPair(
+            existing = null,
+            legacy = null,
+            generate = { "generated-private" to "generated-public" },
+        )
+        val retry = resolvePublicAWGKeyPair(
+            existing = initial.privateKey to initial.publicKey,
+            legacy = null,
+            generate = { error("retry must reuse the persisted AWG keypair") },
+        )
+
+        assertEquals(initial.privateKey, retry.privateKey)
+        assertEquals(initial.publicKey, retry.publicKey)
+        assertEquals(PublicAWGKeyPairSource.EXISTING, retry.source)
+        assertTrue(!retry.newlyCreated)
+    }
 }

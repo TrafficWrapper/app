@@ -48,5 +48,13 @@
     <string name="public_bootstrap_camera_error">Could not open the camera for QR scanning</string>
     <string name="public_bootstrap_import_file">Open bootstrap file</string>
     <string name="public_bootstrap_invalid">Bootstrap string is invalid or expired</string>
+    <string name="public_bootstrap_pending_body">Bootstrap is saved. The device is enrolling with the orchestrator and waiting for an approved signed configuration.</string>
+    <string name="enrollment_status_pending">Waiting for approval</string>
+    <string name="enrollment_status_blocked">Access blocked</string>
+    <string name="enrollment_status_error">Enrollment error</string>
+    <string name="public_enrollment_status_registering">Registering with the platform</string>
+    <string name="public_enrollment_error">Could not contact the platform enrollment service.</string>
+    <string name="public_enrollment_terminal_error">Enrollment was rejected. Check the bootstrap or contact the operator.</string>
+    <string name="public_enrollment_retry">Retry</string>
     <string name="update_notification_ready">Update APK downloaded and verified</string>
 </resources>

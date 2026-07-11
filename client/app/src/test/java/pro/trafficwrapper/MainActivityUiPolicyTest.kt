@@ -5,8 +5,60 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.IOException
 
 class MainActivityUiPolicyTest {
+    @Test
+    fun publicEnrollmentTransientFailureSurfacesRetryAndRepeatsSavedBootstrap() {
+        val policy = publicEnrollmentFailurePolicy(IOException("connection reset"))
+        val serverNotReady = publicEnrollmentFailurePolicy(
+            IllegalStateException("public device enrollment rejected: no approved worker with awg public key"),
+        )
+        val dnsFailure = publicEnrollmentFailurePolicy(
+            IllegalStateException("Post https://orch.example: dial tcp: lookup orch.example: no such host"),
+        )
+        val state = publicEnrollmentFailureState(AuthUiState(inProgress = true), policy)
+        var retriedBootstrap = ""
+
+        val retried = retryPublicEnrollmentIfAllowed(state, "stored-bootstrap") {
+            retriedBootstrap = it
+        }
+
+        assertEquals(PublicEnrollmentFailureKind.TRANSIENT, policy.kind)
+        assertEquals(PublicEnrollmentFailureKind.TRANSIENT, serverNotReady.kind)
+        assertEquals(PublicEnrollmentFailureKind.TRANSIENT, dnsFailure.kind)
+        assertEquals(R.string.enrollment_status_error, state.statusTextRes)
+        assertEquals(R.string.public_enrollment_error, state.errorTextRes)
+        assertTrue(state.enrollmentRetryAllowed)
+        assertTrue(retried)
+        assertEquals("stored-bootstrap", retriedBootstrap)
+    }
+
+    @Test
+    fun publicEnrollmentHardFailuresAndPendingApprovalDoNotRetry() {
+        val blocked = publicEnrollmentFailurePolicy(IllegalStateException("device revoked"))
+        val rejected = publicEnrollmentFailurePolicy(IllegalStateException("device identity mismatch"))
+        val invalidToken = publicEnrollmentFailurePolicy(IllegalStateException("invalid bootstrap token"))
+        val pending = publicEnrollmentFailurePolicy(IllegalStateException("device is not approved"))
+
+        assertEquals(PublicEnrollmentFailureKind.BLOCKED, blocked.kind)
+        assertFalse(blocked.retryAllowed)
+        assertEquals(PublicEnrollmentFailureKind.TERMINAL, rejected.kind)
+        assertFalse(rejected.retryAllowed)
+        assertEquals(PublicEnrollmentFailureKind.TERMINAL, invalidToken.kind)
+        assertFalse(invalidToken.retryAllowed)
+        assertEquals(PublicEnrollmentFailureKind.PENDING, pending.kind)
+        assertEquals(R.string.enrollment_status_pending, pending.statusTextRes)
+        assertEquals(null, pending.errorTextRes)
+        assertFalse(pending.retryAllowed)
+        assertFalse(
+            retryPublicEnrollmentIfAllowed(
+                AuthUiState(enrollmentRetryAllowed = false),
+                "stored-bootstrap",
+            ) { error("terminal enrollment must not retry") },
+        )
+    }
+
     @Test
     fun statusRoutePrefersCarryingThenActiveThenDefault() {
         assertEquals(
