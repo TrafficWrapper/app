@@ -49,11 +49,15 @@ class UpdateCheckWorker(
                     checkedAt = checkedAt,
                     showSheet = false,
                 )
-                val carrying = TransportRuntime.state.carryingTransport.isNotBlank()
+                val gateState = TransportRuntime.state
+                val carrying = gateState.isCarryingTrafficNow()
                 val mandatory = outcome.manifest?.requiresInstalledUpdate() == true
+                // AVAILABLE outcomes carry a source; PLATFORM is the conservative fallback.
+                val source = outcome.source ?: UpdateSource.PLATFORM
                 if (shouldAutoDownloadUpdateWithCarry(
                         UpdateNetworkPolicy.currentPolicy(applicationContext),
                         UpdateNetworkPolicy.underlyingNetworkKind(applicationContext),
+                        source = source,
                         carrying = carrying,
                         mandatory = mandatory,
                     )

@@ -1,5 +1,6 @@
 package pro.trafficwrapper
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -20,6 +21,7 @@ class UpdateNetworkPolicyTest {
             shouldAutoDownloadUpdateWithCarry(
                 enabled,
                 UpdateNetworkKind.WIFI,
+                source = UpdateSource.PLATFORM,
                 carrying = false,
                 mandatory = false,
             ),
@@ -28,6 +30,7 @@ class UpdateNetworkPolicyTest {
             shouldAutoDownloadUpdateWithCarry(
                 enabled,
                 UpdateNetworkKind.WIFI,
+                source = UpdateSource.PLATFORM,
                 carrying = true,
                 mandatory = false,
             ),
@@ -37,6 +40,7 @@ class UpdateNetworkPolicyTest {
             shouldAutoDownloadUpdateWithCarry(
                 enabled,
                 UpdateNetworkKind.WIFI,
+                source = UpdateSource.PLATFORM,
                 carrying = false,
                 mandatory = mandatoryByMinVersion,
             ),
@@ -45,9 +49,125 @@ class UpdateNetworkPolicyTest {
             shouldAutoDownloadUpdateWithCarry(
                 enabled.copy(autoDownloadEnabled = false),
                 UpdateNetworkKind.WIFI,
+                source = UpdateSource.PLATFORM,
                 carrying = true,
                 mandatory = true,
             ),
+        )
+    }
+
+    @Test
+    fun directAutoDownloadRequiresMandatoryRegardlessOfCarry() {
+        val enabled = UpdateAutoDownloadPolicy(
+            autoDownloadEnabled = true,
+            wifiEnabled = true,
+            mobileEnabled = false,
+        )
+
+        val withoutCarry = shouldAutoDownloadUpdateWithCarry(
+            enabled,
+            UpdateNetworkKind.WIFI,
+            source = UpdateSource.DIRECT,
+            carrying = false,
+            mandatory = false,
+        )
+        val withCarry = shouldAutoDownloadUpdateWithCarry(
+            enabled,
+            UpdateNetworkKind.WIFI,
+            source = UpdateSource.DIRECT,
+            carrying = true,
+            mandatory = false,
+        )
+
+        assertFalse(withoutCarry)
+        assertEquals(withoutCarry, withCarry)
+        assertTrue(
+            shouldAutoDownloadUpdateWithCarry(
+                enabled,
+                UpdateNetworkKind.WIFI,
+                source = UpdateSource.DIRECT,
+                carrying = false,
+                mandatory = true,
+            ),
+        )
+    }
+
+    @Test
+    fun autoDownloadMasterToggleAppliesToEverySource() {
+        val disabled = UpdateAutoDownloadPolicy(
+            autoDownloadEnabled = false,
+            wifiEnabled = true,
+            mobileEnabled = true,
+        )
+
+        UpdateSource.values().forEach { source ->
+            assertFalse(
+                shouldAutoDownloadUpdateWithCarry(
+                    disabled,
+                    UpdateNetworkKind.WIFI,
+                    source = source,
+                    carrying = true,
+                    mandatory = true,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun autoDownloadNetworkPolicyAppliesToEverySource() {
+        val wifiOnly = UpdateAutoDownloadPolicy(
+            autoDownloadEnabled = true,
+            wifiEnabled = true,
+            mobileEnabled = false,
+        )
+
+        UpdateSource.values().forEach { source ->
+            assertFalse(
+                shouldAutoDownloadUpdateWithCarry(
+                    wifiOnly,
+                    UpdateNetworkKind.CELLULAR,
+                    source = source,
+                    carrying = true,
+                    mandatory = true,
+                ),
+            )
+            assertFalse(
+                shouldAutoDownloadUpdateWithCarry(
+                    wifiOnly,
+                    UpdateNetworkKind.NONE,
+                    source = source,
+                    carrying = true,
+                    mandatory = true,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun carryingTrafficNowRequiresHandshakeAndRoute() {
+        assertTrue(
+            TransportUiState(
+                handshakeEstablished = true,
+                carryingTransport = "AWG",
+            ).isCarryingTrafficNow(),
+        )
+        assertFalse(
+            TransportUiState(
+                handshakeEstablished = false,
+                carryingTransport = "AWG",
+            ).isCarryingTrafficNow(),
+        )
+        assertFalse(
+            TransportUiState(
+                handshakeEstablished = true,
+                carryingTransport = "",
+            ).isCarryingTrafficNow(),
+        )
+        assertFalse(
+            TransportUiState(
+                handshakeEstablished = false,
+                carryingTransport = "",
+            ).isCarryingTrafficNow(),
         )
     }
 

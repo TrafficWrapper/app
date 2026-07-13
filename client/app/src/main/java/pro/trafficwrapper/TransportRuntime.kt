@@ -28,6 +28,9 @@ data class TransportUiState(
     val stableSinceElapsedRealtimeMs: Long? = null,
 )
 
+internal fun TransportUiState.isCarryingTrafficNow(): Boolean =
+    handshakeEstablished && carryingTransport.isNotBlank()
+
 enum class VpnTransition {
     NONE,
     STARTING,
