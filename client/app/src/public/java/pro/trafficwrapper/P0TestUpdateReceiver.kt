@@ -13,10 +13,15 @@ import androidx.work.WorkManager
 class P0TestUpdateReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent?.action != ACTION_TEST_UPDATE_NOW) return
+        val appContext = context.applicationContext
+        // P0-TEST TEMPORARY: force every auto-download network gate on for the FGS probe.
+        TransportLifecycleStore.setAutoDownloadUpdatesEnabled(appContext, true)
+        TransportLifecycleStore.setAutoDownloadWifiEnabled(appContext, true)
+        TransportLifecycleStore.setAutoDownloadMobileEnabled(appContext, true)
         val request = OneTimeWorkRequestBuilder<UpdateCheckWorker>()
             .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
             .build()
-        WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
+        WorkManager.getInstance(appContext).enqueueUniqueWork(
             TEST_WORK_NAME,
             ExistingWorkPolicy.REPLACE,
             request,
