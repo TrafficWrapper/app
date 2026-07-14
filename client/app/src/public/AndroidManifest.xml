@@ -21,13 +21,5 @@
                 <action android:name="pro.trafficwrapper.action.UPDATE_INSTALL_RESULT" />
             </intent-filter>
         </receiver>
-        <!-- P0-TEST TEMPORARY: exported only in the disposable device-test commit. -->
-        <receiver
-            android:name=".P0TestUpdateReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="pro.trafficwrapper.TEST_UPDATE_NOW" />
-            </intent-filter>
-        </receiver>
     </application>
 </manifest>
