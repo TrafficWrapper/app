@@ -2,20 +2,37 @@ package pro.trafficwrapper
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class UpdateDownloadControlTest {
     @Test
-    fun downloadGuardHasSingleOwnerUntilRelease() {
+    fun leaseReleasesGuardOnlyOnce() {
+        var releaseCount = 0
+        val lease = UpdateDownloadLease { releaseCount += 1 }
+
+        lease.release()
+        lease.release()
+
+        assertEquals(1, releaseCount)
+    }
+
+    @Test
+    fun staleLeaseCannotReleaseTheNextOwner() {
         val guard = UpdateDownloadGuard()
 
-        assertTrue(guard.tryAcquire())
-        assertFalse(guard.tryAcquire())
-        guard.release()
-        assertTrue(guard.tryAcquire())
-        guard.release()
+        val firstLease = checkNotNull(guard.tryAcquire())
+        assertNull(guard.tryAcquire())
+        firstLease.release()
+
+        val secondLease = checkNotNull(guard.tryAcquire())
+        firstLease.release()
+        assertNull(guard.tryAcquire())
+
+        secondLease.release()
+        checkNotNull(guard.tryAcquire()).release()
     }
 
     @Test

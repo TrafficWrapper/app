@@ -332,7 +332,8 @@ object DistributionChannel {
     }
 
     private fun performUpdateDownloadAndInstall(context: Context, auth: AuthUiState, socksListen: String) {
-        if (!sharedUpdateDownloadGuard.tryAcquire()) {
+        val downloadLease = sharedUpdateDownloadGuard.tryAcquire()
+        if (downloadLease == null) {
             Log.i(LOG_TAG, "manual update download skipped: another download owns the guard")
             return
         }
@@ -397,17 +398,17 @@ object DistributionChannel {
                             try {
                                 TransportRuntime.updates = finishedUpdateDownloadState(TransportRuntime.updates)
                             } finally {
-                                sharedUpdateDownloadGuard.release()
+                                downloadLease.release()
                             }
                         }
                     } catch (error: Throwable) {
-                        sharedUpdateDownloadGuard.release()
+                        downloadLease.release()
                         Log.w(LOG_TAG, "manual update download cleanup failed", error)
                     }
                 }
             }
         } catch (error: Throwable) {
-            sharedUpdateDownloadGuard.release()
+            downloadLease.release()
             Log.w(LOG_TAG, "manual update download could not start", error)
             TransportRuntime.updates = failedUpdateDownloadState(TransportRuntime.updates)
             showInstallStatusSafely(context, R.string.update_notification_available)

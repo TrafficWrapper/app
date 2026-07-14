@@ -73,10 +73,7 @@ class UpdateCheckWorker(
                     )
                 } else {
                     TransportRuntime.updates = availableState
-                    UpdateNotifications.showInstallStatus(
-                        applicationContext,
-                        R.string.update_notification_available,
-                    )
+                    showInstallStatusSafely(R.string.update_notification_available)
                 }
             }
 
@@ -112,7 +109,8 @@ class UpdateCheckWorker(
         checkedAt: String,
         availableState: DistributionUiState,
     ) {
-        if (!sharedUpdateDownloadGuard.tryAcquire()) {
+        val downloadLease = sharedUpdateDownloadGuard.tryAcquire()
+        if (downloadLease == null) {
             Log.i(LOG_TAG, "background update download skipped: another download owns the guard")
             return
         }
@@ -178,7 +176,7 @@ class UpdateCheckWorker(
                 clearDownloadNotificationSafely()
                 TransportRuntime.updates = finishedUpdateDownloadState(TransportRuntime.updates)
             } finally {
-                sharedUpdateDownloadGuard.release()
+                downloadLease.release()
             }
         }
     }

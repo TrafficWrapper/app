@@ -5,10 +5,21 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal class UpdateDownloadGuard {
     private val active = AtomicBoolean(false)
 
-    fun tryAcquire(): Boolean = active.compareAndSet(false, true)
+    fun tryAcquire(): UpdateDownloadLease? {
+        if (!active.compareAndSet(false, true)) return null
+        return UpdateDownloadLease {
+            active.compareAndSet(true, false)
+        }
+    }
+}
+
+internal class UpdateDownloadLease(private val releaseGuard: () -> Unit) {
+    private val released = AtomicBoolean(false)
 
     fun release() {
-        active.compareAndSet(true, false)
+        if (released.compareAndSet(false, true)) {
+            releaseGuard()
+        }
     }
 }
 
