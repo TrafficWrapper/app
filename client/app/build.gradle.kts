@@ -19,10 +19,10 @@ android {
             .getOrElse("org.trafficwrapper.app")
         minSdk = 26
         targetSdk = 36
-        versionCode = providers.environmentVariable("TW_VERSION_CODE").map(String::toInt).getOrElse(1001)
+        versionCode = providers.environmentVariable("TW_VERSION_CODE").map(String::toInt).getOrElse(30)
         versionName = providers.environmentVariable("TW_VERSION_NAME")
             .orElse(providers.environmentVariable("TW_PUBLIC_VERSION_NAME"))
-            .getOrElse("public-1.0.0")
+            .getOrElse("0.1.30")
 
         val enrollmentSecret = providers.environmentVariable("TW_ENROLLMENT_SECRET")
             .orElse(providers.gradleProperty("tw.enrollmentSecret"))
