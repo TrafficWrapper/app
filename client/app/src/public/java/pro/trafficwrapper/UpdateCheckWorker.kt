@@ -39,8 +39,6 @@ class UpdateCheckWorker(
         val outcome = UpdateRepository(applicationContext).check(
             auth = auth,
             socksListen = socksListen,
-            allowProvisioningFallback = false,
-            activeTransportOverride = transport.activeTransport,
         )
         val checkedAt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
             .format(Date())
@@ -67,7 +65,6 @@ class UpdateCheckWorker(
                     downloadAvailableUpdate(
                         auth = auth,
                         socksListen = socksListen,
-                        activeTransport = transport.activeTransport,
                         checkedAt = checkedAt,
                         availableState = availableState,
                     )
@@ -105,7 +102,6 @@ class UpdateCheckWorker(
     private fun downloadAvailableUpdate(
         auth: AuthUiState,
         socksListen: String,
-        activeTransport: String,
         checkedAt: String,
         availableState: DistributionUiState,
     ) {
@@ -144,8 +140,6 @@ class UpdateCheckWorker(
             val result = UpdateRepository(applicationContext).downloadAndVerify(
                 auth = auth,
                 socksListen = socksListen,
-                allowProvisioningFallback = false,
-                activeTransportOverride = activeTransport,
             ) { downloaded, total ->
                 if (progressThrottle.shouldPublish(downloaded, total)) {
                     TransportRuntime.updates = TransportRuntime.updates.copy(

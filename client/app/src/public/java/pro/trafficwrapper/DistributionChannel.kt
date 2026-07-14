@@ -73,8 +73,6 @@ object DistributionChannel {
                 val result = UpdateRepository(context.applicationContext).check(
                     auth = auth,
                     socksListen = socksListen,
-                    allowProvisioningFallback = false,
-                    activeTransportOverride = activeTransport,
                 )
                 val checkedAt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
                     .format(Date())
@@ -353,12 +351,10 @@ object DistributionChannel {
             updateExecutor.execute {
                 val mainHandler = Handler(Looper.getMainLooper())
                 try {
-                    val activeTransport = TransportRuntime.state.activeTransport
                     val progressThrottle = UpdateProgressThrottle()
                     val result = UpdateRepository(context).downloadAndVerify(
                         auth = auth,
                         socksListen = socksListen,
-                        activeTransportOverride = activeTransport,
                     ) { downloaded, total ->
                         if (progressThrottle.shouldPublish(downloaded, total)) {
                             postOrRun(mainHandler) {

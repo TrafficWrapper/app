@@ -11,8 +11,6 @@ class UpdateRepository(private val context: Context) {
     fun check(
         auth: AuthUiState,
         socksListen: String,
-        allowProvisioningFallback: Boolean = false,
-        activeTransportOverride: String? = null,
     ): UpdateCheckOutcome {
         val directEnabled = TransportLifecycleStore.directUpdateFallbackEnabled(context)
         val tunnelViable = auth.authorized && socksListen.isNotBlank()
@@ -49,8 +47,6 @@ class UpdateRepository(private val context: Context) {
     fun downloadAndVerify(
         auth: AuthUiState,
         socksListen: String,
-        allowProvisioningFallback: Boolean = false,
-        activeTransportOverride: String? = null,
         onProgress: (downloadedBytes: Long, totalBytes: Long) -> Unit = { _, _ -> },
     ): UpdateCheckOutcome {
         val directEnabled = TransportLifecycleStore.directUpdateFallbackEnabled(context)
@@ -155,7 +151,6 @@ class UpdateRepository(private val context: Context) {
         tunnelViable: Boolean,
         directEnabled: Boolean,
     ): List<UpdateEndpoint> {
-        val urls = linkedSetOf<String>()
         if (tunnelViable) {
             return publicUpdateEndpoints(
                 routeParams = TransportRuntime.publicPlatformRouteSlots.orderedRoutes.map { it.route.params },
