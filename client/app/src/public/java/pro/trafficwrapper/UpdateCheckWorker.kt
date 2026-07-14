@@ -1,6 +1,8 @@
 package pro.trafficwrapper
 
 import android.content.Context
+import android.content.pm.ServiceInfo
+import android.util.Log
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ForegroundInfo
@@ -44,7 +46,7 @@ class UpdateCheckWorker(
             .format(Date())
         when (outcome.status) {
             UpdateCheckStatus.AVAILABLE -> {
-                TransportRuntime.updates = updateStateFromOutcome(
+                val availableState = updateStateFromOutcome(
                     outcome = outcome,
                     checkedAt = checkedAt,
                     showSheet = false,
@@ -62,8 +64,15 @@ class UpdateCheckWorker(
                         mandatory = mandatory,
                     )
                 ) {
-                    downloadAvailableUpdate(auth, socksListen, transport.activeTransport, checkedAt)
+                    downloadAvailableUpdate(
+                        auth = auth,
+                        socksListen = socksListen,
+                        activeTransport = transport.activeTransport,
+                        checkedAt = checkedAt,
+                        availableState = availableState,
+                    )
                 } else {
+                    TransportRuntime.updates = availableState
                     UpdateNotifications.showInstallStatus(
                         applicationContext,
                         R.string.update_notification_available,
@@ -85,13 +94,12 @@ class UpdateCheckWorker(
             }
 
             UpdateCheckStatus.ERROR -> {
-                if (outcome.mandatoryDegraded) {
-                    TransportRuntime.updates = updateStateFromOutcome(
-                        outcome = outcome,
-                        checkedAt = checkedAt,
-                        showSheet = false,
-                    )
-                }
+                TransportRuntime.updates = backgroundUpdateErrorState(outcome, checkedAt)
+                Log.w(
+                    LOG_TAG,
+                    "background update check failed " +
+                        "errorRes=${outcome.errorTextRes} mandatoryDegraded=${outcome.mandatoryDegraded}",
+                )
             }
         }
         return Result.success()
@@ -102,50 +110,100 @@ class UpdateCheckWorker(
         socksListen: String,
         activeTransport: String,
         checkedAt: String,
+        availableState: DistributionUiState,
     ) {
-        setForegroundAsync(
-            ForegroundInfo(
-                AUTO_DOWNLOAD_NOTIFICATION_ID,
-                UpdateNotifications.downloadForegroundNotification(applicationContext),
-            ),
-        ).get()
-        TransportRuntime.updates = TransportRuntime.updates.copy(
-            inProgress = true,
-            downloadInProgress = true,
-            statusTextRes = R.string.update_status_downloading,
-            errorTextRes = null,
-            downloadedBytes = 0,
-        )
-        val result = UpdateRepository(applicationContext).downloadAndVerify(
-            auth = auth,
-            socksListen = socksListen,
-            allowProvisioningFallback = false,
-            activeTransportOverride = activeTransport,
-        ) { downloaded, total ->
-            TransportRuntime.updates = TransportRuntime.updates.copy(
-                downloadedBytes = downloaded,
-                totalBytes = total,
+        if (!sharedUpdateDownloadGuard.tryAcquire()) {
+            Log.i(LOG_TAG, "background update download skipped: another download owns the guard")
+            return
+        }
+        try {
+            TransportRuntime.updates = availableState.copy(
+                inProgress = true,
+                downloadInProgress = true,
+                statusTextRes = R.string.update_status_downloading,
+                errorTextRes = null,
+                downloadedBytes = 0,
             )
-            if (total > 0) {
-                UpdateNotifications.showDownloadProgress(applicationContext, downloaded, total)
+            tryForegroundPromotion(
+                promote = {
+                    setForegroundAsync(
+                        ForegroundInfo(
+                            AUTO_DOWNLOAD_NOTIFICATION_ID,
+                            UpdateNotifications.downloadForegroundNotification(applicationContext),
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                        ),
+                    ).get()
+                },
+                onFailure = { error ->
+                    Log.w(
+                        LOG_TAG,
+                        "background update foreground promotion failed; continuing without FGS",
+                        error,
+                    )
+                },
+            )
+            val progressThrottle = UpdateProgressThrottle()
+            val result = UpdateRepository(applicationContext).downloadAndVerify(
+                auth = auth,
+                socksListen = socksListen,
+                allowProvisioningFallback = false,
+                activeTransportOverride = activeTransport,
+            ) { downloaded, total ->
+                if (progressThrottle.shouldPublish(downloaded, total)) {
+                    TransportRuntime.updates = TransportRuntime.updates.copy(
+                        downloadedBytes = downloaded,
+                        totalBytes = total,
+                    )
+                    if (total > 0) {
+                        showDownloadProgressSafely(downloaded, total)
+                    }
+                }
+            }
+            TransportRuntime.updates = updateStateFromOutcome(
+                outcome = result,
+                checkedAt = checkedAt,
+                showSheet = false,
+            ).copy(inProgress = false, downloadInProgress = false)
+            if (result.status == UpdateCheckStatus.AVAILABLE && result.apkFile != null) {
+                showInstallStatusSafely(R.string.update_notification_ready)
+            } else if (result.status == UpdateCheckStatus.ERROR) {
+                showInstallStatusSafely(result.errorTextRes ?: R.string.update_error_unknown)
+            }
+        } catch (error: Throwable) {
+            Log.w(LOG_TAG, "background update download failed", error)
+            TransportRuntime.updates = failedUpdateDownloadState(TransportRuntime.updates)
+            showInstallStatusSafely(R.string.update_notification_available)
+        } finally {
+            try {
+                clearDownloadNotificationSafely()
+                TransportRuntime.updates = finishedUpdateDownloadState(TransportRuntime.updates)
+            } finally {
+                sharedUpdateDownloadGuard.release()
             }
         }
-        UpdateNotifications.clearDownload(applicationContext)
-        TransportRuntime.updates = updateStateFromOutcome(
-            outcome = result,
-            checkedAt = checkedAt,
-            showSheet = false,
-        ).copy(inProgress = false, downloadInProgress = false)
-        if (result.status == UpdateCheckStatus.AVAILABLE && result.apkFile != null) {
-            UpdateNotifications.showInstallStatus(
-                applicationContext,
-                R.string.update_notification_ready,
-            )
-        } else if (result.status == UpdateCheckStatus.ERROR) {
-            UpdateNotifications.showInstallStatus(
-                applicationContext,
-                result.errorTextRes ?: R.string.update_error_unknown,
-            )
+    }
+
+    private fun showDownloadProgressSafely(downloaded: Long, total: Long) {
+        try {
+            UpdateNotifications.showDownloadProgress(applicationContext, downloaded, total)
+        } catch (error: Throwable) {
+            Log.w(LOG_TAG, "background update progress notification failed", error)
+        }
+    }
+
+    private fun showInstallStatusSafely(textRes: Int) {
+        try {
+            UpdateNotifications.showInstallStatus(applicationContext, textRes)
+        } catch (error: Throwable) {
+            Log.w(LOG_TAG, "background update status notification failed", error)
+        }
+    }
+
+    private fun clearDownloadNotificationSafely() {
+        try {
+            UpdateNotifications.clearDownload(applicationContext)
+        } catch (error: Throwable) {
+            Log.w(LOG_TAG, "background update progress notification cleanup failed", error)
         }
     }
 
@@ -174,5 +232,6 @@ class UpdateCheckWorker(
         private const val REPEAT_INTERVAL_HOURS = 12L
         private const val FLEX_INTERVAL_HOURS = 2L
         private const val AUTO_DOWNLOAD_NOTIFICATION_ID = 1403
+        private const val LOG_TAG = "TWPublicUpdate"
     }
 }

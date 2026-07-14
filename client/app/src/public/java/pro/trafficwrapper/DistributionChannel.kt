@@ -332,50 +332,115 @@ object DistributionChannel {
     }
 
     private fun performUpdateDownloadAndInstall(context: Context, auth: AuthUiState, socksListen: String) {
-        TransportRuntime.updates = TransportRuntime.updates.copy(
-            inProgress = true,
-            downloadInProgress = true,
-            statusTextRes = R.string.update_status_downloading,
-            errorTextRes = null,
-            downloadedBytes = 0,
-            apkPath = "",
-            showAvailableSheet = false,
-            installInProgress = false,
-            installStatusTextRes = null,
-            installErrorTextRes = null,
-        )
-        updateExecutor.execute {
-            val mainHandler = Handler(Looper.getMainLooper())
-            val activeTransport = TransportRuntime.state.activeTransport
-            val result = UpdateRepository(context).downloadAndVerify(
-                auth = auth,
-                socksListen = socksListen,
-                activeTransportOverride = activeTransport,
-            ) { downloaded, total ->
-                mainHandler.post {
-                    TransportRuntime.updates = TransportRuntime.updates.copy(
-                        downloadedBytes = downloaded,
-                        totalBytes = total,
-                    )
-                }
-                if (total > 0) {
-                    UpdateNotifications.showDownloadProgress(context, downloaded, total)
+        if (!sharedUpdateDownloadGuard.tryAcquire()) {
+            Log.i(LOG_TAG, "manual update download skipped: another download owns the guard")
+            return
+        }
+        try {
+            TransportRuntime.updates = TransportRuntime.updates.copy(
+                inProgress = true,
+                downloadInProgress = true,
+                statusTextRes = R.string.update_status_downloading,
+                errorTextRes = null,
+                downloadedBytes = 0,
+                apkPath = "",
+                showAvailableSheet = false,
+                installInProgress = false,
+                installStatusTextRes = null,
+                installErrorTextRes = null,
+            )
+            updateExecutor.execute {
+                val mainHandler = Handler(Looper.getMainLooper())
+                try {
+                    val activeTransport = TransportRuntime.state.activeTransport
+                    val progressThrottle = UpdateProgressThrottle()
+                    val result = UpdateRepository(context).downloadAndVerify(
+                        auth = auth,
+                        socksListen = socksListen,
+                        activeTransportOverride = activeTransport,
+                    ) { downloaded, total ->
+                        if (progressThrottle.shouldPublish(downloaded, total)) {
+                            postOrRun(mainHandler) {
+                                TransportRuntime.updates = TransportRuntime.updates.copy(
+                                    downloadedBytes = downloaded,
+                                    totalBytes = total,
+                                )
+                            }
+                            if (total > 0) {
+                                showDownloadProgressSafely(context, downloaded, total)
+                            }
+                        }
+                    }
+                    val checkedAt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+                        .format(Date())
+                    postOrRun(mainHandler) {
+                        val nextState = updateStateFromOutcome(
+                            outcome = result,
+                            checkedAt = checkedAt,
+                            showSheet = false,
+                        ).copy(inProgress = false, downloadInProgress = false)
+                        TransportRuntime.updates = nextState
+                        if (result.status == UpdateCheckStatus.AVAILABLE && nextState.apkPath.isNotBlank()) {
+                            startUpdateInstall(context, nextState)
+                        }
+                    }
+                } catch (error: Throwable) {
+                    Log.w(LOG_TAG, "manual update download failed", error)
+                    postOrRun(mainHandler) {
+                        TransportRuntime.updates = failedUpdateDownloadState(TransportRuntime.updates)
+                        showInstallStatusSafely(context, R.string.update_notification_available)
+                    }
+                } finally {
+                    clearDownloadNotificationSafely(context)
+                    try {
+                        postOrRun(mainHandler) {
+                            try {
+                                TransportRuntime.updates = finishedUpdateDownloadState(TransportRuntime.updates)
+                            } finally {
+                                sharedUpdateDownloadGuard.release()
+                            }
+                        }
+                    } catch (error: Throwable) {
+                        sharedUpdateDownloadGuard.release()
+                        Log.w(LOG_TAG, "manual update download cleanup failed", error)
+                    }
                 }
             }
+        } catch (error: Throwable) {
+            sharedUpdateDownloadGuard.release()
+            Log.w(LOG_TAG, "manual update download could not start", error)
+            TransportRuntime.updates = failedUpdateDownloadState(TransportRuntime.updates)
+            showInstallStatusSafely(context, R.string.update_notification_available)
+        }
+    }
+
+    private fun postOrRun(handler: Handler, action: () -> Unit) {
+        if (!handler.post(action)) {
+            action()
+        }
+    }
+
+    private fun showDownloadProgressSafely(context: Context, downloaded: Long, total: Long) {
+        try {
+            UpdateNotifications.showDownloadProgress(context, downloaded, total)
+        } catch (error: Throwable) {
+            Log.w(LOG_TAG, "manual update progress notification failed", error)
+        }
+    }
+
+    private fun showInstallStatusSafely(context: Context, textRes: Int) {
+        try {
+            UpdateNotifications.showInstallStatus(context, textRes)
+        } catch (error: Throwable) {
+            Log.w(LOG_TAG, "manual update status notification failed", error)
+        }
+    }
+
+    private fun clearDownloadNotificationSafely(context: Context) {
+        try {
             UpdateNotifications.clearDownload(context)
-            val checkedAt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
-                .format(Date())
-            mainHandler.post {
-                val nextState = updateStateFromOutcome(
-                    outcome = result,
-                    checkedAt = checkedAt,
-                    showSheet = false,
-                ).copy(inProgress = false, downloadInProgress = false)
-                TransportRuntime.updates = nextState
-                if (result.status == UpdateCheckStatus.AVAILABLE && nextState.apkPath.isNotBlank()) {
-                    startUpdateInstall(context, nextState)
-                }
-            }
+        } catch (error: Throwable) {
+            Log.w(LOG_TAG, "manual update progress notification cleanup failed", error)
         }
     }
 
