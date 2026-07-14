@@ -152,9 +152,6 @@ class UpdateCheckWorker(
                         downloadedBytes = downloaded,
                         totalBytes = total,
                     )
-                    if (total > 0) {
-                        showDownloadProgressSafely(downloaded, total)
-                    }
                 }
             }
             TransportRuntime.updates = updateStateFromOutcome(
@@ -178,14 +175,6 @@ class UpdateCheckWorker(
             } finally {
                 downloadLease.release()
             }
-        }
-    }
-
-    private fun showDownloadProgressSafely(downloaded: Long, total: Long) {
-        try {
-            UpdateNotifications.showDownloadProgress(applicationContext, downloaded, total)
-        } catch (error: Throwable) {
-            Log.w(LOG_TAG, "background update progress notification failed", error)
         }
     }
 
