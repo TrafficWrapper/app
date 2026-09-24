@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -46,9 +47,24 @@ type publicDeviceEnrollAPIRequest struct {
 	IdentityKeyType string `json:"identity_key_type,omitempty"`
 	EnrollmentNonce string `json:"enrollment_nonce,omitempty"`
 	ClientVersion   string `json:"client_version,omitempty"`
-	AWGPrivateKey   string `json:"awg_private_key,omitempty"`
-	AWGPublicKey    string `json:"awg_public_key,omitempty"`
-	TimeoutSeconds  int64  `json:"timeout_seconds,omitempty"`
+	// ClientVersionCode and ClientCapabilities are passed through to the
+	// orchestrator so it can gate newer AWG profiles / Reality flows per
+	// client build. Both are optional.
+	ClientVersionCode  int64    `json:"client_version_code,omitempty"`
+	ClientCapabilities []string `json:"client_capabilities,omitempty"`
+	AWGPrivateKey      string   `json:"awg_private_key,omitempty"`
+	AWGPublicKey       string   `json:"awg_public_key,omitempty"`
+	TimeoutSeconds     int64    `json:"timeout_seconds,omitempty"`
+}
+
+// publicAWGProfileCredentials is the per-profile device AWG record the
+// orchestrator issues (orchestrator store.go deviceAWGProfile), keyed by the
+// worker AWG profile name. EndpointV6 is an optional client-side override.
+type publicAWGProfileCredentials struct {
+	AWGPublicKey string `json:"awg_public_key,omitempty"`
+	InternalIP   string `json:"internal_ip,omitempty"`
+	PSK2         string `json:"psk2,omitempty"`
+	EndpointV6   string `json:"endpoint_v6,omitempty"`
 }
 
 type publicDeviceEnrollAPIResult struct {
@@ -64,6 +80,16 @@ type publicDeviceEnrollAPIResult struct {
 	ClientBundle    json.RawMessage `json:"client_bundle,omitempty"`
 	AWGPrivateKey   string          `json:"awg_private_key,omitempty"`
 	AWGPublicKey    string          `json:"awg_public_key,omitempty"`
+	publicEnrollExtras
+}
+
+// publicEnrollExtras are optional enrollment fields passed through verbatim
+// from the orchestrator response to the platform layer. RealityFlow is a
+// pointer so an explicit "" (flow disabled) survives while an absent field
+// stays absent.
+type publicEnrollExtras struct {
+	AWGProfiles map[string]publicAWGProfileCredentials `json:"awg_profiles,omitempty"`
+	RealityFlow *string                                `json:"reality_flow,omitempty"`
 }
 
 type publicDeviceEnrollWireRequest struct {
@@ -77,6 +103,9 @@ type publicDeviceEnrollWireRequest struct {
 	EnrollmentNonce string `json:"enrollment_nonce,omitempty"`
 	ClientVersion   string `json:"client_version,omitempty"`
 	AWGPublicKey    string `json:"awg_public_key,omitempty"`
+
+	ClientVersionCode  int64    `json:"client_version_code,omitempty"`
+	ClientCapabilities []string `json:"client_capabilities,omitempty"`
 }
 
 type publicDeviceEnrollWireResponse struct {
@@ -90,6 +119,7 @@ type publicDeviceEnrollWireResponse struct {
 	ServerAWGPublic string          `json:"server_awg_public,omitempty"`
 	SignerPublicKey string          `json:"signer_public_key,omitempty"`
 	ClientBundle    json.RawMessage `json:"client_bundle,omitempty"`
+	publicEnrollExtras
 }
 
 type publicNoiseStartRequest struct {
@@ -116,16 +146,20 @@ type publicNoiseEnvelopeResponse struct {
 }
 
 type publicApplyAPIRequest struct {
-	AWGPrivateKey    string           `json:"awg_private_key"`
-	InternalIP       string           `json:"internal_ip"`
-	PSK2             string           `json:"psk2"`
-	ServerAWGPublic  string           `json:"server_awg_public"`
-	DNSServers       []string         `json:"dns_servers,omitempty"`
-	AWGRU            *publicRouteSpec `json:"awg_ru,omitempty"`
-	AWG              *publicRouteSpec `json:"awg,omitempty"`
-	AWGRUSOCKSListen string           `json:"awg_ru_socks_listen,omitempty"`
-	SOCKSListen      string           `json:"socks_listen,omitempty"`
-	MTU              int              `json:"mtu,omitempty"`
+	AWGPrivateKey   string   `json:"awg_private_key"`
+	InternalIP      string   `json:"internal_ip"`
+	PSK2            string   `json:"psk2"`
+	ServerAWGPublic string   `json:"server_awg_public"`
+	DNSServers      []string `json:"dns_servers,omitempty"`
+	// AWGProfiles holds per-profile device credentials from enrollment; a
+	// route naming a profile present here uses its internal_ip/psk2 instead
+	// of the top-level ones.
+	AWGProfiles      map[string]publicAWGProfileCredentials `json:"awg_profiles,omitempty"`
+	AWGRU            *publicRouteSpec                       `json:"awg_ru,omitempty"`
+	AWG              *publicRouteSpec                       `json:"awg,omitempty"`
+	AWGRUSOCKSListen string                                 `json:"awg_ru_socks_listen,omitempty"`
+	SOCKSListen      string                                 `json:"socks_listen,omitempty"`
+	MTU              int                                    `json:"mtu,omitempty"`
 	// RendezvousPublicKey, when set, pins (or rotates) the minisign key that
 	// ApplyDiscoveredEndpoints verifies rendezvous bundles against. It must
 	// come from the verified client config (discovery_pubkey), not from the
@@ -150,6 +184,14 @@ type publicRouteSpec struct {
 	PublicKey string          `json:"public_key,omitempty"`
 	Dialect   json.RawMessage `json:"dialect,omitempty"`
 	AWGPreset json.RawMessage `json:"awg_preset,omitempty"`
+	// Profile / AWGProfile name the worker AWG profile (awg_profile wins).
+	Profile    string `json:"profile,omitempty"`
+	AWGProfile string `json:"awg_profile,omitempty"`
+	// EndpointV6 is "[addr]:port"; used when IPFamily is "v6".
+	EndpointV6 string `json:"endpoint_v6,omitempty"`
+	IPFamily   string `json:"ip_family,omitempty"`
+	// DNS overrides dns_servers for this route when it has non-blank values.
+	DNS []string `json:"dns,omitempty"`
 }
 
 // PublicDeviceEnroll performs public-platform device enrollment over the
@@ -223,6 +265,9 @@ func publicDeviceEnroll(req publicDeviceEnrollAPIRequest) (publicDeviceEnrollAPI
 			EnrollmentNonce: req.EnrollmentNonce,
 			ClientVersion:   req.ClientVersion,
 			AWGPublicKey:    awgPublic,
+
+			ClientVersionCode:  req.ClientVersionCode,
+			ClientCapabilities: req.ClientCapabilities,
 		},
 		&wireResp,
 	)
@@ -244,6 +289,8 @@ func publicDeviceEnroll(req publicDeviceEnrollAPIRequest) (publicDeviceEnrollAPI
 		ClientBundle:    wireResp.ClientBundle,
 		AWGPrivateKey:   awgPrivate,
 		AWGPublicKey:    awgPublic,
+
+		publicEnrollExtras: wireResp.publicEnrollExtras,
 	}, nil
 }
 
@@ -438,20 +485,22 @@ func applyPublicPlatformConfig(req publicApplyAPIRequest) (publicApplyAPIResult,
 		req.AWGRUSOCKSListen = defaultAWGRUSOCKSListen
 	}
 	var defaultConfigJSON string
+	var defaultMeta provisionedConfigMeta
 	if req.AWG != nil {
-		raw, err := publicAWGConfigJSON(req.AWG, req, req.SOCKSListen)
+		raw, meta, err := publicAWGConfigJSON(req.AWG, req, req.SOCKSListen)
 		if err != nil {
 			return publicApplyAPIResult{}, fmt.Errorf("public awg config: %w", err)
 		}
-		defaultConfigJSON = raw
+		defaultConfigJSON, defaultMeta = raw, meta
 	}
 	var awgRUConfigJSON string
+	var awgRUMeta provisionedConfigMeta
 	if req.AWGRU != nil {
-		raw, err := publicAWGConfigJSON(req.AWGRU, req, req.AWGRUSOCKSListen)
+		raw, meta, err := publicAWGConfigJSON(req.AWGRU, req, req.AWGRUSOCKSListen)
 		if err != nil {
 			return publicApplyAPIResult{}, fmt.Errorf("public awg-ru config: %w", err)
 		}
-		awgRUConfigJSON = raw
+		awgRUConfigJSON, awgRUMeta = raw, meta
 	}
 	if strings.TrimSpace(req.RendezvousPublicKey) != "" {
 		// Replace is allowed: this request carries the currently verified
@@ -465,9 +514,11 @@ func applyPublicPlatformConfig(req publicApplyAPIRequest) (publicApplyAPIResult,
 	pendingProvision.Lock()
 	if defaultConfigJSON != "" {
 		pendingProvision.configJSON = defaultConfigJSON
+		pendingProvision.configMeta = defaultMeta
 	}
 	if awgRUConfigJSON != "" {
 		pendingProvision.awgRUConfigJSON = awgRUConfigJSON
+		pendingProvision.awgRUConfigMeta = awgRUMeta
 	}
 	pendingProvision.Unlock()
 	return publicApplyAPIResult{
@@ -477,32 +528,125 @@ func applyPublicPlatformConfig(req publicApplyAPIRequest) (publicApplyAPIResult,
 	}, nil
 }
 
-func publicAWGConfigJSON(route *publicRouteSpec, req publicApplyAPIRequest, socksListen string) (string, error) {
-	endpoint := strings.TrimSpace(route.Endpoint)
-	if endpoint == "" && route.Address != "" && route.Port > 0 {
-		endpoint = fmt.Sprintf("%s:%d", route.Address, route.Port)
+func publicAWGConfigJSON(route *publicRouteSpec, req publicApplyAPIRequest, socksListen string) (string, provisionedConfigMeta, error) {
+	profile := route.profileName()
+	internalIP, psk2 := req.InternalIP, req.PSK2
+	var profileCreds *publicAWGProfileCredentials
+	if !isBaseAWGProfile(profile) {
+		if creds, ok := req.AWGProfiles[profile]; ok {
+			if strings.TrimSpace(creds.InternalIP) == "" || strings.TrimSpace(creds.PSK2) == "" {
+				return "", provisionedConfigMeta{}, fmt.Errorf("awg_profiles[%q] credentials are incomplete", profile)
+			}
+			internalIP, psk2 = strings.TrimSpace(creds.InternalIP), strings.TrimSpace(creds.PSK2)
+			profileCreds = &creds
+		}
 	}
-	endpoint = endpointUsingPinnedIP(endpoint, route.egressIP())
+	endpoint, v6, err := route.endpointFor(profileCreds)
+	if err != nil {
+		return "", provisionedConfigMeta{}, err
+	}
 	serverKey := strings.TrimSpace(route.PublicKey)
 	if serverKey == "" {
 		serverKey = req.ServerAWGPublic
 	}
 	presetValue, err := route.preset()
 	if err != nil {
-		return "", err
+		return "", provisionedConfigMeta{}, err
+	}
+	dnsServers, err := route.dnsServers(req.DNSServers)
+	if err != nil {
+		return "", provisionedConfigMeta{}, err
 	}
 	cfg := config{
 		PrivateKey:      req.AWGPrivateKey,
-		InternalIP:      req.InternalIP,
+		InternalIP:      internalIP,
 		Endpoint:        endpoint,
 		ServerPublicKey: serverKey,
-		PSK2:            req.PSK2,
+		PSK2:            psk2,
 		AWGPreset:       presetValue,
 		SOCKSListen:     socksListen,
 		MTU:             req.MTU,
-		DNSServers:      req.DNSServers,
+		DNSServers:      dnsServers,
 	}
-	return validatedConfigJSON(cfg)
+	raw, err := validatedConfigJSON(cfg)
+	if err != nil {
+		return "", provisionedConfigMeta{}, err
+	}
+	return raw, provisionedConfigMeta{profile: profile, v6: v6}, nil
+}
+
+// profileName returns the worker AWG profile this route targets; awg_profile
+// wins over the older profile key.
+func (r *publicRouteSpec) profileName() string {
+	if value := strings.TrimSpace(r.AWGProfile); value != "" {
+		return value
+	}
+	return strings.TrimSpace(r.Profile)
+}
+
+// isBaseAWGProfile reports whether a profile name means the worker's base AWG
+// inbound, which uses the top-level device credentials.
+func isBaseAWGProfile(profile string) bool {
+	return profile == "" || profile == "awg"
+}
+
+// endpointFor picks the peer endpoint: the IPv6 one when ip_family is "v6"
+// and an IPv6 endpoint is known (a per-profile endpoint_v6 wins over the
+// route's), otherwise the IPv4 endpoint. The bool reports an IPv6 choice.
+func (r *publicRouteSpec) endpointFor(profile *publicAWGProfileCredentials) (string, bool, error) {
+	if strings.EqualFold(strings.TrimSpace(r.IPFamily), "v6") {
+		v6 := strings.TrimSpace(r.EndpointV6)
+		if profile != nil && strings.TrimSpace(profile.EndpointV6) != "" {
+			v6 = strings.TrimSpace(profile.EndpointV6)
+		}
+		if v6 != "" {
+			endpoint, err := r.normalizeEndpointV6(v6)
+			if err != nil {
+				return "", false, err
+			}
+			return endpoint, true, nil
+		}
+	}
+	endpoint := strings.TrimSpace(r.Endpoint)
+	if endpoint == "" && r.Address != "" && r.Port > 0 {
+		endpoint = net.JoinHostPort(strings.Trim(strings.TrimSpace(r.Address), "[]"), strconv.Itoa(r.Port))
+	}
+	return endpointUsingPinnedIP(endpoint, r.egressIP()), false, nil
+}
+
+// normalizeEndpointV6 accepts "[addr]:port" (the worker's format) or a bare
+// IPv6 address combined with the route port.
+func (r *publicRouteSpec) normalizeEndpointV6(value string) (string, error) {
+	if ap, err := netip.ParseAddrPort(value); err == nil {
+		if !ap.Addr().Is6() || ap.Addr().Is4In6() || ap.Port() == 0 {
+			return "", fmt.Errorf("endpoint_v6 %q must be an IPv6 [addr]:port", value)
+		}
+		return ap.String(), nil
+	}
+	if addr, err := netip.ParseAddr(strings.Trim(value, "[]")); err == nil && addr.Is6() && !addr.Is4In6() && r.Port > 0 && r.Port <= 65535 {
+		return netip.AddrPortFrom(addr, uint16(r.Port)).String(), nil
+	}
+	return "", fmt.Errorf("endpoint_v6 %q must be an IPv6 [addr]:port", value)
+}
+
+// dnsServers returns the route's own DNS servers when it lists any non-blank
+// value (all must be IP literals), otherwise the request-wide fallback.
+func (r *publicRouteSpec) dnsServers(fallback []string) ([]string, error) {
+	out := make([]string, 0, len(r.DNS))
+	for _, value := range r.DNS {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, err := netip.ParseAddr(value); err != nil {
+			return nil, fmt.Errorf("route dns %q is not an IP address", value)
+		}
+		out = append(out, value)
+	}
+	if len(out) == 0 {
+		return fallback, nil
+	}
+	return out, nil
 }
 
 func endpointUsingPinnedIP(endpoint string, ip string) string {

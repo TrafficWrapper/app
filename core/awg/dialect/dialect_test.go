@@ -168,3 +168,58 @@ func TestUAPILinesNeverContainNewlines(t *testing.T) {
 		t.Fatalf("expected canonical h1=%s, got %v", h1, got)
 	}
 }
+
+func TestValidateAcceptsLegacyAndRejectsOutOfRangeJunk(t *testing.T) {
+	legacy, err := Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Jmin != 8 || legacy.Jc < 4 || legacy.Jc > 12 || legacy.Jmax < 40 || legacy.Jmax > 80 {
+		t.Fatalf("legacy generator left its compatible ranges: %+v", legacy)
+	}
+	if err := ValidateProduction(legacy, DefaultMTU); err != nil {
+		t.Fatalf("legacy dialect rejected: %v", err)
+	}
+	for _, mutate := range []func(*Dialect){
+		func(d *Dialect) { d.Jc = 2 },
+		func(d *Dialect) { d.Jc = 17 },
+		func(d *Dialect) { d.Jmin = 7 },
+		func(d *Dialect) { d.Jmin = 65 },
+		func(d *Dialect) { d.Jmax = d.Jmin },
+		func(d *Dialect) { d.Jmax = 265 },
+		func(d *Dialect) { d.Jmax = 39 },
+	} {
+		d := legacy
+		mutate(&d)
+		if err := ValidateProduction(d, DefaultMTU); err == nil {
+			t.Fatalf("accepted %+v", d)
+		}
+	}
+}
+
+func TestValidateAcceptsWideWorkerDialect(t *testing.T) {
+	base, err := Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ jc, jmin, jmax int }{
+		{3, 8, 40},
+		{16, 40, 200},
+		{16, 64, 264},
+		{12, 8, 80},
+	} {
+		d := base
+		d.Jc, d.Jmin, d.Jmax = c.jc, c.jmin, c.jmax
+		if err := Validate(d, DefaultMTU); err != nil {
+			t.Fatalf("wide dialect %+v rejected: %v", c, err)
+		}
+		if _, err := EffectiveMTU(DefaultMTU, d); err != nil {
+			t.Fatalf("effective mtu for %+v: %v", c, err)
+		}
+	}
+	d := base
+	d.Jc, d.Jmin, d.Jmax = 16, 64, 264
+	if err := ValidateProduction(d, 264); err == nil {
+		t.Fatal("jmax >= mtu accepted")
+	}
+}

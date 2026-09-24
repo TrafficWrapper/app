@@ -45,6 +45,25 @@ come from the dependency `github.com/amnezia-vpn/amneziawg-go` pseudo-version
 - `socks_listen` must be a loopback address; `socks_max_conns` caps concurrent
   SOCKS connections (default 1024). AWG `h1`..`h4` and the UAPI-bound config
   fields reject whitespace/control characters and line breaks.
+- `PublicDeviceEnroll` forwards the optional `client_capabilities` (string
+  array) and `client_version_code` (integer) to the orchestrator. The result
+  passes through `awg_profiles` (map of AWG profile name to
+  `{awg_public_key, internal_ip, psk2}`) and `reality_flow` (present, even
+  as `""`, only when the orchestrator sent it).
+- `ApplyPublicPlatformConfig` accepts `awg_profiles` in the same format. An
+  `awg` / `awg_ru` route may carry `awg_profile` (falls back to `profile`),
+  `endpoint_v6` (`"[addr]:port"`), `ip_family` (`"v4"` by default or `"v6"`)
+  and `dns` (IP list). A route whose profile is not `""`/`"awg"` and is present
+  in `awg_profiles` uses that profile's `internal_ip`/`psk2` (and its
+  `endpoint_v6`, if any); otherwise the top-level credentials. `"v6"` uses the
+  IPv6 endpoint when one is known, else the IPv4 endpoint. A non-blank route
+  `dns` replaces `dns_servers` for that config; a non-IP value fails the apply.
+- AWG dialects accept the wider worker ranges: `jc` 3..16, `jmin` 8..64,
+  `jmax` 40..264 (and `< mtu`), `jmin < jmax`; older dialects stay valid.
+- Rendezvous discovery only describes the base IPv4 AWG endpoint, so it does
+  not merge into a stored config built for another AWG profile or an IPv6
+  endpoint (with `base_config_json`: an IPv6 endpoint). Such a result is `ok`
+  with the unchanged `config_json` and `awg_merge_skipped: true`.
 - Errors that come from outside the Noise channel are prefixed with
   `unauthenticated server response:`, stripped of control characters and
   truncated to about 200 characters.

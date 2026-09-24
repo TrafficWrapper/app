@@ -579,11 +579,14 @@ func setPendingProvision(t *testing.T, configJSON, awgRUConfigJSON string) strin
 	t.Helper()
 	pendingProvision.Lock()
 	oldConfig, oldAWGRU := pendingProvision.configJSON, pendingProvision.awgRUConfigJSON
+	oldMeta, oldAWGRUMeta := pendingProvision.configMeta, pendingProvision.awgRUConfigMeta
 	pendingProvision.configJSON, pendingProvision.awgRUConfigJSON = configJSON, awgRUConfigJSON
+	pendingProvision.configMeta, pendingProvision.awgRUConfigMeta = provisionedConfigMeta{}, provisionedConfigMeta{}
 	pendingProvision.Unlock()
 	t.Cleanup(func() {
 		pendingProvision.Lock()
 		pendingProvision.configJSON, pendingProvision.awgRUConfigJSON = oldConfig, oldAWGRU
+		pendingProvision.configMeta, pendingProvision.awgRUConfigMeta = oldMeta, oldAWGRUMeta
 		pendingProvision.Unlock()
 	})
 	return configJSON
