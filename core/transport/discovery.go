@@ -12,8 +12,10 @@ import (
 const (
 	rendezvousNamespace = "rendezvous-v1"
 	rendezvousSchema    = 2
-	rendezvousPubkey    = ""
 )
+
+// discoveryLocalNow is the device clock; replaceable in tests.
+var discoveryLocalNow = time.Now
 
 var forbiddenDiscoveryKeys = map[string]struct{}{
 	"internal_ip":        {},
@@ -183,7 +185,17 @@ func validateDiscoveredBundle(bundle discoveredBundle, maxSeenSeq int64, now tim
 	if now.Before(issuedAt) {
 		return errors.New("rendezvous bundle is not issued yet")
 	}
-	if !now.Before(expiresAt) {
+	// The caller-supplied now (the mirror's Date header) is not signed and may
+	// be replayed alongside an old bundle, so expiry is checked against the
+	// later of it and the device clock: a bundle already expired locally is
+	// rejected even when the mirror claims an earlier time. The trade-off is
+	// that a device clock running far ahead rejects still-valid bundles; a
+	// device clock running behind is still corrected by the supplied now.
+	expiryNow := now
+	if local := discoveryLocalNow().UTC(); local.After(expiryNow) {
+		expiryNow = local
+	}
+	if !expiryNow.Before(expiresAt) {
 		return errors.New("rendezvous bundle expired")
 	}
 	return nil

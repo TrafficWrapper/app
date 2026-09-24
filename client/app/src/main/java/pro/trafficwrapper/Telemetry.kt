@@ -10,10 +10,9 @@ import android.util.Base64
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedInputStream
 import java.io.File
-import java.io.EOFException
 import java.io.InputStream
-import java.net.InetSocketAddress
 import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.Proxy
@@ -40,8 +39,17 @@ object Telemetry {
     private val lastDedupKeyAtMs = ConcurrentHashMap<String, Long>()
     private val secureRandom = SecureRandom()
     private val bootID = UUID.randomUUID().toString()
+    // Earliest time of the next regular (batched) flush; set to now + min interval after a success.
     private val nextFlushAtElapsedMs = AtomicLong(0)
+    // Error backoff: no flush attempt (not even a forced one) before this time.
+    private val backoffUntilElapsedMs = AtomicLong(0)
+    private val lastAttemptAtElapsedMs = AtomicLong(0)
+    // Lines currently in the spool file; -1 until counted once. Touched only on the io thread.
+    private val spoolLineCount = AtomicLong(-1)
     private val backoffMs = AtomicLong(BACKOFF_MIN_MS)
+
+    @Volatile
+    private var identityStore: SecureIdentityStore? = null
     private val effectiveMaxBatchBytes = AtomicLong(TELEMETRY_MAX_BATCH_BYTES.toLong())
     private val seq = AtomicLong(SEQ_UNINITIALIZED)
     private val seqLock = Any()
@@ -68,13 +76,19 @@ object Telemetry {
                     fields = safeFields,
                 ),
             )
-            Log.i(LOG_TAG, "telemetry queued kind=$safeKind")
+            if (BuildConfig.DEBUG) {
+                Log.d(LOG_TAG, "telemetry queued kind=$safeKind")
+            }
             io.execute { maybeFlush(context.applicationContext, force = false) }
         }.onFailure { error ->
             Log.w(LOG_TAG, "telemetry enqueue failed: ${safeErrorMessage(error)}")
         }
     }
 
+    /**
+     * Requests a flush of spooled events. Rate limited: at most one attempt per
+     * [FORCE_FLUSH_MIN_INTERVAL_MS] and never during an error backoff.
+     */
     fun flush(context: Context) {
         if (!enabled(context)) return
         runCatching {
@@ -89,6 +103,7 @@ object Telemetry {
             queue.clear()
             val dir = telemetryDir(context.applicationContext)
             File(dir, SPOOL_FILE_NAME).delete()
+            spoolLineCount.set(0)
             Log.i(LOG_TAG, "telemetry local queue/spool cleared")
         }
     }
@@ -126,80 +141,131 @@ object Telemetry {
             if (!enabled(context)) return
             appendQueueToSpool(context)
             val nowElapsed = SystemClock.elapsedRealtime()
-            if (!force && nowElapsed < nextFlushAtElapsedMs.get()) return
-            val spool = spoolFile(context)
-            val lines = if (spool.exists()) spool.readLines(Charsets.UTF_8) else emptyList()
-            val batch = readBatch(lines, effectiveTelemetryMaxBatchBytes()) { events ->
-                estimatedTelemetryPayloadBytes(events)
-            }
-            if (batch.events.isEmpty()) {
-                if (batch.consumedLines > 0) {
-                    removeConsumedLines(spool, lines, batch.consumedLines)
+            val due = telemetryShouldFlush(
+                force = force,
+                nowMs = nowElapsed,
+                pendingEvents = pendingSpoolLines(context),
+                nextFlushAtMs = nextFlushAtElapsedMs.get(),
+                backoffUntilMs = backoffUntilElapsedMs.get(),
+                lastAttemptAtMs = lastAttemptAtElapsedMs.get(),
+            )
+            if (!due) return
+            lastAttemptAtElapsedMs.set(nowElapsed)
+            var batches = 0
+            while (batches < MAX_BATCHES_PER_FLUSH) {
+                batches++
+                when (flushOneBatch(context)) {
+                    BatchOutcome.SENT_MORE_PENDING -> continue
+                    BatchOutcome.RETRY_SMALLER -> continue
+                    BatchOutcome.DONE, BatchOutcome.FAILED -> break
                 }
-                return
-            }
-            val body = buildBody(context, batch.events)
-            val bodyString = body.toString()
-            val bodyBytes = bodyString.toByteArray(Charsets.UTF_8)
-            val endpointLabel = if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
-                PUBLIC_TELEMETRY_URL
-            } else {
-                BuildConfig.TELEMETRY_ENDPOINT
-            }
-            Log.i(LOG_TAG, "telemetry flush attempt events=${batch.events.size} endpoint=$endpointLabel")
-            val post = if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
-                postPublic(context, bodyBytes)
-            } else {
-                val endpoint = URL(BuildConfig.TELEMETRY_ENDPOINT)
-                val effectivePort = if (endpoint.port > 0) endpoint.port else endpoint.defaultPort
-                if (
-                    endpoint.protocol != "https" ||
-                    endpoint.host == "127.0.0.1" ||
-                    endpoint.host.equals("localhost", ignoreCase = true) ||
-                    effectivePort in BANNED_ENDPOINT_PORTS
-                ) {
-                    Log.w(LOG_TAG, "telemetry endpoint rejected: ${endpoint.protocol}://${endpoint.host}:$effectivePort")
-                    removeConsumedLines(spool, lines, batch.consumedLines)
-                    return
-                }
-                post(context, endpoint, bodyBytes)
-            }
-            if (post.httpCode in 200..299) {
-                removeConsumedLines(spool, lines, batch.consumedLines)
-                resetTelemetryBatchLimitAfterSuccess()
-                backoffMs.set(BACKOFF_MIN_MS)
-                nextFlushAtElapsedMs.set(0)
-                if (post.disableTelemetry) {
-                    TransportLifecycleStore.setTelemetryRemoteOff(context, true)
-                }
-                Log.i(LOG_TAG, "telemetry flush ok http=${post.httpCode} disable=${post.disableTelemetry}")
-            } else if (post.httpCode == HTTP_PAYLOAD_TOO_LARGE) {
-                val previousLimit = effectiveTelemetryMaxBatchBytes()
-                val nextLimit = shrinkTelemetryBatchLimitAfterPayloadTooLarge(previousLimit)
-                backoffMs.set(BACKOFF_MIN_MS)
-                if (nextLimit < previousLimit) {
-                    nextFlushAtElapsedMs.set(0)
-                    io.execute { maybeFlush(context, force = true) }
-                } else {
-                    scheduleBackoff("http_413")
-                }
-                Log.w(
-                    LOG_TAG,
-                    "telemetry payload too large http=413 batch_bytes=${bodyBytes.size} max_batch_bytes=$nextLimit retry=true",
-                )
-            } else if (isNonRetryableTelemetryHttpCode(post.httpCode)) {
-                removeConsumedLines(spool, lines, batch.consumedLines)
-                resetTelemetryBatchLimitAfterSuccess()
-                backoffMs.set(BACKOFF_MIN_MS)
-                nextFlushAtElapsedMs.set(0)
-                Log.w(LOG_TAG, "telemetry poison batch dropped http=${post.httpCode}")
-            } else {
-                scheduleBackoff("http_${post.httpCode}")
             }
         }.onFailure { error ->
             scheduleBackoff(errorKind(error))
             Log.w(LOG_TAG, "telemetry flush failed: ${safeErrorMessage(error)}")
         }
+    }
+
+    private enum class BatchOutcome {
+        DONE,
+        SENT_MORE_PENDING,
+        RETRY_SMALLER,
+        FAILED,
+    }
+
+    private fun flushOneBatch(context: Context): BatchOutcome {
+        val spool = spoolFile(context)
+        val lines = if (spool.exists()) spool.readLines(Charsets.UTF_8) else emptyList()
+        spoolLineCount.set(lines.size.toLong())
+        val batch = readBatch(lines, effectiveTelemetryMaxBatchBytes()) { event ->
+            estimatedTelemetryEventBytes(event)
+        }
+        if (batch.events.isEmpty()) {
+            if (batch.consumedLines > 0) {
+                removeConsumedLines(spool, lines, batch.consumedLines)
+            }
+            return BatchOutcome.DONE
+        }
+        val body = buildBody(context, batch.events)
+        val bodyBytes = body.toString().toByteArray(Charsets.UTF_8)
+        if (BuildConfig.DEBUG) {
+            Log.d(LOG_TAG, "telemetry flush attempt events=${batch.events.size}")
+        }
+        val post = if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
+            postPublic(context, bodyBytes)
+        } else {
+            val endpoint = URL(BuildConfig.TELEMETRY_ENDPOINT)
+            val effectivePort = if (endpoint.port > 0) endpoint.port else endpoint.defaultPort
+            if (
+                endpoint.protocol != "https" ||
+                endpoint.host == "127.0.0.1" ||
+                endpoint.host.equals("localhost", ignoreCase = true) ||
+                effectivePort in BANNED_ENDPOINT_PORTS
+            ) {
+                Log.w(LOG_TAG, "telemetry endpoint rejected")
+                removeConsumedLines(spool, lines, batch.consumedLines)
+                return BatchOutcome.FAILED
+            }
+            post(context, endpoint, bodyBytes)
+        }
+        val nowElapsed = SystemClock.elapsedRealtime()
+        return when (telemetryFlushDispositionForHttpCode(post.httpCode)) {
+            TelemetryFlushDisposition.SUCCESS -> {
+                val remaining = removeConsumedLines(spool, lines, batch.consumedLines)
+                resetTelemetryBatchLimitAfterSuccess()
+                backoffMs.set(BACKOFF_MIN_MS)
+                backoffUntilElapsedMs.set(0)
+                // Batching: the next regular flush waits for the minimum interval (or for enough
+                // events to accumulate), it is not re-armed immediately.
+                nextFlushAtElapsedMs.set(nowElapsed + FLUSH_MIN_INTERVAL_MS)
+                if (post.disableTelemetry) {
+                    TransportLifecycleStore.setTelemetryRemoteOff(context, true)
+                }
+                Log.i(LOG_TAG, "telemetry flush ok http=${post.httpCode} events=${batch.events.size} disable=${post.disableTelemetry}")
+                if (post.disableTelemetry || remaining < BATCH_LIMIT) BatchOutcome.DONE else BatchOutcome.SENT_MORE_PENDING
+            }
+            TelemetryFlushDisposition.SHRINK_RETRY -> {
+                val previousLimit = effectiveTelemetryMaxBatchBytes()
+                val nextLimit = shrinkTelemetryBatchLimitAfterPayloadTooLarge(previousLimit)
+                backoffMs.set(BACKOFF_MIN_MS)
+                Log.w(
+                    LOG_TAG,
+                    "telemetry payload too large http=413 batch_bytes=${bodyBytes.size} max_batch_bytes=$nextLimit",
+                )
+                if (nextLimit < previousLimit) {
+                    BatchOutcome.RETRY_SMALLER
+                } else {
+                    scheduleBackoff("http_413")
+                    BatchOutcome.FAILED
+                }
+            }
+            TelemetryFlushDisposition.DROP -> {
+                removeConsumedLines(spool, lines, batch.consumedLines)
+                resetTelemetryBatchLimitAfterSuccess()
+                backoffMs.set(BACKOFF_MIN_MS)
+                nextFlushAtElapsedMs.set(nowElapsed + FLUSH_MIN_INTERVAL_MS)
+                Log.w(LOG_TAG, "telemetry poison batch dropped http=${post.httpCode}")
+                BatchOutcome.DONE
+            }
+            TelemetryFlushDisposition.RETRY -> {
+                scheduleBackoff("http_${post.httpCode}")
+                BatchOutcome.FAILED
+            }
+        }
+    }
+
+    private fun pendingSpoolLines(context: Context): Int {
+        var count = spoolLineCount.get()
+        if (count < 0L) {
+            val spool = spoolFile(context)
+            count = if (spool.exists()) {
+                spool.bufferedReader(Charsets.UTF_8).useLines { lines -> lines.count().toLong() }
+            } else {
+                0L
+            }
+            spoolLineCount.set(count)
+        }
+        return count.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 
     private fun appendQueueToSpool(context: Context) {
@@ -209,56 +275,72 @@ object Telemetry {
             lines += event.toJson().toString()
         }
         if (lines.isEmpty()) return
+        val known = pendingSpoolLines(context)
         val spool = spoolFile(context)
         val dir = spool.parentFile
         if (dir != null && !dir.exists() && !dir.mkdirs()) return
         spool.appendText(lines.joinToString(separator = "\n", postfix = "\n"), Charsets.UTF_8)
+        spoolLineCount.set(known.toLong() + lines.size)
         trimSpool(spool)
     }
 
     private fun trimSpool(spool: File) {
         if (!spool.exists() || spool.length() <= SPOOL_MAX_BYTES) return
+        // Trim well below the cap so the file is not rewritten again on every following append.
         val lines = spool.readLines(Charsets.UTF_8)
         val kept = ArrayDeque<String>()
         var totalBytes = 0
         for (line in lines.asReversed()) {
             val lineBytes = line.toByteArray(Charsets.UTF_8).size + 1
-            if (totalBytes + lineBytes > SPOOL_MAX_BYTES && kept.isNotEmpty()) break
+            if (totalBytes + lineBytes > SPOOL_TRIM_TARGET_BYTES && kept.isNotEmpty()) break
             kept.addFirst(line)
             totalBytes += lineBytes
         }
         writeLinesAtomically(spool, kept.toList())
+        spoolLineCount.set(kept.size.toLong())
     }
 
+    /** Selects the next batch in O(n): payload size is accumulated per event, not recomputed. */
     private fun readBatch(
         lines: List<String>,
         maxPayloadBytes: Int,
-        payloadSizeBytes: (List<QueuedEvent>) -> Int,
+        eventSizeBytes: (QueuedEvent) -> Int,
     ): Batch {
         val events = mutableListOf<QueuedEvent>()
         var consumed = 0
+        var payloadBytes = TELEMETRY_BATCH_BASE_BYTES
         for (line in lines) {
             val event = parseQueuedEvent(line)
             if (event == null) {
                 consumed++
                 continue
             }
-            val candidate = events + event
-            val candidateBytes = payloadSizeBytes(candidate)
-            if (events.isNotEmpty() && candidateBytes > maxPayloadBytes) {
+            val eventBytes = eventSizeBytes(event)
+            if (events.isNotEmpty() && payloadBytes + eventBytes > maxPayloadBytes) {
                 break
             }
             consumed++
             events += event
+            payloadBytes += eventBytes
             if (events.size >= BATCH_LIMIT) break
         }
         return Batch(events = events, consumedLines = consumed)
     }
 
-    private fun removeConsumedLines(spool: File, lines: List<String>, consumedLines: Int) {
-        if (!spool.exists()) return
+    /** Rewrites the spool without the sent lines; returns the number of lines left. */
+    private fun removeConsumedLines(spool: File, lines: List<String>, consumedLines: Int): Int {
+        if (!spool.exists()) {
+            spoolLineCount.set(0)
+            return 0
+        }
         val remaining = lines.drop(consumedLines.coerceAtLeast(0))
-        writeLinesAtomically(spool, remaining)
+        if (remaining.isEmpty()) {
+            spool.delete()
+        } else {
+            writeLinesAtomically(spool, remaining)
+        }
+        spoolLineCount.set(remaining.size.toLong())
+        return remaining.size
     }
 
     private fun writeLinesAtomically(spool: File, lines: List<String>) {
@@ -445,8 +527,13 @@ object Telemetry {
             .putStringIfNotBlank("oem", snapshot.batteryHintOem)
             .putBooleanIfNotNull("restricted", snapshot.batteryHintRestricted)
 
+    private fun identityStore(context: Context): SecureIdentityStore =
+        identityStore ?: synchronized(this) {
+            identityStore ?: SecureIdentityStore(context.applicationContext).also { identityStore = it }
+        }
+
     private fun signedTelemetryHeaders(context: Context, bodyBytes: ByteArray): Map<String, String> {
-        val store = SecureIdentityStore(context)
+        val store = identityStore(context)
         val publicKey = store.deviceIdentityPublicKey()
         val deviceID = telemetryDeviceIDForPublicKey(publicKey)
         val ts = System.currentTimeMillis().toString()
@@ -528,7 +615,7 @@ object Telemetry {
             output.write(request)
             output.write(bodyBytes)
             output.flush()
-            val input = socket.getInputStream()
+            val input = BufferedInputStream(socket.getInputStream(), PUBLIC_HTTP_READ_BUFFER_BYTES)
             val header = readPublicHttpHeader(input)
             val statusLine = header.lineSequence().firstOrNull().orEmpty()
             val code = statusLine.split(' ').firstOrNull { it.toIntOrNull() != null }?.toIntOrNull() ?: 0
@@ -546,42 +633,15 @@ object Telemetry {
         }
     }
 
-    private fun openRouterSocks5Socket(targetHost: String, targetPort: Int, timeoutMs: Int): Socket {
-        val socket = Socket()
-        try {
-            socket.soTimeout = timeoutMs
-            socket.connect(InetSocketAddress(PUBLIC_ROUTER_HOST, PUBLIC_ROUTER_PORT), timeoutMs)
-            val input = socket.getInputStream()
-            val output = socket.getOutputStream()
-            output.write(byteArrayOf(SOCKS_VERSION.toByte(), 0x01, SOCKS_NO_AUTH.toByte()))
-            output.flush()
-            if (readSocksByte(input) != SOCKS_VERSION || readSocksByte(input) != SOCKS_NO_AUTH) {
-                error("bad router socks greeting")
-            }
-            val hostBytes = targetHost.toByteArray(Charsets.UTF_8)
-            if (hostBytes.size > BYTE_MASK) error("router target host is too long")
-            output.write(byteArrayOf(SOCKS_VERSION.toByte(), SOCKS_CONNECT.toByte(), 0x00, SOCKS_ATYP_DOMAIN.toByte(), hostBytes.size.toByte()))
-            output.write(hostBytes)
-            output.write(byteArrayOf(((targetPort ushr 8) and BYTE_MASK).toByte(), (targetPort and BYTE_MASK).toByte()))
-            output.flush()
-            if (readSocksByte(input) != SOCKS_VERSION) error("bad router socks response")
-            val reply = readSocksByte(input)
-            readSocksByte(input)
-            val atyp = readSocksByte(input)
-            if (reply != 0) error("router socks connect failed rep=$reply")
-            val bindLength = when (atyp) {
-                SOCKS_ATYP_IPV4 -> 4
-                SOCKS_ATYP_DOMAIN -> readSocksByte(input)
-                SOCKS_ATYP_IPV6 -> 16
-                else -> error("bad router socks bind atyp=$atyp")
-            }
-            readSocksExact(input, bindLength + 2)
-            return socket
-        } catch (error: Throwable) {
-            runCatching { socket.close() }
-            throw error
-        }
-    }
+    private fun openRouterSocks5Socket(targetHost: String, targetPort: Int, timeoutMs: Int): Socket =
+        openLocalSocks5Connection(
+            proxyHost = PUBLIC_ROUTER_HOST,
+            proxyPort = PUBLIC_ROUTER_PORT,
+            targetHost = targetHost,
+            targetPort = targetPort,
+            timeoutMs = timeoutMs,
+            credentials = LocalSocksAuth.internal,
+        )
 
     private fun readPublicHttpHeader(input: InputStream): String {
         val bytes = ArrayList<Byte>(1024)
@@ -601,25 +661,9 @@ object Telemetry {
         error("telemetry http header is too large")
     }
 
-    private fun readSocksByte(input: InputStream): Int {
-        val value = input.read()
-        if (value < 0) throw EOFException()
-        return value and BYTE_MASK
-    }
-
-    private fun readSocksExact(input: InputStream, size: Int) {
-        var remaining = size
-        val buffer = ByteArray(256)
-        while (remaining > 0) {
-            val read = input.read(buffer, 0, minOf(buffer.size, remaining))
-            if (read < 0) throw EOFException()
-            remaining -= read
-        }
-    }
-
     private fun scheduleBackoff(reason: String) {
         val delayMs = backoffMs.get()
-        nextFlushAtElapsedMs.set(SystemClock.elapsedRealtime() + delayMs)
+        backoffUntilElapsedMs.set(SystemClock.elapsedRealtime() + delayMs)
         backoffMs.set((delayMs * 2).coerceAtMost(BACKOFF_MAX_MS))
         Log.w(LOG_TAG, "telemetry backoff=${delayMs}ms reason=$reason")
     }
@@ -661,12 +705,37 @@ object Telemetry {
         effectiveMaxBatchBytes.set(TELEMETRY_MAX_BATCH_BYTES.toLong())
     }
 
+    private fun estimatedTelemetryEventBytes(event: QueuedEvent): Int =
+        event.toJson().toString().toByteArray(Charsets.UTF_8).size + TELEMETRY_EVENT_ENVELOPE_BYTES
+
     private fun estimatedTelemetryPayloadBytes(events: List<QueuedEvent>): Int =
-        TELEMETRY_BATCH_BASE_BYTES +
-            events.sumOf { it.toJson().toString().toByteArray(Charsets.UTF_8).size + TELEMETRY_EVENT_ENVELOPE_BYTES }
+        TELEMETRY_BATCH_BASE_BYTES + events.sumOf { estimatedTelemetryEventBytes(it) }
+
+    /**
+     * Batching policy. Regular flushes happen at most every [FLUSH_MIN_INTERVAL_MS] unless
+     * [FLUSH_EVENT_THRESHOLD] events are pending; forced flushes (backstop, lifecycle edges) and
+     * threshold flushes are still spaced by [FORCE_FLUSH_MIN_INTERVAL_MS]. Nothing is sent during
+     * an error backoff or when the spool is empty.
+     */
+    internal fun telemetryShouldFlush(
+        force: Boolean,
+        nowMs: Long,
+        pendingEvents: Int,
+        nextFlushAtMs: Long,
+        backoffUntilMs: Long,
+        lastAttemptAtMs: Long,
+        eventThreshold: Int = FLUSH_EVENT_THRESHOLD,
+        minAttemptSpacingMs: Long = FORCE_FLUSH_MIN_INTERVAL_MS,
+    ): Boolean {
+        if (pendingEvents <= 0) return false
+        if (nowMs < backoffUntilMs) return false
+        val spacingOk = lastAttemptAtMs <= 0L || nowMs - lastAttemptAtMs >= minAttemptSpacingMs
+        if (force || pendingEvents >= eventThreshold) return spacingOk
+        return nowMs >= nextFlushAtMs && spacingOk
+    }
 
     private fun telemetryDeviceID(context: Context): String =
-        telemetryDeviceIDForPublicKey(SecureIdentityStore(context).deviceIdentityPublicKey())
+        telemetryDeviceIDForPublicKey(identityStore(context).deviceIdentityPublicKey())
 
     internal fun telemetryDeviceIDForPublicKey(publicKey: String): String =
         "twpk_" + sha256Hex(publicKey.toByteArray(Charsets.UTF_8)).take(32)
@@ -699,8 +768,8 @@ object Telemetry {
         lines: List<String>,
         maxPayloadBytes: Int,
     ): TelemetryBatchSelectionForTest {
-        val batch = readBatch(lines, maxPayloadBytes) { events ->
-            estimatedTelemetryPayloadBytes(events)
+        val batch = readBatch(lines, maxPayloadBytes) { event ->
+            estimatedTelemetryEventBytes(event)
         }
         return TelemetryBatchSelectionForTest(
             events = batch.events.size,
@@ -1008,6 +1077,11 @@ object Telemetry {
     private const val KEY_SEQ = "seq"
     private const val SPOOL_FILE_NAME = "spool.jsonl"
     private const val SPOOL_MAX_BYTES = 256 * 1024
+    private const val SPOOL_TRIM_TARGET_BYTES = 192 * 1024
+    internal const val FLUSH_MIN_INTERVAL_MS = 10 * 60 * 1000L
+    internal const val FORCE_FLUSH_MIN_INTERVAL_MS = 60_000L
+    internal const val FLUSH_EVENT_THRESHOLD = 40
+    private const val MAX_BATCHES_PER_FLUSH = 5
     private const val QUEUE_CAP = 200
     private const val BATCH_LIMIT = 20
     internal const val TELEMETRY_MAX_BATCH_BYTES = 32 * 1024
@@ -1020,17 +1094,11 @@ object Telemetry {
     private const val HTTPS_TIMEOUT_MS = 5_000
     private const val PUBLIC_HTTP_TIMEOUT_MS = 5_000
     private const val PUBLIC_HTTP_HEADER_LIMIT_BYTES = 64 * 1024
+    private const val PUBLIC_HTTP_READ_BUFFER_BYTES = 8 * 1024
     private const val HTTP_PAYLOAD_TOO_LARGE = 413
     private const val PUBLIC_TELEMETRY_URL = "http://awg-gw:8080/tw/telemetry"
     private const val PUBLIC_ROUTER_HOST = "127.0.0.1"
     private const val PUBLIC_ROUTER_PORT = 18080
-    private const val SOCKS_VERSION = 0x05
-    private const val SOCKS_NO_AUTH = 0x00
-    private const val SOCKS_CONNECT = 0x01
-    private const val SOCKS_ATYP_IPV4 = 0x01
-    private const val SOCKS_ATYP_DOMAIN = 0x03
-    private const val SOCKS_ATYP_IPV6 = 0x04
-    private const val BYTE_MASK = 0xff
     private const val NONCE_BYTES = 16
     private const val MAX_RESPONSE_CHARS = 4096
     private const val MAX_KIND_CHARS = 48

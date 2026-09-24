@@ -206,11 +206,33 @@ func parseStartResult(raw string) (startResult, error) {
 	return result, nil
 }
 
+// localSOCKSProxyUser returns the per-process RFC 1929 credentials required by
+// the transport SOCKS listener as curl's user:password. This is a developer
+// tool, so the credentials are printed with the commands for manual reuse.
+func localSOCKSProxyUser() (string, error) {
+	var auth struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Error    string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(transport.LocalSOCKSAuth()), &auth); err != nil {
+		return "", fmt.Errorf("parse local socks auth: %w", err)
+	}
+	if auth.Error != "" {
+		return "", fmt.Errorf("local socks auth: %s", auth.Error)
+	}
+	return auth.Username + ":" + auth.Password, nil
+}
+
 func runCurlThroughSOCKS(socksAddr, url string) (string, error) {
-	fmt.Printf("curl_command=curl --socks5 %s --max-time 25 -s %s\n", socksAddr, url)
+	proxyUser, err := localSOCKSProxyUser()
+	if err != nil {
+		return "", err
+	}
+	fmt.Printf("curl_command=curl --socks5 %s --proxy-user %s --max-time 25 -s %s\n", socksAddr, proxyUser, url)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "curl", "--socks5", socksAddr, "--max-time", "25", "-s", url)
+	cmd := exec.CommandContext(ctx, "curl", "--socks5", socksAddr, "--proxy-user", proxyUser, "--max-time", "25", "-s", url)
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
 		return "", ctx.Err()
@@ -229,12 +251,17 @@ func runThroughputCurl(socksAddr, url string, maxTime time.Duration, attempt int
 	if seconds < 1 {
 		seconds = 1
 	}
-	fmt.Printf("throughput_command=curl --socks5 %s --max-time %d --output /dev/null --write-out ... %s\n", socksAddr, seconds, url)
+	proxyUser, err := localSOCKSProxyUser()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("throughput_command=curl --socks5 %s --proxy-user %s --max-time %d --output /dev/null --write-out ... %s\n", socksAddr, proxyUser, seconds, url)
 	ctx, cancel := context.WithTimeout(context.Background(), maxTime+10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx,
 		"curl",
 		"--socks5", socksAddr,
+		"--proxy-user", proxyUser,
 		"--max-time", strconv.Itoa(seconds),
 		"--silent",
 		"--show-error",

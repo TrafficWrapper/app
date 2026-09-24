@@ -454,7 +454,12 @@ object DistributionChannel {
             showAvailableSheet = false,
         )
         updateExecutor.execute {
-            val result = UpdateInstaller(context).install(updates.apkPath)
+            // The expected hash comes from the verified manifest (registered after verifyApk);
+            // the installer re-hashes the streamed bytes and abandons the session on mismatch.
+            val result = UpdateInstaller(context).install(
+                apkPath = updates.apkPath,
+                expectedSha256 = VerifiedUpdateApks.expectedSha256(updates.apkPath),
+            )
             Handler(Looper.getMainLooper()).post {
                 TransportRuntime.updates = TransportRuntime.updates.copy(
                     installInProgress = result.started,

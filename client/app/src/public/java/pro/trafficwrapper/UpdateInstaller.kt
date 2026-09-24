@@ -7,14 +7,69 @@ import android.content.pm.PackageInstaller
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.util.Log
 import androidx.annotation.StringRes
 import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
+import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 
 data class InstallStartResult(
     val started: Boolean,
     @StringRes val textRes: Int,
     val needsPermission: Boolean = false,
 )
+
+/**
+ * In-process registry of APKs that passed [UpdateVerifier.verifyApk], keyed by canonical path,
+ * holding the SHA-256 pinned by the verified manifest. The installer re-hashes the bytes it
+ * streams into the PackageInstaller session and refuses anything that does not match, closing
+ * the window between verification and installation (the file is re-read from disk).
+ */
+internal object VerifiedUpdateApks {
+    private val expected = ConcurrentHashMap<String, String>()
+
+    fun register(apk: File, sha256: String) {
+        expected[key(apk)] = sha256.trim().lowercase()
+    }
+
+    fun expectedSha256(apkPath: String): String? = expected[key(File(apkPath))]
+
+    private fun key(file: File): String = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
+}
+
+internal class ApkHashMismatchException(message: String) : Exception(message)
+
+/**
+ * Copies [input] to [output] while hashing, and returns the lowercase hex SHA-256 of the bytes
+ * written. Throws [ApkHashMismatchException] when the size or the hash differ from the expected
+ * values (checked before the caller commits anything).
+ */
+internal fun copyAndVerifySha256(
+    input: InputStream,
+    output: OutputStream,
+    expectedSha256: String,
+    expectedSize: Long,
+): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val buffer = ByteArray(64 * 1024)
+    var total = 0L
+    while (true) {
+        val read = input.read(buffer)
+        if (read < 0) break
+        total += read
+        if (total > expectedSize) throw ApkHashMismatchException("apk grew beyond verified size")
+        digest.update(buffer, 0, read)
+        output.write(buffer, 0, read)
+    }
+    if (total != expectedSize) throw ApkHashMismatchException("apk size changed after verification")
+    val actual = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    if (expectedSha256.isBlank() || !actual.equals(expectedSha256.trim(), ignoreCase = true)) {
+        throw ApkHashMismatchException("apk hash changed after verification")
+    }
+    return actual
+}
 
 class UpdateInstaller(private val context: Context) {
     fun canRequestInstalls(): Boolean =
@@ -30,7 +85,10 @@ class UpdateInstaller(private val context: Context) {
         }
     }
 
-    fun install(apkPath: String): InstallStartResult {
+    fun install(
+        apkPath: String,
+        expectedSha256: String? = VerifiedUpdateApks.expectedSha256(apkPath),
+    ): InstallStartResult {
         if (!canRequestInstalls()) {
             return InstallStartResult(
                 started = false,
@@ -42,12 +100,18 @@ class UpdateInstaller(private val context: Context) {
         if (!apk.isFile || apk.length() <= 0) {
             return InstallStartResult(started = false, textRes = R.string.update_install_missing_apk)
         }
+        if (expectedSha256.isNullOrBlank()) {
+            // Nothing verified this file in the current process: refuse rather than trust the disk.
+            Log.w(TAG, "update install refused: no verified hash for $apkPath")
+            return InstallStartResult(started = false, textRes = R.string.update_install_missing_apk)
+        }
+        val apkSize = apk.length()
 
         val installer = context.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
             .apply {
                 setAppPackageName(context.packageName)
-                setSize(apk.length())
+                setSize(apkSize)
                 if (Build.VERSION.SDK_INT >= 31) {
                     setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_REQUIRED)
                 }
@@ -59,10 +123,11 @@ class UpdateInstaller(private val context: Context) {
         return try {
             sessionId = installer.createSession(params)
             session = installer.openSession(sessionId)
+            val openedSession = session
             apk.inputStream().use { input ->
-                session.openWrite(APK_STREAM_NAME, 0, apk.length()).use { output ->
-                    input.copyTo(output, DEFAULT_BUFFER_SIZE)
-                    session.fsync(output)
+                openedSession.openWrite(APK_STREAM_NAME, 0, apkSize).use { output ->
+                    copyAndVerifySha256(input, output, expectedSha256, apkSize)
+                    openedSession.fsync(output)
                 }
             }
             val callback = Intent(context, UpdateInstallReceiver::class.java)
@@ -74,7 +139,11 @@ class UpdateInstaller(private val context: Context) {
             session.close()
             session = null
             InstallStartResult(started = true, textRes = R.string.update_install_started)
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
+            if (error is ApkHashMismatchException) {
+                Log.w(TAG, "update install aborted: ${error.message}")
+                apk.delete()
+            }
             runCatching { session?.abandon() }
             if (session == null && sessionId != 0) {
                 runCatching { installer.abandonSession(sessionId) }
@@ -101,6 +170,7 @@ class UpdateInstaller(private val context: Context) {
     }
 
     private companion object {
+        private const val TAG = "TWPublicUpdate"
         private const val APK_STREAM_NAME = "base.apk"
         private const val ENFORCE_UPDATE_OWNERSHIP = "android.permission.ENFORCE_UPDATE_OWNERSHIP"
     }

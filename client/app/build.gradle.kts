@@ -24,6 +24,10 @@ android {
             .orElse(providers.environmentVariable("TW_PUBLIC_VERSION_NAME"))
             .getOrElse("0.1.31")
 
+        // NOTE: ENROLLMENT_SECRET is compiled into BuildConfig and can be extracted from any APK
+        // (it is a plain string constant in classes.dex). It is a public build-time identifier,
+        // not a secret: the server must never treat it as proof of anything beyond "some build of
+        // this app"; device authentication relies on the Keystore-backed device identity instead.
         val enrollmentSecret = providers.environmentVariable("TW_ENROLLMENT_SECRET")
             .orElse(providers.gradleProperty("tw.enrollmentSecret"))
             .getOrElse("")
@@ -62,9 +66,23 @@ android {
         buildConfig = true
     }
 
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+        }
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            // libxray.so is the upstream Xray *executable* (sha256-pinned in
+            // build/prepare-xray-android.sh), already built with -s -w, so this does not add size;
+            // it only stops AGP from running strip on a verified prebuilt binary.
             keepDebugSymbols += "**/libxray.so"
         }
     }

@@ -215,12 +215,8 @@ func TestSOCKSCloseCancelsActiveSession(t *testing.T) {
 	}()
 	defer client.Close()
 
-	if _, err := client.Write([]byte{socksVersion5, 0x01, socksNoAuth}); err != nil {
-		t.Fatalf("write handshake: %v", err)
-	}
-	reply := make([]byte, 2)
-	if _, err := io.ReadFull(client, reply); err != nil {
-		t.Fatalf("read handshake reply: %v", err)
+	if err := socksClientAuthenticate(client); err != nil {
+		t.Fatalf("socks auth: %v", err)
 	}
 	if _, err := client.Write(socksConnectRequestDomain("example.com", 443)); err != nil {
 		t.Fatalf("write connect request: %v", err)
@@ -276,12 +272,8 @@ func socksReplyCodeForRequest(t *testing.T, request []byte) byte {
 	done := make(chan error, 1)
 	go func() { done <- (&socksServer{}).handle(context.Background(), serverConn) }()
 
-	if _, err := client.Write([]byte{socksVersion5, 0x01, socksNoAuth}); err != nil {
-		t.Fatalf("write handshake: %v", err)
-	}
-	reply := make([]byte, 2)
-	if _, err := io.ReadFull(client, reply); err != nil {
-		t.Fatalf("read handshake reply: %v", err)
+	if err := socksClientAuthenticate(client); err != nil {
+		t.Fatalf("socks auth: %v", err)
 	}
 	if _, err := client.Write(request); err != nil {
 		t.Fatalf("write connect request: %v", err)

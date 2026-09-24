@@ -69,13 +69,23 @@ class UpdateVerifier(private val context: Context) {
             Log.w(TAG, "public update rejected: rollback seq=${manifest.seq} maxSeen=${stored.maxSeenUpdateSeq}")
             throw UpdateVerificationException(R.string.update_error_downgrade)
         }
-        store.writePublicPlatformState(
-            stored.copy(
-                maxSeenUpdateSeq = max(stored.maxSeenUpdateSeq, manifest.seq),
-                trustedWallTimeMs = maxOf(stored.trustedWallTimeMs, trustedTime.wallTimeMs, manifestTimestampMs),
+        // Atomic read-modify-write: re-check the pin and the rollback floor against the freshest
+        // state so a concurrent writer (service, activity) can neither be overwritten nor race us.
+        store.updatePublicPlatformState { current ->
+            if (current.updatePubkeyPin != updatePubkey) {
+                Log.w(TAG, "public update rejected: update_pubkey pin changed during verification")
+                throw UpdateVerificationException(R.string.update_error_signer)
+            }
+            if (current.maxSeenUpdateSeq > 0 && manifest.seq < current.maxSeenUpdateSeq) {
+                Log.w(TAG, "public update rejected: rollback seq=${manifest.seq} maxSeen=${current.maxSeenUpdateSeq}")
+                throw UpdateVerificationException(R.string.update_error_downgrade)
+            }
+            current.copy(
+                maxSeenUpdateSeq = max(current.maxSeenUpdateSeq, manifest.seq),
+                trustedWallTimeMs = maxOf(current.trustedWallTimeMs, trustedTime.wallTimeMs, manifestTimestampMs),
                 trustedElapsedRealtimeMs = trustedTime.elapsedRealtimeMs,
-            ),
-        )
+            )
+        }
         return if (manifest.versionCode <= BuildConfig.VERSION_CODE.toLong()) {
             ManifestDecision.Latest(manifest)
         } else {

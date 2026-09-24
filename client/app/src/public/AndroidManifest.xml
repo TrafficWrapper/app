@@ -1,7 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
-    <application>
+    <!-- Keystore-sealed state must never be restored elsewhere (Android 12+ D2D ignores allowBackup). -->
+    <application android:dataExtractionRules="@xml/data_extraction_rules">
         <activity android:name=".MainActivity">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />

@@ -3,8 +3,30 @@ package device
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
+
+const (
+	// maxObfRandLength bounds random-filler tags: they must fit in a single
+	// UDP datagram.
+	maxObfRandLength = 65535
+	// maxObfDataSizeLength bounds <dz N>: the encoded length is an int.
+	maxObfDataSizeLength = 8
+)
+
+// parseObfLength parses a tag length, rejecting negative and oversized values
+// that would otherwise panic when slicing packet buffers.
+func parseObfLength(val string, max int) (int, error) {
+	length, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, err
+	}
+	if length < 0 || length > max {
+		return 0, fmt.Errorf("length %d out of range [0,%d]", length, max)
+	}
+	return length, nil
+}
 
 type obfBuilder func(val string) (obf, error)
 

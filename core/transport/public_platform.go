@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	orchestratorNoisePrologue = "TrafficWrapper orchestrator worker v1"
-	publicEnrollTimeout       = 35 * time.Second
+	orchestratorNoisePrologue   = "TrafficWrapper orchestrator worker v1"
+	publicEnrollTimeout         = 35 * time.Second
+	publicEnrollIdleConnTimeout = 30 * time.Second
 )
 
 type publicDeviceEnrollAPIRequest struct {
@@ -280,6 +281,7 @@ func publicNoiseJSONRequest(ctx context.Context, baseURL, serverPublic, clientPr
 		return err
 	}
 	client := publicHTTPClient()
+	defer client.CloseIdleConnections()
 	var start publicNoiseStartResponse
 	if err := postJSON(ctx, client, joinPublicURL(baseURL, "/d/v1/handshake/start"), publicNoiseStartRequest{
 		Message: base64.StdEncoding.EncodeToString(msg1),
@@ -334,7 +336,9 @@ func publicHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: publicEnrollTimeout,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Noise pins the orchestrator static key.
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, // Noise pins the orchestrator static key.
+			IdleConnTimeout:     publicEnrollIdleConnTimeout,
+			MaxIdleConnsPerHost: 1,
 		},
 	}
 }

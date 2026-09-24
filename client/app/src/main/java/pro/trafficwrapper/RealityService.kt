@@ -12,12 +12,8 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.net.InetSocketAddress
-import java.net.Proxy
-import java.net.URL
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import javax.net.ssl.HttpsURLConnection
 
 class RealityService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -48,6 +44,12 @@ class RealityService : Service() {
         stopReality()
         executor.shutdownNow()
         super.onDestroy()
+    }
+
+    // Android 15+: the dataSync foreground-service time budget ran out.
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        stopReality()
+        stopSelf()
     }
 
     private fun startReality() {
@@ -136,10 +138,13 @@ class RealityService : Service() {
     }
 
     private fun stopReality() {
+        val wasActive = workerActive
         workerActive = false
         xrayProcess?.destroy()
         xrayProcess = null
-        publishState(TransportUiState(stateTextRes = R.string.state_idle))
+        if (wasActive) {
+            publishState(TransportUiState(stateTextRes = R.string.state_idle))
+        }
     }
 
     private fun writeXrayConfig(cfg: RealityUiConfig): File {
@@ -153,12 +158,7 @@ class RealityService : Service() {
             .put("listen", DEFAULT_REALITY_HOST)
             .put("port", DEFAULT_REALITY_PORT)
             .put("protocol", "socks")
-            .put(
-                "settings",
-                JSONObject()
-                    .put("auth", "noauth")
-                    .put("udp", false),
-            )
+            .put("settings", realityXraySocksInboundSettings(LocalSocksAuth.internal))
         val user = JSONObject()
             .put("id", cfg.uuid)
             .put("encryption", "none")
@@ -201,15 +201,13 @@ class RealityService : Service() {
     private fun fetchOutboundIp(socksListen: String): String {
         val address = socksListen.substringBefore(":")
         val port = socksListen.substringAfter(":", DEFAULT_REALITY_PORT.toString()).toInt()
-        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress(address, port))
-        val connection = URL(OUTBOUND_URL).openConnection(proxy) as HttpsURLConnection
-        return try {
-            connection.connectTimeout = OUTBOUND_TIMEOUT_MS
-            connection.readTimeout = OUTBOUND_TIMEOUT_MS
-            connection.inputStream.bufferedReader().use { it.readText().trim() }
-        } finally {
-            connection.disconnect()
-        }
+        return httpGetViaLocalSocks(
+            proxyHost = address,
+            proxyPort = port,
+            url = OUTBOUND_URL,
+            timeoutMs = OUTBOUND_TIMEOUT_MS,
+            credentials = LocalSocksAuth.internal,
+        ).trim()
     }
 
     private fun publishState(state: TransportUiState) {
@@ -242,7 +240,11 @@ class RealityService : Service() {
                 process.inputStream.bufferedReader().useLines { lines ->
                     lines.forEach { line ->
                         if (line.isNotBlank()) {
-                            Log.i(XRAY_LOG_TAG, line)
+                            if (BuildConfig.DEBUG) {
+                                Log.i(XRAY_LOG_TAG, line)
+                            } else {
+                                Log.w(XRAY_LOG_TAG, redactXrayLogLine(line))
+                            }
                         }
                     }
                 }

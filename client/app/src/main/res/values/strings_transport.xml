@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="vpn_always_on_enrollment_required_title">Постоянный VPN не запущен</string>
+    <string name="vpn_always_on_enrollment_required_text">Устройство ещё не подключено к TrafficWrapper. Откройте приложение и завершите регистрацию, затем снова включите VPN.</string>
+</resources>

@@ -1,5 +1,6 @@
 package pro.trafficwrapper
 
+import org.json.JSONArray
 import org.json.JSONObject
 
 internal fun realityStreamSettingsJson(
@@ -57,7 +58,29 @@ internal fun realityXhttpOutboundMode(mode: String): String {
     }
 }
 
-internal fun realityXrayLogLevel(cfg: RealityUiConfig): String =
-    if (cfg.network.equals("xhttp", ignoreCase = true)) "debug" else "warning"
+/**
+ * Xray log level. Verbose xhttp dial diagnostics ("debug") are only emitted in debug builds:
+ * release builds must not spam logcat with per-connection lines that include destinations.
+ */
+internal fun realityXrayLogLevel(cfg: RealityUiConfig, debugBuild: Boolean = BuildConfig.DEBUG): String =
+    if (debugBuild && cfg.network.equals("xhttp", ignoreCase = true)) "debug" else "warning"
+
+/**
+ * Settings for the loopback SOCKS inbound of an xray sidecar. The listener always requires the
+ * process-internal credentials (RFC 1929), so other apps on the device cannot use the sidecar
+ * directly and bypass the router.
+ */
+internal fun realityXraySocksInboundSettings(credentials: SocksCredentials): JSONObject =
+    JSONObject()
+        .put("auth", "password")
+        .put(
+            "accounts",
+            JSONArray().put(
+                JSONObject()
+                    .put("user", credentials.username)
+                    .put("pass", credentials.password),
+            ),
+        )
+        .put("udp", false)
 
 private const val XHTTP_DEFAULT_OUTBOUND_MODE = "stream-up"

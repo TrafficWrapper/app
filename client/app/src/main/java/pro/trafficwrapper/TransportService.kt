@@ -10,12 +10,8 @@ import android.os.IBinder
 import android.os.Looper
 import org.json.JSONObject
 import pro.trafficwrapper.go.transport.Transport
-import java.net.InetSocketAddress
-import java.net.Proxy
-import java.net.URL
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import javax.net.ssl.HttpsURLConnection
 
 class TransportService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -23,6 +19,10 @@ class TransportService : Service() {
 
     @Volatile
     private var workerActive = false
+
+    /** True only while this (legacy) service itself started the native AWG core. */
+    @Volatile
+    private var nativeStarted = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -43,6 +43,12 @@ class TransportService : Service() {
         stopTransport()
         executor.shutdownNow()
         super.onDestroy()
+    }
+
+    // Android 15+: the dataSync foreground-service time budget ran out.
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        stopTransport()
+        stopSelf()
     }
 
     private fun startTransport(fakeClockSkewSeconds: Long?) {
@@ -68,6 +74,8 @@ class TransportService : Service() {
                     )
                     return@execute
                 }
+                if (!workerActive) return@execute
+                nativeStarted = true
                 val startResult = Transport.startProvisioned()
                 publishTransportState(startResult, R.string.state_starting, "", clock)
                 if (!JSONObject(startResult).optBoolean(JSON_OK, false)) {
@@ -97,10 +105,26 @@ class TransportService : Service() {
         }
     }
 
+    /**
+     * Never blocks the caller (main thread) and never touches native state this service did not
+     * start: MainActivity sends ACTION_STOP here on every disconnect, while the AWG core is owned
+     * by [AutoTransportService].
+     */
     private fun stopTransport() {
+        val wasActive = workerActive
         workerActive = false
-        Transport.stop()
-        publishState(TransportUiState(stateTextRes = R.string.state_idle))
+        if (nativeStarted) {
+            nativeStarted = false
+            Thread({
+                runCatching { Transport.stop() }
+            }, "tw-legacy-transport-stop").apply {
+                isDaemon = true
+                start()
+            }
+        }
+        if (wasActive) {
+            publishState(TransportUiState(stateTextRes = R.string.state_idle))
+        }
     }
 
     private fun publishTransportState(
@@ -163,15 +187,13 @@ class TransportService : Service() {
     private fun fetchOutboundIp(socksListen: String): String {
         val address = socksListen.substringBefore(":")
         val port = socksListen.substringAfter(":", DEFAULT_SOCKS_PORT.toString()).toInt()
-        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress(address, port))
-        val connection = URL(OUTBOUND_URL).openConnection(proxy) as HttpsURLConnection
-        return try {
-            connection.connectTimeout = OUTBOUND_TIMEOUT_MS
-            connection.readTimeout = OUTBOUND_TIMEOUT_MS
-            connection.inputStream.bufferedReader().use { it.readText().trim() }
-        } finally {
-            connection.disconnect()
-        }
+        return httpGetViaLocalSocks(
+            proxyHost = address,
+            proxyPort = port,
+            url = OUTBOUND_URL,
+            timeoutMs = OUTBOUND_TIMEOUT_MS,
+            credentials = LocalSocksAuth.internal,
+        ).trim()
     }
 
     private fun checkClock(fakeClockSkewSeconds: Long?): ClockCheckResult =
