@@ -21,9 +21,13 @@ jobs:
         with:
           go-version: "1.24.x"
 
+      - name: Vet transport core
+        working-directory: core
+        run: go vet ./...
+
       - name: Test transport core
         working-directory: core
-        run: go test ./...
+        run: go test -race ./...
 
   android-lint:
     runs-on: ubuntu-latest
@@ -45,3 +49,54 @@ jobs:
           private_root='/root/Traffic''Wrapper'
           ! grep -R "$private_root" -n README.md README.ru.md core client build
           ! git ls-files | grep -E '(^|/)(.*\.jks|.*\.keystore|.*\.apk|update\.key|.*\.minisign\.key)$'
+
+  android:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_NDK_VERSION: "26.3.11579264"
+      GOMOBILE_VERSION: a1d90793fc63015513ae877a689ddcc0903750ae
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: core/go.sum
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          sdkmanager="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "${sdkmanager}" --licenses >/dev/null || true
+          "${sdkmanager}" --install "platforms;android-36" "build-tools;36.0.0" "ndk;${ANDROID_NDK_VERSION}" >/dev/null
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "${GITHUB_ENV}"
+
+      - name: Build transport AAR
+        working-directory: core
+        run: |
+          set -euo pipefail
+          go install "golang.org/x/mobile/cmd/gomobile@${GOMOBILE_VERSION}"
+          go install "golang.org/x/mobile/cmd/gobind@${GOMOBILE_VERSION}"
+          mkdir -p ../client/app/libs
+          gomobile init
+          gomobile bind \
+            -target=android/arm64 \
+            -androidapi=26 \
+            -javapkg=pro.trafficwrapper.go \
+            -o ../client/app/libs/transport.aar \
+            ./transport
+
+      - name: Unit tests and build
+        working-directory: client
+        run: ./gradlew --no-daemon testPublicDebugUnitTest assemblePublicDebug assemblePublicRelease
