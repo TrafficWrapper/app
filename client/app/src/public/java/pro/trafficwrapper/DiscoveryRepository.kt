@@ -53,7 +53,7 @@ class DiscoveryRepository(private val context: Context) {
         val rendezvousState = store.readRendezvousState()
         val sinks = discoverySinks(stored, config, socksListen, rendezvousState)
         if (sinks.isEmpty()) return null
-        ensureCoreConfig(stored, config)
+        ensureCoreConfig(stored, config, publicKey)
 
         var lastError: Throwable? = null
         for (sink in sinks) {
@@ -113,7 +113,11 @@ class DiscoveryRepository(private val context: Context) {
         return DiscoveryRefreshResult(applied = true, seq = seq, sinkName = sink.name)
     }
 
-    private fun ensureCoreConfig(stored: StoredPublicPlatformState, config: PublicClientConfig) {
+    private fun ensureCoreConfig(
+        stored: StoredPublicPlatformState,
+        config: PublicClientConfig,
+        rendezvousPublicKey: String,
+    ) {
         val credentials = PublicPlatformCredentials(
             deviceID = stored.deviceID,
             realityUUID = stored.realityUUID,
@@ -133,6 +137,9 @@ class DiscoveryRepository(private val context: Context) {
             .put("awg_ru_socks_listen", AWG_RU_SOCKS_LISTEN)
             .put("mtu", DEFAULT_MTU)
             .put("dns_servers", JSONArray(config.dnsServers))
+            // The core only verifies discovery bundles against a key pinned here from the
+            // verified client config, never against the key sent with the bundle request.
+            .put("rendezvous_public_key", rendezvousPublicKey)
         slots.awgRu?.let { applyRequest.put("awg_ru", PublicPlatformConfigParser.awgRouteJson(it)) }
         slots.awg?.let { applyRequest.put("awg", PublicPlatformConfigParser.awgRouteJson(it)) }
         val response = JSONObject(Transport.applyPublicPlatformConfig(applyRequest.toString()))

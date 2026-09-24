@@ -135,6 +135,7 @@ func TestApplyDiscoveredEndpointsRejectsBundleExpiredOnDeviceClock(t *testing.T)
 	defer func() { discoveryLocalNow = old }()
 
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
 	// A replayed mirror Date inside the validity window must not revive it.
 	req := signer.request(t, bundle, testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
@@ -150,6 +151,7 @@ func TestApplyDiscoveredEndpointsAcceptsSuppliedNowWhenDeviceClockBehind(t *test
 	defer func() { discoveryLocalNow = old }()
 
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
 	req := signer.request(t, bundle, testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
 	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))

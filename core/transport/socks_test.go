@@ -401,3 +401,77 @@ func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	}
 	return nil, nil
 }
+
+func TestSOCKSServerShedsConnectionsOverLimit(t *testing.T) {
+	server, err := startSOCKSServer("127.0.0.1:0", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.close()
+
+	greet := func(conn net.Conn) error {
+		if _, err := conn.Write([]byte{socksVersion5, 0x01, socksMethodUserPass}); err != nil {
+			return err
+		}
+		reply := make([]byte, 2)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.ReadFull(conn, reply); err != nil {
+			return err
+		}
+		if reply[1] != socksMethodUserPass {
+			return errors.New("unexpected method")
+		}
+		return nil
+	}
+
+	// First connection holds the only slot while waiting for credentials.
+	first, err := net.Dial("tcp", server.addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if err := greet(first); err != nil {
+		t.Fatalf("first connection handshake: %v", err)
+	}
+
+	second, err := net.Dial("tcp", server.addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	_ = second.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := second.Read(make([]byte, 1)); err == nil {
+		t.Fatal("connection over limit was served")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("connection over limit was left open")
+	}
+
+	_ = first.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		third, err := net.Dial("tcp", server.addr())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = greet(third)
+		_ = third.Close()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slot was not released after first connection closed: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestStartSOCKSServerDefaultsMaxConns(t *testing.T) {
+	server, err := startSOCKSServer("127.0.0.1:0", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.close()
+	if cap(server.sem) != defaultSOCKSMaxConns {
+		t.Fatalf("max conns=%d want %d", cap(server.sem), defaultSOCKSMaxConns)
+	}
+}

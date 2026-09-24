@@ -25,3 +25,26 @@ come from the dependency `github.com/amnezia-vpn/amneziawg-go` pseudo-version
 `6a7c878409f32dc39a82bc597766c81304ab9840`. This revision removes the obsolete
 `PacketBuffer.IsNil()` call and builds natively with gVisor
 `v0.0.0-20250503011706-39ed1f5ac29c` using Go 1.24.
+
+## Client API notes
+
+- `ApplyDiscoveredEndpoints` verifies rendezvous bundles only against a pinned
+  minisign key. Pin it with `rendezvous_public_key` in
+  `ApplyPublicPlatformConfig` (may rotate the pin; use the `discovery_pubkey`
+  of the verified client config) or with `SetRendezvousPublicKey(key)` (cannot
+  replace a different pinned key). A `public_key` in the request is optional
+  and must equal the pin. The pin lives for the process lifetime.
+- The highest accepted rendezvous `seq` is remembered per pinned key; the
+  effective rollback bound is `max(remembered, max_seen_seq)`. An empty `now`
+  means the device clock; expiry is always checked against
+  `max(now, device clock)`.
+- With `base_config_json` the result is computed from it alone; without it the
+  stored provisioned config is merged and updated atomically.
+- `ApplyPublicPlatformConfig` never clears a stored route config because the
+  request omits that route.
+- `socks_listen` must be a loopback address; `socks_max_conns` caps concurrent
+  SOCKS connections (default 1024). AWG `h1`..`h4` and the UAPI-bound config
+  fields reject whitespace/control characters and line breaks.
+- Errors that come from outside the Noise channel are prefixed with
+  `unauthenticated server response:`, stripped of control characters and
+  truncated to about 200 characters.

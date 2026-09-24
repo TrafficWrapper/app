@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -223,7 +224,13 @@ func HeaderRanges(d Dialect) ([4]HeaderRange, error) {
 }
 
 func ParseHeaderRange(spec string) (HeaderRange, error) {
-	parts := strings.Split(strings.TrimSpace(spec), "-")
+	// Header specs are later spliced verbatim-ish into newline-delimited UAPI
+	// text, so any whitespace/control rune (including a leading/trailing one)
+	// is rejected outright instead of being trimmed and tolerated.
+	if strings.IndexFunc(spec, isUnsafeHeaderRune) >= 0 {
+		return HeaderRange{}, errors.New("header range contains whitespace or control characters")
+	}
+	parts := strings.Split(spec, "-")
 	if len(parts) < 1 || len(parts) > 2 || parts[0] == "" {
 		return HeaderRange{}, errors.New("bad header range format")
 	}
@@ -272,12 +279,32 @@ func UAPILines(d Dialect) []string {
 		"s2="+strconv.Itoa(d.S2),
 		"s3="+strconv.Itoa(d.S3),
 		"s4="+strconv.Itoa(d.S4),
-		"h1="+d.H1,
-		"h2="+d.H2,
-		"h3="+d.H3,
-		"h4="+d.H4,
+		"h1="+uapiHeader(d.H1),
+		"h2="+uapiHeader(d.H2),
+		"h3="+uapiHeader(d.H3),
+		"h4="+uapiHeader(d.H4),
 	)
 	return lines
+}
+
+// uapiHeader returns the canonical form of a header range for UAPI. Callers
+// are expected to Validate first; for an unparsable value it still strips
+// whitespace/control runes so a stray "\n" can never terminate the UAPI
+// operation early and silently drop the keys that follow.
+func uapiHeader(spec string) string {
+	if parsed, err := ParseHeaderRange(spec); err == nil {
+		return parsed.String()
+	}
+	return strings.Map(func(r rune) rune {
+		if isUnsafeHeaderRune(r) {
+			return -1
+		}
+		return r
+	}, spec)
+}
+
+func isUnsafeHeaderRune(r rune) bool {
+	return unicode.IsSpace(r) || unicode.IsControl(r)
 }
 
 func Summary(d Dialect) string {
