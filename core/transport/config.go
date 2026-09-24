@@ -25,15 +25,18 @@ var defaultDNSServers = []string{"1.1.1.1", "1.0.0.1"}
 type preset = awgdialect.Dialect
 
 type config struct {
-	PrivateKey      string   `json:"private_key"`
-	InternalIP      string   `json:"internal_ip"`
-	Endpoint        string   `json:"endpoint"`
-	ServerPublicKey string   `json:"server_public_key"`
-	PSK2            string   `json:"psk2"`
-	AWGPreset       preset   `json:"awg_preset"`
-	SOCKSListen     string   `json:"socks_listen,omitempty"`
-	MTU             int      `json:"mtu,omitempty"`
-	DNSServers      []string `json:"dns_servers,omitempty"`
+	PrivateKey      string `json:"private_key"`
+	InternalIP      string `json:"internal_ip"`
+	Endpoint        string `json:"endpoint"`
+	ServerPublicKey string `json:"server_public_key"`
+	PSK2            string `json:"psk2"`
+	AWGPreset       preset `json:"awg_preset"`
+	SOCKSListen     string `json:"socks_listen,omitempty"`
+	// SOCKSMaxConns caps concurrent SOCKS client connections; 0 means
+	// defaultSOCKSMaxConns.
+	SOCKSMaxConns int      `json:"socks_max_conns,omitempty"`
+	MTU           int      `json:"mtu,omitempty"`
+	DNSServers    []string `json:"dns_servers,omitempty"`
 }
 
 type normalizedConfig struct {
@@ -55,6 +58,26 @@ func parseConfig(configJSON string) (normalizedConfig, error) {
 	}
 	if cfg.PrivateKey == "" || cfg.InternalIP == "" || cfg.Endpoint == "" || cfg.ServerPublicKey == "" || cfg.PSK2 == "" {
 		return normalizedConfig{}, errors.New("config is incomplete")
+	}
+	// These values end up in newline-delimited UAPI text (or next to it); a
+	// line break or NUL would terminate the operation early or smuggle keys.
+	for _, field := range []struct{ name, value string }{
+		{"private_key", cfg.PrivateKey},
+		{"internal_ip", cfg.InternalIP},
+		{"endpoint", cfg.Endpoint},
+		{"server_public_key", cfg.ServerPublicKey},
+		{"psk2", cfg.PSK2},
+		{"socks_listen", cfg.SOCKSListen},
+	} {
+		if strings.ContainsAny(field.value, "\r\n\x00") {
+			return normalizedConfig{}, fmt.Errorf("%s contains a line break or NUL", field.name)
+		}
+	}
+	if err := validateSOCKSListen(cfg.SOCKSListen); err != nil {
+		return normalizedConfig{}, err
+	}
+	if cfg.SOCKSMaxConns < 0 {
+		return normalizedConfig{}, fmt.Errorf("socks_max_conns must be non-negative, got %d", cfg.SOCKSMaxConns)
 	}
 	endpoint, err := normalizeEndpoint(cfg.Endpoint)
 	if err != nil {
@@ -120,6 +143,23 @@ func validatedConfigJSON(cfg config) (string, error) {
 		return "", err
 	}
 	return string(raw), nil
+}
+
+// validateSOCKSListen only allows loopback listeners: the SOCKS server proxies
+// into the tunnel and must never be reachable from the LAN.
+func validateSOCKSListen(listen string) error {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("socks_listen %q: %w", listen, err)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil || !addr.IsLoopback() {
+		return fmt.Errorf("socks_listen %q must be a loopback address", listen)
+	}
+	return nil
 }
 
 func normalizeEndpoint(endpoint string) (string, error) {

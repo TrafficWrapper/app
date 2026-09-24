@@ -15,6 +15,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/flynn/noise"
 
@@ -26,6 +28,9 @@ const (
 	orchestratorNoisePrologue   = "TrafficWrapper orchestrator worker v1"
 	publicEnrollTimeout         = 35 * time.Second
 	publicEnrollIdleConnTimeout = 30 * time.Second
+	// maxUntrustedErrorRunes bounds server-controlled text copied into Error.
+	maxUntrustedErrorRunes = 200
+	untrustedServerPrefix  = "unauthenticated server response: "
 )
 
 type publicDeviceEnrollAPIRequest struct {
@@ -121,6 +126,11 @@ type publicApplyAPIRequest struct {
 	AWGRUSOCKSListen string           `json:"awg_ru_socks_listen,omitempty"`
 	SOCKSListen      string           `json:"socks_listen,omitempty"`
 	MTU              int              `json:"mtu,omitempty"`
+	// RendezvousPublicKey, when set, pins (or rotates) the minisign key that
+	// ApplyDiscoveredEndpoints verifies rendezvous bundles against. It must
+	// come from the verified client config (discovery_pubkey), not from the
+	// network response that carries a bundle.
+	RendezvousPublicKey string `json:"rendezvous_public_key,omitempty"`
 }
 
 type publicApplyAPIResult struct {
@@ -220,7 +230,7 @@ func publicDeviceEnroll(req publicDeviceEnrollAPIRequest) (publicDeviceEnrollAPI
 		return publicDeviceEnrollAPIResult{}, err
 	}
 	if !wireResp.OK {
-		return publicDeviceEnrollAPIResult{}, fmt.Errorf("public device enrollment rejected: %s", wireResp.Error)
+		return publicDeviceEnrollAPIResult{}, fmt.Errorf("public device enrollment rejected: %s", sanitizeUntrustedText(wireResp.Error))
 	}
 	return publicDeviceEnrollAPIResult{
 		OK:              true,
@@ -289,7 +299,8 @@ func publicNoiseJSONRequest(ctx context.Context, baseURL, serverPublic, clientPr
 		return err
 	}
 	if !start.OK {
-		return errors.New(start.Error)
+		// Pre-handshake reply: not authenticated by Noise.
+		return untrustedServerError(start.Error)
 	}
 	msg2, err := base64.StdEncoding.DecodeString(start.Message)
 	if err != nil {
@@ -319,7 +330,8 @@ func publicNoiseJSONRequest(ctx context.Context, baseURL, serverPublic, clientPr
 		return err
 	}
 	if !envelope.OK {
-		return errors.New(envelope.Error)
+		// Envelope-level error is outside the Noise payload: unauthenticated.
+		return untrustedServerError(envelope.Error)
 	}
 	encrypted, err := base64.StdEncoding.DecodeString(envelope.Payload)
 	if err != nil {
@@ -332,9 +344,11 @@ func publicNoiseJSONRequest(ctx context.Context, baseURL, serverPublic, clientPr
 	return json.Unmarshal(decrypted, resp)
 }
 
+// publicHTTPClient deliberately has no http.Client.Timeout: the overall
+// deadline comes from the request context (timeout_seconds), so a caller
+// asking for more than publicEnrollTimeout is not silently cut short.
 func publicHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout: publicEnrollTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, // Noise pins the orchestrator static key.
 			IdleConnTimeout:     publicEnrollIdleConnTimeout,
@@ -360,12 +374,45 @@ func postJSON(ctx context.Context, client *http.Client, endpoint string, req any
 	defer httpResp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
 	if httpResp.StatusCode >= 300 {
-		return fmt.Errorf("%s: %s", httpResp.Status, strings.TrimSpace(string(body)))
+		return fmt.Errorf("http %d: %w", httpResp.StatusCode, untrustedServerError(string(body)))
 	}
 	if err := json.Unmarshal(body, resp); err != nil {
 		return err
 	}
 	return nil
+}
+
+// untrustedServerError wraps text the server sent outside the Noise channel.
+// It is bounded, stripped of control/format characters and clearly labelled
+// so the UI never shows it as an authenticated message.
+func untrustedServerError(message string) error {
+	return errors.New(untrustedServerPrefix + sanitizeUntrustedText(message))
+}
+
+func sanitizeUntrustedText(message string) string {
+	var b strings.Builder
+	runes := 0
+	lastSpace := false
+	for _, r := range strings.TrimSpace(message) {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.IsSpace(r) {
+			r = ' '
+		}
+		if r == ' ' {
+			if lastSpace {
+				continue
+			}
+			lastSpace = true
+		} else {
+			lastSpace = false
+		}
+		if runes == maxUntrustedErrorRunes {
+			b.WriteString("...")
+			break
+		}
+		b.WriteRune(r)
+		runes++
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func joinPublicURL(base, path string) string {
@@ -406,9 +453,22 @@ func applyPublicPlatformConfig(req publicApplyAPIRequest) (publicApplyAPIResult,
 		}
 		awgRUConfigJSON = raw
 	}
+	if strings.TrimSpace(req.RendezvousPublicKey) != "" {
+		// Replace is allowed: this request carries the currently verified
+		// signed client config, which is where key rotation comes from.
+		if err := pinRendezvousPublicKey(req.RendezvousPublicKey, true); err != nil {
+			return publicApplyAPIResult{}, fmt.Errorf("rendezvous_public_key: %w", err)
+		}
+	}
+	// A request that omits a route must not wipe the config stored for it
+	// (e.g. an awg_ru-only refresh must keep the main awg config).
 	pendingProvision.Lock()
-	pendingProvision.configJSON = defaultConfigJSON
-	pendingProvision.awgRUConfigJSON = awgRUConfigJSON
+	if defaultConfigJSON != "" {
+		pendingProvision.configJSON = defaultConfigJSON
+	}
+	if awgRUConfigJSON != "" {
+		pendingProvision.awgRUConfigJSON = awgRUConfigJSON
+	}
 	pendingProvision.Unlock()
 	return publicApplyAPIResult{
 		OK:                true,

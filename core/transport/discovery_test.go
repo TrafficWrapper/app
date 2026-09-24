@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ func init() {
 
 func TestApplyDiscoveredEndpointsMergesAWGWithStoredSecrets(t *testing.T) {
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	base := testBaseConfig(t)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
 	req := signer.request(t, bundle, base, 9, "2026-06-13T12:00:00Z")
@@ -71,6 +73,7 @@ func TestApplyDiscoveredEndpointsMergesAWGWithStoredSecrets(t *testing.T) {
 
 func TestApplyDiscoveredEndpointsRejectsTamperedSignedBundle(t *testing.T) {
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
 	message := mustJSON(t, bundle)
 	signature := signer.sign(message)
@@ -85,6 +88,7 @@ func TestApplyDiscoveredEndpointsRejectsTamperedSignedBundle(t *testing.T) {
 
 func TestApplyDiscoveredEndpointsRejectsHostnameAWGWithoutEgressIP(t *testing.T) {
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	base := testBaseConfig(t)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
 	awg := bundle["endpoints"].(map[string]any)["awg"].([]any)[0].(map[string]any)
@@ -102,6 +106,7 @@ func TestApplyDiscoveredEndpointsRejectsHostnameAWGWithoutEgressIP(t *testing.T)
 
 func TestApplyDiscoveredEndpointsRejectsWrongSignature(t *testing.T) {
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	other := newTestSigner(t)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
 	message := mustJSON(t, bundle)
@@ -113,20 +118,247 @@ func TestApplyDiscoveredEndpointsRejectsWrongSignature(t *testing.T) {
 	}
 }
 
-func TestApplyDiscoveredEndpointsRequiresPublicKey(t *testing.T) {
+func TestApplyDiscoveredEndpointsUsesPinnedKeyWhenRequestOmitsIt(t *testing.T) {
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
 	message := mustJSON(t, bundle)
 	req := requestJSON(t, "", message, signer.sign(message), testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
 
 	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))
-	if result.OK || !strings.Contains(result.Error, "public_key is required") {
-		t.Fatalf("missing public key accepted or wrong error: %+v", result)
+	if !result.OK {
+		t.Fatalf("pinned key was not used: %+v", result)
+	}
+}
+
+func TestApplyDiscoveredEndpointsRequiresPinnedKey(t *testing.T) {
+	signer := newTestSigner(t)
+	resetDiscoveryTrust(t)
+	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	// The request carries the bundle's own signer key: that must not be
+	// enough on its own.
+	req := signer.request(t, bundle, testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
+
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))
+	if result.OK || !strings.Contains(result.Error, "not pinned") {
+		t.Fatalf("request-supplied key trusted without pin or wrong error: %+v", result)
+	}
+}
+
+func TestApplyDiscoveredEndpointsRejectsRequestKeyDifferentFromPinned(t *testing.T) {
+	pinned := newTestSigner(t)
+	pinTestSigner(t, pinned)
+	attacker := newTestSigner(t)
+	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	req := attacker.request(t, bundle, testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
+
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))
+	if result.OK || !strings.Contains(result.Error, "does not match pinned key") {
+		t.Fatalf("foreign key accepted or wrong error: %+v", result)
+	}
+	// Signed by the attacker but claiming the pinned key: signature check fails.
+	message := mustJSON(t, bundle)
+	req = requestJSON(t, pinned.publicKey, message, attacker.sign(message), testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req)); result.OK {
+		t.Fatal("bundle signed by a foreign key accepted")
+	}
+}
+
+func TestSetRendezvousPublicKeyRefusesToReplacePinnedKey(t *testing.T) {
+	first := newTestSigner(t)
+	resetDiscoveryTrust(t)
+	if got := decodeMinisignResult(t, SetRendezvousPublicKey(first.publicKey)); !got.OK {
+		t.Fatalf("pinning failed: %+v", got)
+	}
+	if got := decodeMinisignResult(t, SetRendezvousPublicKey("  "+first.publicKey+"\n")); !got.OK {
+		t.Fatalf("re-pinning same key failed: %+v", got)
+	}
+	second := newTestSigner(t)
+	if got := decodeMinisignResult(t, SetRendezvousPublicKey(second.publicKey)); got.OK {
+		t.Fatal("different key replaced pinned key")
+	}
+	if got := decodeMinisignResult(t, SetRendezvousPublicKey("garbage")); got.OK {
+		t.Fatal("invalid key accepted")
+	}
+	if got := decodeMinisignResult(t, SetRendezvousPublicKey("")); got.OK {
+		t.Fatal("empty key accepted")
+	}
+}
+
+func TestApplyPublicPlatformConfigPinsAndRotatesRendezvousKey(t *testing.T) {
+	first := newTestSigner(t)
+	resetDiscoveryTrust(t)
+	setPendingProvision(t, "", "")
+	req := testPublicApplyRequest()
+	req.RendezvousPublicKey = first.publicKey
+	if _, err := applyPublicPlatformConfig(req); err != nil {
+		t.Fatal(err)
+	}
+	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(first.request(t, bundle, "", 0, "2026-06-13T12:00:00Z"))); !result.OK {
+		t.Fatalf("bundle under key pinned by ApplyPublicPlatformConfig rejected: %+v", result)
+	}
+
+	// A signed client config update may rotate discovery_pubkey.
+	second := newTestSigner(t)
+	req.RendezvousPublicKey = second.publicKey
+	if _, err := applyPublicPlatformConfig(req); err != nil {
+		t.Fatal(err)
+	}
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(first.request(t, bundle, "", 0, "2026-06-13T12:00:00Z"))); result.OK {
+		t.Fatal("old key still trusted after rotation")
+	}
+	older := testBundle(t, 3, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(second.request(t, older, "", 0, "2026-06-13T12:00:00Z"))); !result.OK {
+		t.Fatalf("new key starts a new seq space, got: %+v", result)
+	}
+
+	// Omitting the field keeps the pin.
+	req.RendezvousPublicKey = ""
+	if _, err := applyPublicPlatformConfig(req); err != nil {
+		t.Fatal(err)
+	}
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(second.request(t, older, "", 0, "2026-06-13T12:00:00Z"))); !result.OK {
+		t.Fatalf("pin lost when rendezvous_public_key omitted: %+v", result)
+	}
+
+	req.RendezvousPublicKey = "garbage"
+	if _, err := applyPublicPlatformConfig(req); err == nil {
+		t.Fatal("invalid rendezvous_public_key accepted")
+	}
+}
+
+func TestApplyDiscoveredEndpointsRemembersMaxSeenSeq(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	newer := testBundle(t, 20, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, newer, testBaseConfig(t), 0, "2026-06-13T12:00:00Z"))); !result.OK {
+		t.Fatalf("newer bundle rejected: %+v", result)
+	}
+	// Caller forgot (or lost) its persisted max_seen_seq: core still refuses.
+	older := testBundle(t, 15, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, older, testBaseConfig(t), 0, "2026-06-13T12:00:00Z")))
+	if result.OK || !strings.Contains(result.Error, "rollback") {
+		t.Fatalf("rollback below stored max_seen_seq accepted: %+v", result)
+	}
+	// Same seq is still accepted (idempotent re-apply).
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, newer, testBaseConfig(t), 0, "2026-06-13T12:00:00Z"))); !result.OK {
+		t.Fatalf("re-applying same seq rejected: %+v", result)
+	}
+	// A caller-supplied higher bound still wins over the in-process one.
+	newest := testBundle(t, 25, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	result = decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, newest, testBaseConfig(t), 30, "2026-06-13T12:00:00Z")))
+	if result.OK || !strings.Contains(result.Error, "rollback") {
+		t.Fatalf("caller max_seen_seq ignored: %+v", result)
+	}
+}
+
+func TestApplyDiscoveredEndpointsFailureDoesNotAdvanceSeq(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	bad := testBundle(t, 50, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	bad["endpoints"].(map[string]any)["awg"].([]any)[0].(map[string]any)["egress_ip"] = ""
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, bad, testBaseConfig(t), 0, "2026-06-13T12:00:00Z"))); result.OK {
+		t.Fatal("unmergeable bundle accepted")
+	}
+	good := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, good, testBaseConfig(t), 0, "2026-06-13T12:00:00Z"))); !result.OK {
+		t.Fatalf("failed apply advanced max seq: %+v", result)
+	}
+}
+
+func TestApplyDiscoveredEndpointsDefaultsNowToDeviceClock(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	old := discoveryLocalNow
+	discoveryLocalNow = func() time.Time { return time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC) }
+	defer func() { discoveryLocalNow = old }()
+	expired := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T11:00:00Z")
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, expired, testBaseConfig(t), 0, "")))
+	if result.OK || !strings.Contains(result.Error, "expired") {
+		t.Fatalf("expired bundle accepted without now or wrong error: %+v", result)
+	}
+	valid := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, valid, testBaseConfig(t), 0, ""))); !result.OK {
+		t.Fatalf("valid bundle rejected without now: %+v", result)
+	}
+}
+
+func TestApplyDiscoveredEndpointsCallerBaseDoesNotTouchPendingProvision(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	stored := setPendingProvision(t, testBaseConfig(t), "")
+	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, bundle, testBaseConfig(t), 0, "2026-06-13T12:00:00Z")))
+	if !result.OK {
+		t.Fatalf("apply failed: %+v", result)
+	}
+	pendingProvision.Lock()
+	got := pendingProvision.configJSON
+	pendingProvision.Unlock()
+	if got != stored {
+		t.Fatal("caller-supplied base_config_json overwrote pendingProvision")
+	}
+}
+
+func TestApplyDiscoveredEndpointsUsesAndUpdatesPendingProvision(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	setPendingProvision(t, testBaseConfig(t), "")
+	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	req := signer.request(t, bundle, "", 0, "2026-06-13T12:00:00Z")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req)); !result.OK {
+				t.Errorf("apply failed: %+v", result)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = applyPublicPlatformConfig(testPublicApplyRequest())
+		}()
+	}
+	wg.Wait()
+	// Final state must be one of the two whole writes, never a torn mix.
+	pendingProvision.Lock()
+	got := pendingProvision.configJSON
+	pendingProvision.Unlock()
+	if _, err := parseConfig(got); err != nil {
+		t.Fatalf("pending config invalid: %v", err)
+	}
+	if result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req)); !result.OK {
+		t.Fatalf("apply failed: %+v", result)
+	}
+	pendingProvision.Lock()
+	got = pendingProvision.configJSON
+	pendingProvision.Unlock()
+	var merged config
+	if err := json.Unmarshal([]byte(got), &merged); err != nil {
+		t.Fatal(err)
+	}
+	if merged.Endpoint != "198.51.100.50:51821" || merged.PrivateKey != testKey(1) {
+		t.Fatalf("pending config not merged: endpoint=%q", merged.Endpoint)
+	}
+}
+
+func TestApplyDiscoveredEndpointsMissingProvisionedConfig(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	setPendingProvision(t, "", "")
+	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, bundle, "", 0, "2026-06-13T12:00:00Z")))
+	if result.OK || !strings.Contains(result.Error, "provisioned config is missing") {
+		t.Fatalf("got %+v", result)
 	}
 }
 
 func TestApplyDiscoveredEndpointsRejectsExpiredBundle(t *testing.T) {
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T11:00:00Z")
 	req := signer.request(t, bundle, testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
 
@@ -138,6 +370,7 @@ func TestApplyDiscoveredEndpointsRejectsExpiredBundle(t *testing.T) {
 
 func TestApplyDiscoveredEndpointsRejectsRollback(t *testing.T) {
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	bundle := testBundle(t, 9, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
 	req := signer.request(t, bundle, testBaseConfig(t), 10, "2026-06-13T12:00:00Z")
 
@@ -149,6 +382,7 @@ func TestApplyDiscoveredEndpointsRejectsRollback(t *testing.T) {
 
 func TestApplyDiscoveredEndpointsRejectsWrongNamespace(t *testing.T) {
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
 	bundle["ns"] = "version-v1"
 	req := signer.request(t, bundle, testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
@@ -161,6 +395,7 @@ func TestApplyDiscoveredEndpointsRejectsWrongNamespace(t *testing.T) {
 
 func TestApplyDiscoveredEndpointsRejectsPublicBundleSecrets(t *testing.T) {
 	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
 	awg := bundle["endpoints"].(map[string]any)["awg"].([]any)[0].(map[string]any)
 	awg["psk2"] = testKey(8)
@@ -316,5 +551,59 @@ func TestDiscoveryNowUsesUTC(t *testing.T) {
 	want := time.Date(2026, 6, 13, 9, 0, 0, 0, time.UTC)
 	if !got.Equal(want) {
 		t.Fatalf("got %s, want %s", got, want)
+	}
+}
+
+func resetDiscoveryTrust(t *testing.T) {
+	t.Helper()
+	discoveryTrust.Lock()
+	oldKey, oldSeq := discoveryTrust.publicKey, discoveryTrust.maxSeenSeq
+	discoveryTrust.publicKey, discoveryTrust.maxSeenSeq = "", 0
+	discoveryTrust.Unlock()
+	t.Cleanup(func() {
+		discoveryTrust.Lock()
+		discoveryTrust.publicKey, discoveryTrust.maxSeenSeq = oldKey, oldSeq
+		discoveryTrust.Unlock()
+	})
+}
+
+func pinTestSigner(t *testing.T, signer testSigner) {
+	t.Helper()
+	resetDiscoveryTrust(t)
+	if err := pinRendezvousPublicKey(signer.publicKey, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setPendingProvision(t *testing.T, configJSON, awgRUConfigJSON string) string {
+	t.Helper()
+	pendingProvision.Lock()
+	oldConfig, oldAWGRU := pendingProvision.configJSON, pendingProvision.awgRUConfigJSON
+	pendingProvision.configJSON, pendingProvision.awgRUConfigJSON = configJSON, awgRUConfigJSON
+	pendingProvision.Unlock()
+	t.Cleanup(func() {
+		pendingProvision.Lock()
+		pendingProvision.configJSON, pendingProvision.awgRUConfigJSON = oldConfig, oldAWGRU
+		pendingProvision.Unlock()
+	})
+	return configJSON
+}
+
+func decodeMinisignResult(t *testing.T, raw string) minisignVerifyResult {
+	t.Helper()
+	var result minisignVerifyResult
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		t.Fatalf("decode minisign result %s: %v", raw, err)
+	}
+	return result
+}
+
+func testPublicApplyRequest() publicApplyAPIRequest {
+	return publicApplyAPIRequest{
+		AWGPrivateKey:   testKey(1),
+		InternalIP:      "10.13.13.42/32",
+		PSK2:            testKey(3),
+		ServerAWGPublic: testKey(2),
+		AWG:             &publicRouteSpec{Endpoint: "203.0.113.10:51821"},
 	}
 }

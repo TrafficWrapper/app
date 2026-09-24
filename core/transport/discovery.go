@@ -6,13 +6,30 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"aead.dev/minisign"
 )
 
 const (
-	rendezvousNamespace = "rendezvous-v1"
-	rendezvousSchema    = 2
+	rendezvousNamespace    = "rendezvous-v1"
+	rendezvousSchema       = 2
+	rendezvousKeyMismatch  = "rendezvous public key does not match pinned key"
+	rendezvousKeyNotPinned = "rendezvous public key is not pinned; call SetRendezvousPublicKey or pass rendezvous_public_key to ApplyPublicPlatformConfig"
 )
+
+// discoveryTrust is the process-wide trust anchor for rendezvous bundles. The
+// key is pinned out of band (SetRendezvousPublicKey / ApplyPublicPlatformConfig
+// with rendezvous_public_key), never taken from the ApplyDiscoveredEndpoints
+// request that also carries the bundle. maxSeenSeq is the highest seq accepted
+// under the pinned key during this process lifetime; the caller-persisted
+// max_seen_seq is combined with it.
+var discoveryTrust struct {
+	sync.Mutex
+	publicKey  string
+	maxSeenSeq int64
+}
 
 // discoveryLocalNow is the device clock; replaceable in tests.
 var discoveryLocalNow = time.Now
@@ -104,9 +121,9 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 	if strings.TrimSpace(signature) == "" {
 		return applyDiscoveredResult{}, errors.New("endpoints minisig is required")
 	}
-	pubkey := strings.TrimSpace(req.PublicKey)
-	if pubkey == "" {
-		return applyDiscoveredResult{}, errors.New("public_key is required")
+	pubkey, storedMaxSeq, err := discoveryTrustSnapshot(req.PublicKey)
+	if err != nil {
+		return applyDiscoveredResult{}, err
 	}
 	if err := verifyMinisignResult(req.EndpointsJSON, signature, pubkey); err != nil {
 		return applyDiscoveredResult{}, err
@@ -122,7 +139,7 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 	if err != nil {
 		return applyDiscoveredResult{}, err
 	}
-	if err := validateDiscoveredBundle(bundle, req.MaxSeenSeq, now); err != nil {
+	if err := validateDiscoveredBundle(bundle, max(storedMaxSeq, req.MaxSeenSeq), now); err != nil {
 		return applyDiscoveredResult{}, err
 	}
 	awg, err := selectAWGEndpoint(bundle.Endpoints.AWG)
@@ -130,22 +147,37 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 		return applyDiscoveredResult{}, err
 	}
 	reality := selectRealityEndpoint(bundle.Endpoints.Reality)
-	baseJSON := req.BaseConfigJSON
-	if baseJSON == "" {
+	var mergedJSON string
+	if req.BaseConfigJSON != "" {
+		// Caller-supplied base: a pure function of the request. The shared
+		// provisioned config is neither read nor overwritten.
+		mergedJSON, err = mergeDiscoveredAWGConfig(req.BaseConfigJSON, awg)
+		if err == nil {
+			err = recordDiscoveredSeq(pubkey, bundle.Seq)
+		}
+		if err != nil {
+			return applyDiscoveredResult{}, err
+		}
+	} else {
+		// Read, merge and write back in one critical section so a concurrent
+		// ApplyPublicPlatformConfig / ApplyDiscoveredEndpoints cannot be lost.
 		pendingProvision.Lock()
-		baseJSON = pendingProvision.configJSON
+		if pendingProvision.configJSON == "" {
+			pendingProvision.Unlock()
+			return applyDiscoveredResult{}, errors.New("provisioned config is missing")
+		}
+		mergedJSON, err = mergeDiscoveredAWGConfig(pendingProvision.configJSON, awg)
+		if err == nil {
+			err = recordDiscoveredSeq(pubkey, bundle.Seq)
+		}
+		if err == nil {
+			pendingProvision.configJSON = mergedJSON
+		}
 		pendingProvision.Unlock()
+		if err != nil {
+			return applyDiscoveredResult{}, err
+		}
 	}
-	if baseJSON == "" {
-		return applyDiscoveredResult{}, errors.New("provisioned config is missing")
-	}
-	mergedJSON, err := mergeDiscoveredAWGConfig(baseJSON, awg)
-	if err != nil {
-		return applyDiscoveredResult{}, err
-	}
-	pendingProvision.Lock()
-	pendingProvision.configJSON = mergedJSON
-	pendingProvision.Unlock()
 	result := applyDiscoveredResult{
 		OK:         true,
 		Seq:        bundle.Seq,
@@ -156,6 +188,88 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 		result.EgressIP = reality.EgressIP
 	}
 	return result, nil
+}
+
+// SetRendezvousPublicKey pins the minisign public key that authenticates
+// rendezvous bundles for ApplyDiscoveredEndpoints. Re-pinning the same key is a
+// no-op; a different key cannot replace an already pinned one through this
+// call (rotation goes through ApplyPublicPlatformConfig, which carries the
+// currently verified signed client config). Returns {"ok":true} or
+// {"ok":false,"error":"..."}.
+func SetRendezvousPublicKey(publicKey string) string {
+	if err := pinRendezvousPublicKey(publicKey, false); err != nil {
+		return encodeMinisignVerifyResult(minisignVerifyResult{OK: false, Error: err.Error()})
+	}
+	return encodeMinisignVerifyResult(minisignVerifyResult{OK: true})
+}
+
+func pinRendezvousPublicKey(publicKey string, replace bool) error {
+	canonical, err := canonicalRendezvousKey(publicKey)
+	if err != nil {
+		return err
+	}
+	discoveryTrust.Lock()
+	defer discoveryTrust.Unlock()
+	if discoveryTrust.publicKey == canonical {
+		return nil
+	}
+	if discoveryTrust.publicKey != "" && !replace {
+		return errors.New(rendezvousKeyMismatch)
+	}
+	// A new key starts a new seq space; the caller-persisted max_seen_seq
+	// still applies on top of it.
+	discoveryTrust.publicKey = canonical
+	discoveryTrust.maxSeenSeq = 0
+	return nil
+}
+
+func canonicalRendezvousKey(publicKey string) (string, error) {
+	publicKey = strings.TrimSpace(publicKey)
+	if publicKey == "" {
+		return "", errors.New("rendezvous public key is empty")
+	}
+	var parsed minisign.PublicKey
+	if err := parsed.UnmarshalText([]byte(publicKey)); err != nil {
+		return "", errors.New("invalid rendezvous public key")
+	}
+	return parsed.String(), nil
+}
+
+// discoveryTrustSnapshot returns the pinned key and the in-process max seq.
+// A public_key in the request is optional; when present it must equal the pin.
+func discoveryTrustSnapshot(requestKey string) (string, int64, error) {
+	discoveryTrust.Lock()
+	pinned, maxSeenSeq := discoveryTrust.publicKey, discoveryTrust.maxSeenSeq
+	discoveryTrust.Unlock()
+	if pinned == "" {
+		return "", 0, errors.New(rendezvousKeyNotPinned)
+	}
+	if strings.TrimSpace(requestKey) != "" {
+		requested, err := canonicalRendezvousKey(requestKey)
+		if err != nil {
+			return "", 0, err
+		}
+		if requested != pinned {
+			return "", 0, errors.New(rendezvousKeyMismatch)
+		}
+	}
+	return pinned, maxSeenSeq, nil
+}
+
+// recordDiscoveredSeq ratchets the in-process max seq after a bundle has been
+// fully validated. It re-checks the pin and the rollback bound under the lock
+// so a concurrent key rotation or a newer bundle accepted in between wins.
+func recordDiscoveredSeq(pubkey string, seq int64) error {
+	discoveryTrust.Lock()
+	defer discoveryTrust.Unlock()
+	if discoveryTrust.publicKey != pubkey {
+		return errors.New(rendezvousKeyMismatch)
+	}
+	if seq < discoveryTrust.maxSeenSeq {
+		return fmt.Errorf("rendezvous rollback: seq=%d max_seen_seq=%d", seq, discoveryTrust.maxSeenSeq)
+	}
+	discoveryTrust.maxSeenSeq = seq
+	return nil
 }
 
 func validateDiscoveredBundle(bundle discoveredBundle, maxSeenSeq int64, now time.Time) error {
@@ -253,9 +367,16 @@ func selectRealityEndpoint(endpoints []discoveredRealityEndpoint) *discoveredRea
 	return &endpoints[0]
 }
 
+// discoveryNow returns the caller-supplied validation time (the mirror's Date,
+// possibly SNTP-corrected by the app) or the device clock when it is empty.
+// A stale value is deliberately not rejected: it cannot revive an expired
+// bundle because expiry is checked against max(now, device clock) in
+// validateDiscoveredBundle, and it only makes the "not issued yet" check
+// stricter. Rejecting now < device clock - N would instead break every device
+// whose clock runs ahead while the app supplies SNTP-corrected time.
 func discoveryNow(value string) (time.Time, error) {
 	if strings.TrimSpace(value) == "" {
-		return time.Now().UTC(), nil
+		return discoveryLocalNow().UTC(), nil
 	}
 	parsed, err := time.Parse(time.RFC3339, value)
 	if err != nil {

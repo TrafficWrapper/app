@@ -32,13 +32,20 @@ type netstackTUNView struct {
 var netstackTUNLayout = sync.OnceValue(checkNetstackTUNLayout)
 
 func checkNetstackTUNLayout() error {
-	netType := reflect.TypeOf(netstacktun.Net{})
-	viewType := reflect.TypeOf(netstackTUNView{})
-	if netType.Kind() != reflect.Struct || netType.NumField() < viewType.NumField() {
-		return fmt.Errorf("netstack tun layout changed: %s has %d fields", netType, netType.NumField())
+	return compareStructPrefix(reflect.TypeOf(netstacktun.Net{}), reflect.TypeOf(netstackTUNView{}))
+}
+
+// compareStructPrefix reports whether the leading fields of actual match view
+// by name, type and offset. Split out so mismatches can be unit-tested.
+func compareStructPrefix(actual, view reflect.Type) error {
+	if actual.Kind() != reflect.Struct || view.Kind() != reflect.Struct {
+		return fmt.Errorf("netstack tun layout changed: %s or %s is not a struct", actual, view)
 	}
-	for i := 0; i < viewType.NumField(); i++ {
-		want, got := viewType.Field(i), netType.Field(i)
+	if actual.NumField() < view.NumField() {
+		return fmt.Errorf("netstack tun layout changed: %s has %d fields, want at least %d", actual, actual.NumField(), view.NumField())
+	}
+	for i := 0; i < view.NumField(); i++ {
+		want, got := view.Field(i), actual.Field(i)
 		if got.Name != want.Name || got.Type != want.Type || got.Offset != want.Offset {
 			return fmt.Errorf("netstack tun layout changed: field %d is %s %s@%d, want %s %s@%d",
 				i, got.Name, got.Type, got.Offset, want.Name, want.Type, want.Offset)

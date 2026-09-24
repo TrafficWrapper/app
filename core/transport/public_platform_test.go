@@ -1,11 +1,18 @@
 package transport
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/TrafficWrapper/app/core/internal/provisionclient"
 
 	awgdialect "github.com/TrafficWrapper/app/core/awg/dialect"
 )
@@ -172,5 +179,160 @@ func TestPublicAWGConfigJSONRejectsHostnameEndpointWithoutPinnedIP(t *testing.T)
 	}
 	if _, err := publicAWGConfigJSON(route, req, "127.0.0.1:18080"); err == nil {
 		t.Fatal("hostname endpoint without egress_ip was accepted")
+	}
+}
+
+func TestPublicHTTPClientUsesContextTimeoutOnly(t *testing.T) {
+	client := publicHTTPClient()
+	defer client.CloseIdleConnections()
+	if client.Timeout != 0 {
+		t.Fatalf("client timeout=%s overrides timeout_seconds from the request context", client.Timeout)
+	}
+}
+
+func TestPostJSONHonoursContextDeadline(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	client := publicHTTPClient()
+	defer client.CloseIdleConnections()
+	var resp map[string]any
+	if err := postJSON(ctx, client, server.URL, map[string]string{}, &resp); err == nil {
+		t.Fatal("request succeeded past context deadline")
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatal("request did not stop at context deadline")
+	}
+}
+
+func TestPostJSONSanitizesUnauthenticatedErrorBody(t *testing.T) {
+	body := "bad\x1b[31m\nrequest\u202e" + strings.Repeat("A", 5000)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, body, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	client := publicHTTPClient()
+	defer client.CloseIdleConnections()
+	var resp map[string]any
+	err := postJSON(context.Background(), client, server.URL, map[string]string{}, &resp)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "http 400: unauthenticated server response: bad [31m request") {
+		t.Fatalf("error not marked unauthenticated: %q", msg)
+	}
+	if strings.ContainsAny(msg, "\x1b\n\r\u202e") {
+		t.Fatalf("error contains control characters: %q", msg)
+	}
+	if len(msg) > 300 {
+		t.Fatalf("error length=%d, want truncated", len(msg))
+	}
+}
+
+func TestPublicNoiseRequestSanitizesUnauthenticatedErrors(t *testing.T) {
+	_, serverPublic, err := provisionclient.GenerateIdentityKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientPrivate, clientPublic, err := provisionclient.GenerateIdentityKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":    false,
+			"error": "Enrollment approved\n\x1b[2Jcall +1-555" + strings.Repeat("!", 1000),
+		})
+	}))
+	defer server.Close()
+	var resp map[string]any
+	err = publicNoiseJSONRequest(context.Background(), server.URL, serverPublic, clientPrivate, clientPublic, "/d/v1/enroll", map[string]string{}, &resp)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	if !strings.HasPrefix(msg, untrustedServerPrefix) {
+		t.Fatalf("error not marked unauthenticated: %q", msg)
+	}
+	if strings.ContainsAny(msg, "\n\x1b") || len([]rune(msg)) > len(untrustedServerPrefix)+maxUntrustedErrorRunes+3 {
+		t.Fatalf("error not sanitized: %q", msg)
+	}
+}
+
+func TestSanitizeUntrustedText(t *testing.T) {
+	if got := sanitizeUntrustedText("  a\u202eb\x00c\n\t d "); got != "a b c d" {
+		t.Fatalf("got %q", got)
+	}
+	long := sanitizeUntrustedText(strings.Repeat("я", 500))
+	if n := len([]rune(long)); n != maxUntrustedErrorRunes+3 || !strings.HasSuffix(long, "...") {
+		t.Fatalf("rune length=%d", n)
+	}
+	if got := sanitizeUntrustedText(strings.Repeat("b", maxUntrustedErrorRunes)); strings.HasSuffix(got, "...") {
+		t.Fatal("text at the limit was marked truncated")
+	}
+}
+
+func TestApplyPublicPlatformConfigKeepsStoredConfigs(t *testing.T) {
+	setPendingProvision(t, "stored-default", "stored-awg-ru")
+	base := testPublicApplyRequest()
+	base.AWG = nil
+	route := &publicRouteSpec{Endpoint: "203.0.113.10:51821"}
+
+	onlyRU := base
+	onlyRU.AWGRU = route
+	result, err := applyPublicPlatformConfig(onlyRU)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ConfigStored || !result.AWGRUConfigStored {
+		t.Fatalf("result=%+v", result)
+	}
+	pendingProvision.Lock()
+	defaultJSON, ruJSON := pendingProvision.configJSON, pendingProvision.awgRUConfigJSON
+	pendingProvision.Unlock()
+	if defaultJSON != "stored-default" {
+		t.Fatalf("default config was overwritten: %q", defaultJSON)
+	}
+	if ruJSON == "stored-awg-ru" || ruJSON == "" {
+		t.Fatal("awg_ru config was not updated")
+	}
+
+	onlyDefault := base
+	onlyDefault.AWG = route
+	if _, err := applyPublicPlatformConfig(onlyDefault); err != nil {
+		t.Fatal(err)
+	}
+	pendingProvision.Lock()
+	defaultJSON, ruAfter := pendingProvision.configJSON, pendingProvision.awgRUConfigJSON
+	pendingProvision.Unlock()
+	if defaultJSON == "stored-default" || defaultJSON == "" {
+		t.Fatal("default config was not updated")
+	}
+	if ruAfter != ruJSON {
+		t.Fatal("awg_ru config was cleared by request without awg_ru")
+	}
+
+	// A failing request leaves both slots untouched.
+	bad := onlyDefault
+	bad.SOCKSListen = "0.0.0.0:1080"
+	if _, err := applyPublicPlatformConfig(bad); err == nil {
+		t.Fatal("non-loopback socks_listen accepted")
+	}
+	pendingProvision.Lock()
+	defer pendingProvision.Unlock()
+	if pendingProvision.configJSON != defaultJSON || pendingProvision.awgRUConfigJSON != ruJSON {
+		t.Fatal("failed apply modified stored configs")
 	}
 }

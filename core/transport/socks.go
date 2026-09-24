@@ -25,6 +25,9 @@ const (
 	socksShutdownGrace          = 2 * time.Second
 	socksClientHandshakeTimeout = 45 * time.Second
 	socksUpstreamDialTimeout    = 30 * time.Second
+	// defaultSOCKSMaxConns bounds concurrent client connections (and thus
+	// goroutines, buffers and netstack endpoints) per SOCKS listener.
+	defaultSOCKSMaxConns = 1024
 )
 
 var (
@@ -39,15 +42,29 @@ type socksServer struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
+	// sem limits concurrent connections; nil means unlimited (tests only).
+	sem chan struct{}
 }
 
-func startSOCKSServer(listen string, tnet *netstacktun.Net) (*socksServer, error) {
+func startSOCKSServer(listen string, maxConns int, tnet *netstacktun.Net) (*socksServer, error) {
+	if err := validateSOCKSListen(listen); err != nil {
+		return nil, err
+	}
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return nil, fmt.Errorf("listen socks %s: %w", listen, err)
 	}
+	if maxConns <= 0 {
+		maxConns = defaultSOCKSMaxConns
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &socksServer{listener: ln, tnet: tnet, ctx: ctx, cancel: cancel}
+	server := &socksServer{
+		listener: ln,
+		tnet:     tnet,
+		ctx:      ctx,
+		cancel:   cancel,
+		sem:      make(chan struct{}, maxConns),
+	}
 	server.wg.Add(1)
 	go server.serve(ctx)
 	return server, nil
@@ -101,11 +118,36 @@ func (s *socksServer) serve(ctx context.Context) {
 			return
 		}
 		backoff = socksAcceptBackoffMin
+		if !s.acquire() {
+			// Over the limit: shed the connection instead of queueing it, so
+			// a flood cannot pin unbounded goroutines and netstack state.
+			_ = client.Close()
+			continue
+		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer s.release()
 			_ = s.handle(ctx, client)
 		}()
+	}
+}
+
+func (s *socksServer) acquire() bool {
+	if s.sem == nil {
+		return true
+	}
+	select {
+	case s.sem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *socksServer) release() {
+	if s.sem != nil {
+		<-s.sem
 	}
 }
 
