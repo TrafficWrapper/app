@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	netstacktun "github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 )
@@ -142,17 +143,16 @@ func TestVpnBridgeDNSFitUDPRespectsEDNS0(t *testing.T) {
 }
 
 func TestVpnBridgeDNSCacheRewritesTransactionID(t *testing.T) {
-	b := &vpnBridgeInstance{dnsCache: make(map[string]vpnBridgeDNSCacheEntry)}
+	b := &vpnBridgeInstance{}
 	query := vpnBridgeTestDNSQuery(0)
-	response := append([]byte(nil), query...)
-	response[2] = 0x81
-	response[3] = 0x80
+	response := vpnBridgeTestDNSResponse(query, 300)
 	response[0], response[1] = 0xaa, 0xbb
-	b.cacheDNSResponse(query, response)
+	now := time.Now()
+	b.dnsCache.put(query, response, now)
 
 	nextQuery := append([]byte(nil), query...)
 	nextQuery[0], nextQuery[1] = 0xcc, 0xdd
-	cached, ok := b.cachedDNSResponse(nextQuery)
+	cached, ok := b.dnsCache.get(nextQuery, now, false)
 	if !ok {
 		t.Fatal("expected cached DNS response")
 	}

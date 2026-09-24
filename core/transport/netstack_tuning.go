@@ -2,7 +2,10 @@ package transport
 
 import (
 	"fmt"
+	"log"
+	"reflect"
 	"strings"
+	"sync"
 	"unsafe"
 
 	netstacktun "github.com/amnezia-vpn/amneziawg-go/tun/netstack"
@@ -18,13 +21,38 @@ const (
 	tcpBufferMax     = 16 * 1024 * 1024
 )
 
+// netstackTUNView mirrors the leading fields of the unexported netTun struct
+// behind netstacktun.Net. The unsafe cast is only performed after
+// checkNetstackTUNLayout confirmed that names, types and offsets still match.
 type netstackTUNView struct {
 	ep    *channel.Endpoint
 	stack *stack.Stack
 }
 
+var netstackTUNLayout = sync.OnceValue(checkNetstackTUNLayout)
+
+func checkNetstackTUNLayout() error {
+	netType := reflect.TypeOf(netstacktun.Net{})
+	viewType := reflect.TypeOf(netstackTUNView{})
+	if netType.Kind() != reflect.Struct || netType.NumField() < viewType.NumField() {
+		return fmt.Errorf("netstack tun layout changed: %s has %d fields", netType, netType.NumField())
+	}
+	for i := 0; i < viewType.NumField(); i++ {
+		want, got := viewType.Field(i), netType.Field(i)
+		if got.Name != want.Name || got.Type != want.Type || got.Offset != want.Offset {
+			return fmt.Errorf("netstack tun layout changed: field %d is %s %s@%d, want %s %s@%d",
+				i, got.Name, got.Type, got.Offset, want.Name, want.Type, want.Offset)
+		}
+	}
+	return nil
+}
+
 func tuneNetstack(tnet *netstacktun.Net) error {
 	if tnet == nil {
+		return nil
+	}
+	if err := netstackTUNLayout(); err != nil {
+		log.Printf("transport: netstack tuning skipped: %v", err)
 		return nil
 	}
 	st := (*netstackTUNView)(unsafe.Pointer(tnet)).stack

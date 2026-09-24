@@ -13,6 +13,12 @@ import (
 	awgdialect "github.com/TrafficWrapper/app/core/awg/dialect"
 )
 
+func init() {
+	// Fixtures use fixed 2026-06-13 timestamps; pin the device clock before
+	// them so expiry is decided by the supplied now.
+	discoveryLocalNow = func() time.Time { return time.Date(2026, 6, 13, 0, 0, 0, 0, time.UTC) }
+}
+
 func TestApplyDiscoveredEndpointsMergesAWGWithStoredSecrets(t *testing.T) {
 	signer := newTestSigner(t)
 	base := testBaseConfig(t)

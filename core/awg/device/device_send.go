@@ -141,8 +141,13 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	jmax := peer.device.junk.max
 
 	for i := 0; i < jc; i++ {
-		nBig, _ := rand.Int(rand.Reader, big.NewInt(int64(jmax-jmin+1)))
-		n := int(nBig.Int64()) + jmin
+		n := jmin
+		if jmax > jmin {
+			// rand.Int panics on a non-positive bound; jmin/jmax are set
+			// independently over UAPI, so an inverted pair must not crash.
+			nBig, _ := rand.Int(rand.Reader, big.NewInt(int64(jmax-jmin+1)))
+			n += int(nBig.Int64())
+		}
 
 		buf := make([]byte, n)
 		rand.Read(buf)

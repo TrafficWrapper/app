@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -79,6 +80,8 @@ type provisionAPIResult struct {
 	WGPrivateKeySent   bool                           `json:"wg_private_key_sent"`
 	WorkingKeysInGoRAM bool                           `json:"working_keys_in_go_ram,omitempty"`
 	AWGRUConfigStored  bool                           `json:"awg_ru_config_stored,omitempty"`
+	AWGKeyMismatch     bool                           `json:"awg_key_mismatch,omitempty"`
+	AWGRUKeyMismatch   bool                           `json:"awgru_key_mismatch,omitempty"`
 }
 
 // GenerateIdentity returns a fresh Noise_IK identity keypair for the platform
@@ -98,7 +101,12 @@ func DeviceEnroll(requestJSON string) string {
 	}
 	result, err := deviceEnroll(req)
 	if err != nil {
-		return encodeProvisionResult(provisionAPIResult{OK: false, Error: err.Error()})
+		return encodeProvisionResult(provisionAPIResult{
+			OK:               false,
+			Error:            err.Error(),
+			AWGKeyMismatch:   result.AWGKeyMismatch,
+			AWGRUKeyMismatch: result.AWGRUKeyMismatch,
+		})
 	}
 	return encodeProvisionResult(result)
 }
@@ -212,18 +220,8 @@ func deviceEnroll(req deviceEnrollAPIRequest) (provisionAPIResult, error) {
 	if resp.Status != "approved" || resp.InternalIP == "" || resp.Endpoint == "" || resp.ServerPublicKey == "" || resp.PSK2 == "" {
 		return result, nil
 	}
-	if req.ExpectedServerAWGKey != "" && resp.ServerPublicKey != req.ExpectedServerAWGKey {
-		if req.RequireExpectedAWGKey {
-			return provisionAPIResult{}, errors.New("server awg public key mismatch")
-		}
-	}
-	if req.RequireExpectedAWGRUKey && resp.AWGRU == nil {
-		return provisionAPIResult{}, errors.New("server awg-ru config missing")
-	}
-	if req.ExpectedServerAWGRUKey != "" && resp.AWGRU != nil && resp.AWGRU.ServerPublicKey != req.ExpectedServerAWGRUKey {
-		if req.RequireExpectedAWGRUKey {
-			return provisionAPIResult{}, errors.New("server awg-ru public key mismatch")
-		}
+	if err := checkExpectedServerKeys(req, resp); err != nil {
+		return err.result, err
 	}
 	if wgPrivate == "" {
 		return provisionAPIResult{}, errors.New("approved device response requires request_keys")
@@ -274,6 +272,34 @@ func deviceEnroll(req deviceEnrollAPIRequest) (provisionAPIResult, error) {
 		result.AWGRUConfigStored = true
 	}
 	return result, nil
+}
+
+type serverKeyMismatchError struct {
+	result provisionAPIResult
+	msg    string
+}
+
+func (e *serverKeyMismatchError) Error() string { return e.msg }
+
+// checkExpectedServerKeys pins the server AWG keys supplied by the platform.
+// A configured expected key is always enforced: a mismatch means the
+// provisioning channel handed out a peer the app did not pin, and silently
+// accepting it would defeat the pin. The require_* flags are kept for API
+// compatibility; require_expected_awg_ru_public additionally makes a missing
+// AWG-RU config an error.
+func checkExpectedServerKeys(req deviceEnrollAPIRequest, resp provisionclient.Response) *serverKeyMismatchError {
+	if req.ExpectedServerAWGKey != "" && resp.ServerPublicKey != req.ExpectedServerAWGKey {
+		log.Printf("transport: provision server awg public key mismatch (require=%t)", req.RequireExpectedAWGKey)
+		return &serverKeyMismatchError{result: provisionAPIResult{AWGKeyMismatch: true}, msg: "server awg public key mismatch"}
+	}
+	if req.RequireExpectedAWGRUKey && resp.AWGRU == nil {
+		return &serverKeyMismatchError{msg: "server awg-ru config missing"}
+	}
+	if req.ExpectedServerAWGRUKey != "" && resp.AWGRU != nil && resp.AWGRU.ServerPublicKey != req.ExpectedServerAWGRUKey {
+		log.Printf("transport: provision server awg-ru public key mismatch (require=%t)", req.RequireExpectedAWGRUKey)
+		return &serverKeyMismatchError{result: provisionAPIResult{AWGRUKeyMismatch: true}, msg: "server awg-ru public key mismatch"}
+	}
+	return nil
 }
 
 func publicAWGRUConfig(cfg *provisionclient.AWGPeerConfig) *provisionclient.AWGPeerConfig {

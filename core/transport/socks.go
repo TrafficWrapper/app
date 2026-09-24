@@ -22,7 +22,6 @@ const (
 	socksVersion5               = 0x05
 	socksNoAuth                 = 0x00
 	socksConnect                = 0x01
-	socksProxyBufferLen         = 256 * 1024
 	socksShutdownGrace          = 2 * time.Second
 	socksClientHandshakeTimeout = 45 * time.Second
 	socksUpstreamDialTimeout    = 30 * time.Second
@@ -33,13 +32,6 @@ var (
 	socksAcceptBackoffMax = 200 * time.Millisecond
 	socksProxyIdleTimeout = 3 * time.Minute
 )
-
-var socksProxyBuffers = sync.Pool{
-	New: func() any {
-		buf := make([]byte, socksProxyBufferLen)
-		return &buf
-	},
-}
 
 type socksServer struct {
 	listener net.Listener
@@ -174,14 +166,7 @@ func socksHandshake(rw io.ReadWriter) error {
 	if _, err := io.ReadFull(rw, methods); err != nil {
 		return err
 	}
-	for _, method := range methods {
-		if method == socksNoAuth {
-			_, err := rw.Write([]byte{socksVersion5, socksNoAuth})
-			return err
-		}
-	}
-	_, _ = rw.Write([]byte{socksVersion5, 0xff})
-	return errors.New("socks client offered no no-auth method")
+	return socksServerAuthenticate(rw, methods)
 }
 
 type socksTarget struct {
@@ -284,8 +269,6 @@ func writeSOCKSReply(w io.Writer, code byte) error {
 }
 
 func proxy(ctx context.Context, left, right net.Conn) error {
-	deadlines := newProxyDeadlines(left, right, socksProxyIdleTimeout)
-	deadlines.touchRead()
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -299,46 +282,15 @@ func proxy(ctx context.Context, left, right net.Conn) error {
 		}
 	}()
 	defer close(done)
-	type copyResult struct {
-		dst net.Conn
-		err error
-	}
-	errCh := make(chan copyResult, 2)
-	copyConn := func(dst, src net.Conn) {
-		bufPtr := socksProxyBuffers.Get().(*[]byte)
-		defer socksProxyBuffers.Put(bufPtr)
-		errCh <- copyResult{dst: dst, err: copyConnWithIdle(dst, src, *bufPtr, deadlines)}
-	}
-	go copyConn(left, right)
-	go copyConn(right, left)
-
-	var firstErr error
-	for i := 0; i < 2; i++ {
-		result := <-errCh
-		if firstErr == nil && result.err != nil && !isExpectedProxyClose(result.err) {
-			firstErr = result.err
-		}
-		halfCloseWrite(result.dst)
-	}
-	_ = left.Close()
-	_ = right.Close()
-	return firstErr
+	return proxyPair(left, right, socksProxyIdleTimeout, nil, nil)
 }
 
+// tuneConn disables Nagle on proxied connections. Socket buffer sizes are left
+// to kernel autotuning: forcing large SO_RCVBUF/SO_SNDBUF on loopback sockets
+// only pins memory per connection without improving throughput.
 func tuneConn(conn net.Conn) {
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
-		_ = tcp.SetReadBuffer(socksProxyBufferLen)
-		_ = tcp.SetWriteBuffer(socksProxyBufferLen)
-		return
-	}
-	type bufferTuner interface {
-		SetReadBuffer(int) error
-		SetWriteBuffer(int) error
-	}
-	if tuned, ok := conn.(bufferTuner); ok {
-		_ = tuned.SetReadBuffer(socksProxyBufferLen)
-		_ = tuned.SetWriteBuffer(socksProxyBufferLen)
 	}
 }
 
@@ -359,74 +311,6 @@ func isTemporaryAcceptError(err error) bool {
 	}
 	text := strings.ToLower(err.Error())
 	return strings.Contains(text, "too many open files") || strings.Contains(text, "temporary")
-}
-
-type proxyDeadlines struct {
-	conns []net.Conn
-	idle  time.Duration
-}
-
-func newProxyDeadlines(left, right net.Conn, idle time.Duration) proxyDeadlines {
-	return proxyDeadlines{conns: []net.Conn{left, right}, idle: idle}
-}
-
-func (d proxyDeadlines) touchRead() {
-	if d.idle <= 0 {
-		return
-	}
-	deadline := time.Now().Add(d.idle)
-	for _, conn := range d.conns {
-		_ = conn.SetReadDeadline(deadline)
-	}
-}
-
-func (d proxyDeadlines) touchWrite(conn net.Conn) {
-	if d.idle <= 0 {
-		return
-	}
-	_ = conn.SetWriteDeadline(time.Now().Add(d.idle))
-}
-
-func copyConnWithIdle(dst, src net.Conn, buf []byte, deadlines proxyDeadlines) error {
-	for {
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			deadlines.touchRead()
-			if err := writeAllWithIdle(dst, buf[:n], deadlines); err != nil {
-				return err
-			}
-		}
-		if readErr != nil {
-			return readErr
-		}
-	}
-}
-
-func writeAllWithIdle(dst net.Conn, data []byte, deadlines proxyDeadlines) error {
-	for len(data) > 0 {
-		deadlines.touchWrite(dst)
-		n, err := dst.Write(data)
-		if n > 0 {
-			data = data[n:]
-			deadlines.touchRead()
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
-}
-
-func halfCloseWrite(conn net.Conn) {
-	type closeWriter interface {
-		CloseWrite() error
-	}
-	if cw, ok := conn.(closeWriter); ok {
-		_ = cw.CloseWrite()
-	}
 }
 
 func isExpectedProxyClose(err error) bool {

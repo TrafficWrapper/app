@@ -16,9 +16,14 @@ import (
 	awgdialect "github.com/TrafficWrapper/app/core/awg/dialect"
 )
 
+// singleton publishes running instances. Readers (Stat*, the VPN bridge on
+// every new UDP/DNS flow) take the read lock; the write lock is only held for
+// map updates, never across netstack/device initialisation. starting reserves
+// names whose initialisation is in progress outside the lock.
 var singleton struct {
-	sync.Mutex
+	sync.RWMutex
 	instances map[string]*instance
+	starting  map[string]chan struct{}
 }
 
 type instance struct {
@@ -82,6 +87,17 @@ func StopAWGRU() string {
 func StopNamed(name string) string {
 	name = normalizeInstanceName(name)
 	singleton.Lock()
+	// A stop racing an in-progress start waits for it, so the instance being
+	// initialised is stopped rather than published afterwards.
+	for {
+		startDone, starting := singleton.starting[name]
+		if !starting {
+			break
+		}
+		singleton.Unlock()
+		<-startDone
+		singleton.Lock()
+	}
 	inst := singleton.instances[name]
 	delete(singleton.instances, name)
 	singleton.Unlock()
@@ -102,9 +118,9 @@ func StatAWGRU() string {
 
 func StatNamed(name string) string {
 	name = normalizeInstanceName(name)
-	singleton.Lock()
+	singleton.RLock()
 	inst := singleton.instances[name]
-	singleton.Unlock()
+	singleton.RUnlock()
 	if inst == nil {
 		return encodeResult(apiResult{OK: true, Status: &status{Started: false}})
 	}
@@ -118,13 +134,26 @@ func startNamed(name, configJSON string) (*status, error) {
 	}
 
 	singleton.Lock()
-	defer singleton.Unlock()
 	if singleton.instances == nil {
 		singleton.instances = make(map[string]*instance)
 	}
-	if singleton.instances[name] != nil {
+	if singleton.starting == nil {
+		singleton.starting = make(map[string]chan struct{})
+	}
+	_, starting := singleton.starting[name]
+	if singleton.instances[name] != nil || starting {
+		singleton.Unlock()
 		return nil, fmt.Errorf("transport %s already started", name)
 	}
+	startDone := make(chan struct{})
+	singleton.starting[name] = startDone
+	singleton.Unlock()
+	defer func() {
+		singleton.Lock()
+		delete(singleton.starting, name)
+		singleton.Unlock()
+		close(startDone)
+	}()
 
 	tunDev, tnet, err := netstacktun.CreateNetTUN([]netip.Addr{cfg.localAddr}, cfg.dnsServers, cfg.MTU)
 	if err != nil {
@@ -157,7 +186,9 @@ func startNamed(name, configJSON string) (*status, error) {
 		return nil, err
 	}
 	inst.socks = socks
+	singleton.Lock()
 	singleton.instances[name] = inst
+	singleton.Unlock()
 	return inst.status(), nil
 }
 
