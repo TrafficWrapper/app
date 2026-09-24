@@ -110,6 +110,8 @@
     <string name="attention_enable_notifications">Включить уведомления</string>
     <string name="attention_install_permission">Нет права установки обновлений</string>
     <string name="attention_allow_install">Разрешить установку</string>
+    <string name="attention_exact_alarms">Нет права на точные будильники — восстановление туннеля может запаздывать</string>
+    <string name="attention_allow_exact_alarms">Разрешить</string>
     <string name="mode_recommended">рекомендуется</string>
     <string name="apps_title">Приложения</string>
     <string name="apps_other_title">Другие приложения</string>
@@ -166,6 +168,8 @@
     <string name="permission_summary_battery_needed">Фон требует внимания</string>
     <string name="permission_summary_notifications_ok">Уведомления разрешены</string>
     <string name="permission_summary_notifications_needed">Уведомления нужно включить</string>
+    <string name="permission_summary_exact_alarms_ok">Точные будильники разрешены</string>
+    <string name="permission_summary_exact_alarms_needed">Точные будильники нужно разрешить</string>
     <string name="service_notifications_switch">Важные уведомления</string>
     <string name="service_notifications_description">Сообщает, если туннель долго не несёт в фоне, устройству требуется одобрение или лимит почти исчерпан.</string>
     <string name="awg_ru_config_missing">awg-ru набор ещё не получен от сервера</string>

@@ -2,6 +2,7 @@ package pro.trafficwrapper
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlarmManager
 import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
@@ -1208,13 +1209,16 @@ private fun AttentionBanners(
     attentionRefreshTick: Long,
 ) {
     val notificationsOff = notificationsDisabled(context, attentionRefreshTick)
+    val exactAlarmsOff = exactAlarmsDenied(context, attentionRefreshTick)
     val updateAvailable = updates.availableVersionCode > BuildConfig.VERSION_CODE.toLong()
     val updateBusy = updates.downloadInProgress || updates.installInProgress
     val updateError = updates.errorTextRes != null || updates.installErrorTextRes != null
     val showUpdateBanner = updateAvailable || updateBusy || (updateError && updates.availableVersionCode > 0)
     val installPermissionProblem = updates.installErrorTextRes == R.string.update_install_permission_required ||
         installPermissionNeeded(context)
-    if (!showUpdateBanner && !batteryRestriction.restricted && !notificationsOff && !installPermissionProblem) {
+    if (!showUpdateBanner && !batteryRestriction.restricted && !notificationsOff && !exactAlarmsOff &&
+        !installPermissionProblem
+    ) {
         return
     }
     Column(
@@ -1241,6 +1245,13 @@ private fun AttentionBanners(
                 title = stringResource(R.string.attention_notifications),
                 action = stringResource(R.string.attention_enable_notifications),
                 onClick = { requestPostNotificationsPermission(context) },
+            )
+        }
+        if (exactAlarmsOff) {
+            AttentionBanner(
+                title = stringResource(R.string.attention_exact_alarms),
+                action = stringResource(R.string.attention_allow_exact_alarms),
+                onClick = { openExactAlarmSettings(context) },
             )
         }
         if (installPermissionProblem) {
@@ -2633,6 +2644,22 @@ private fun notificationsDisabled(context: Context, attentionRefreshTick: Long):
         context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
 }
 
+private fun exactAlarmsDenied(context: Context, attentionRefreshTick: Long): Boolean {
+    if (attentionRefreshTick < 0L || Build.VERSION.SDK_INT < 31) return false
+    val alarmManager = context.getSystemService(AlarmManager::class.java) ?: return false
+    return !alarmManager.canScheduleExactAlarms()
+}
+
+private fun openExactAlarmSettings(context: Context) {
+    if (Build.VERSION.SDK_INT < 31) return
+    val intent = Intent(
+        Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+        Uri.parse("package:${context.packageName}"),
+    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(intent) }
+        .onFailure { openThisAppDetailsSettings(context) }
+}
+
 private fun requestPostNotificationsPermission(context: Context) {
     if (Build.VERSION.SDK_INT < 33) return
     val activity = context as? Activity
@@ -2898,7 +2925,12 @@ private fun permissionSummary(
     } else {
         context.getString(R.string.permission_summary_notifications_ok)
     }
-    return "$batteryText · $notificationText"
+    val alarmText = if (exactAlarmsDenied(context, attentionRefreshTick)) {
+        context.getString(R.string.permission_summary_exact_alarms_needed)
+    } else {
+        context.getString(R.string.permission_summary_exact_alarms_ok)
+    }
+    return "$batteryText · $notificationText · $alarmText"
 }
 
 private fun installPermissionNeeded(context: Context): Boolean =
