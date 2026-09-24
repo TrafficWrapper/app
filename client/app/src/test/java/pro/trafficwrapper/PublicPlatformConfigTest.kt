@@ -612,6 +612,377 @@ class PublicPlatformConfigTest {
         assertTrue(sinks.any { it.name == "rescue-pointer-0" && it.pointerUrl == "https://operator.example/rescue-pointer.json" })
     }
 
+    @Test
+    fun resolveRealityFlowMatrix() {
+        val vision = REALITY_FLOW_VISION
+        // Unknown device flow (old enrollment / old orchestrator): params.flow exactly as before.
+        for (routeVision in listOf(true, false, null)) {
+            assertEquals(vision, resolveRealityFlow("tcp", "", deviceFlowKnown = false, paramsFlow = " $vision ", routeVision = routeVision))
+            assertEquals("", resolveRealityFlow("tcp", vision, deviceFlowKnown = false, paramsFlow = "", routeVision = routeVision))
+            assertEquals("", resolveRealityFlow("xhttp", vision, deviceFlowKnown = false, paramsFlow = vision, routeVision = routeVision))
+        }
+        // Known Vision flow: routes marked vision=true get it, vision=false never, no mark -> TCP only.
+        assertEquals(vision, resolveRealityFlow("tcp", vision, true, "", routeVision = true))
+        assertEquals("", resolveRealityFlow("tcp", vision, true, vision, routeVision = false))
+        assertEquals(vision, resolveRealityFlow("tcp", vision, true, "", routeVision = null))
+        assertEquals(vision, resolveRealityFlow("", vision, true, "", routeVision = null))
+        assertEquals("", resolveRealityFlow("xhttp", vision, true, "", routeVision = true))
+        assertEquals("", resolveRealityFlow("xhttp", vision, true, "", routeVision = false))
+        assertEquals("", resolveRealityFlow("XHTTP", vision, true, vision, routeVision = null))
+        // Known empty flow (app without Vision on the orchestrator): never a flow.
+        for (routeVision in listOf(true, false, null)) {
+            for (network in listOf("tcp", "xhttp")) {
+                assertEquals("", resolveRealityFlow(network, "", true, vision, routeVision = routeVision))
+            }
+        }
+        // Only Vision is supported as a device flow.
+        assertEquals("", resolveRealityFlow("tcp", "xtls-rprx-direct", true, "", routeVision = true))
+    }
+
+    @Test
+    fun realityRouteVisionReadsOptionalMark() {
+        assertEquals(null, realityRouteVision(JSONObject()))
+        assertEquals(true, realityRouteVision(JSONObject().put("vision", true)))
+        assertEquals(false, realityRouteVision(JSONObject().put("vision", false)))
+    }
+
+    @Test
+    fun realityCohortIndexUsesSha256OfDeviceId() {
+        val hash = MessageDigest.getInstance("SHA-256").digest("device-a".toByteArray(Charsets.UTF_8))
+        val expected = (
+            ((hash[0].toLong() and 0xff) shl 24) or
+                ((hash[1].toLong() and 0xff) shl 16) or
+                ((hash[2].toLong() and 0xff) shl 8) or
+                (hash[3].toLong() and 0xff)
+            ) % 16
+        assertEquals(expected.toInt(), realityCohortIndex("device-a", 16))
+        // Fixed vector: sha256("device-a")[0:4] = dd5e8641 = 3713959489.
+        assertEquals(1, realityCohortIndex("device-a", 16))
+        assertEquals(6, realityCohortIndex("3f1c2e", 16))
+        assertEquals(0, realityCohortIndex("3f1c2e", 3))
+    }
+
+    @Test
+    fun resolveRealityShortIdPicksCohortSlotWithFallback() {
+        val cohorts = org.json.JSONArray((0 until 16).map { "c%02d".format(it) })
+        val params = JSONObject().put("short_id", "base").put("cohort_short_ids", cohorts)
+        assertEquals("c01", resolveRealityShortId(params, "device-a"))
+        assertEquals("c06", resolveRealityShortId(params, "3f1c2e"))
+        // Revoked slot -> base short id.
+        cohorts.put(1, "")
+        assertEquals("base", resolveRealityShortId(params, "device-a"))
+        // No list / empty list / unknown device -> base short id (as before).
+        assertEquals("base", resolveRealityShortId(JSONObject().put("short_id", "base"), "device-a"))
+        assertEquals("sid", resolveRealityShortId(JSONObject().put("shortId", "sid").put("cohort_short_ids", org.json.JSONArray()), "device-a"))
+        assertEquals("base", resolveRealityShortId(JSONObject(params.toString()).put("cohort_short_ids", cohorts), ""))
+    }
+
+    @Test
+    fun routeSlotsWithoutNewFieldsBehaveAsBefore() {
+        val slots = PublicPlatformConfigParser.routeSlots(
+            config = parseConfig(nestedParamsClientConfig()),
+            deviceId = "device-a",
+            credentials = credentials(),
+        )
+        assertEquals(1, slots.realityVariants.size)
+        assertEquals(slots.reality, slots.realityVariants.single().config)
+        assertEquals("xtls-rprx-vision", slots.reality?.flow)
+        assertEquals("short-id", slots.reality?.shortId)
+        assertEquals(1, slots.awgRuVariants.size)
+        assertEquals(IpFamily.V4, slots.awgRuVariants.single().family)
+        assertEquals(emptyList<RealityRouteVariant>(), slots.reality2Variants)
+    }
+
+    @Test
+    fun routeSlotsApplyEnrollFlowAndCohortShortId() {
+        val slots = PublicPlatformConfigParser.routeSlots(
+            config = parseConfig(featureClientConfig()),
+            deviceId = "device-a",
+            credentials = credentials(realityFlow = REALITY_FLOW_VISION, realityFlowKnown = true),
+        )
+        val primary = slots.reality!!
+        assertEquals("primary.example", primary.address)
+        assertEquals(443, primary.port)
+        assertEquals(REALITY_FLOW_VISION, primary.flow)
+        assertEquals("c1", primary.shortId)
+
+        val noVision = PublicPlatformConfigParser.routeSlots(
+            config = parseConfig(featureClientConfig()),
+            deviceId = "device-a",
+            credentials = credentials(realityFlow = "", realityFlowKnown = true),
+        )
+        assertEquals("", noVision.reality?.flow)
+    }
+
+    @Test
+    fun fallbackProfileRoutesExtendVariantsWithoutTakingSlots() {
+        val slots = PublicPlatformConfigParser.routeSlots(
+            config = parseConfig(featureClientConfig()),
+            deviceId = "device-a",
+            credentials = credentials(realityFlow = REALITY_FLOW_VISION, realityFlowKnown = true),
+        )
+        // The fallback routes of worker-a must not become REALITY2; worker-b's primary does.
+        assertEquals("b.example", slots.reality2?.address)
+        assertEquals(1, slots.reality2Variants.size)
+
+        val keys = slots.realityVariants.map { it.key }
+        assertEquals(
+            listOf(
+                "worker-a|reality|tcp|v4|xtls-rprx-vision",
+                "worker-a|tcp-alt|tcp|v4|xtls-rprx-vision",
+                "worker-a|tcp-novision|tcp|v4|",
+                "worker-a|xhttp|xhttp|v4|",
+                "worker-a|tcp-alt|tcp|v6|xtls-rprx-vision",
+                "worker-a|xhttp|xhttp|v6|",
+            ),
+            keys,
+        )
+        val xhttp = slots.realityVariants.first { it.key == "worker-a|xhttp|xhttp|v4|" }.config
+        assertEquals(8443, xhttp.port)
+        assertEquals("stream-up", xhttp.xhttpMode)
+        assertEquals("/xh", xhttp.xhttpPath)
+        assertEquals("", xhttp.xhttpHost)
+        assertEquals("", xhttp.flow)
+        assertEquals("c1", xhttp.shortId)
+        assertTrue(xhttp.isComplete())
+        val xhttpV6 = slots.realityVariants.first { it.key == "worker-a|xhttp|xhttp|v6|" }.config
+        assertEquals("2001:db8::1", xhttpV6.address)
+
+        // No IPv6 on the network: v6 variants are dropped; IPv6-only: they come first.
+        val v4Only = RouteVariants.orderForNetwork(slots.realityVariants, RealityRouteVariant::family, NetworkIpFamilies.DEFAULT)
+        assertTrue(v4Only.all { it.family == IpFamily.V4 })
+        val v6Only = RouteVariants.orderForNetwork(
+            slots.realityVariants,
+            RealityRouteVariant::family,
+            NetworkIpFamilies(ipv4 = false, ipv6 = true),
+        )
+        assertEquals(IpFamily.V6, v6Only.first().family)
+        assertEquals(IpFamily.V4, v6Only.last().family)
+    }
+
+    @Test
+    fun realityProfilesParamsExpandToVariants() {
+        val route = PublicRouteConfig(
+            type = "reality",
+            enabled = true,
+            address = "w.example",
+            port = 443,
+            expectedEgressIp = "",
+            dialectId = "",
+            params = JSONObject()
+                .put("public_key", "pk")
+                .put("short_id", "sid")
+                .put("server_name", "sni.example")
+                .put("network", "tcp")
+                .put(
+                    "reality_profiles",
+                    org.json.JSONArray()
+                        .put(
+                            JSONObject().put("name", "reality").put("address", "w.example").put("port", 443)
+                                .put("network", "tcp").put("flows", org.json.JSONArray().put("").put(REALITY_FLOW_VISION)),
+                        )
+                        .put(
+                            JSONObject().put("name", "xh").put("address", "w.example").put("address_v6", "2001:db8::5")
+                                .put("port", 8443).put("network", "xhttp").put("flows", org.json.JSONArray().put(""))
+                                .put("xhttp", JSONObject().put("path", "/p").put("mode", "").put("host", "cdn.example")),
+                        ),
+                ),
+        )
+        val worker = PublicWorkerConfig("w", "W", 0, 100, listOf(route))
+        val variants = RouteVariants.expandRealityVariants(
+            PublicResolvedRoute(worker, route),
+            fallbacks = emptyList(),
+            credentials = credentials(realityFlow = REALITY_FLOW_VISION, realityFlowKnown = true),
+        )
+        assertEquals(
+            listOf("w|reality|tcp|v4|xtls-rprx-vision", "w|xh|xhttp|v4|", "w|xh|xhttp|v6|"),
+            variants.map { it.key },
+        )
+        assertEquals("stream-up", variants[1].config.xhttpMode)
+        assertEquals("", variants[1].config.xhttpHost)
+        assertEquals("2001:db8::5", variants[2].config.address)
+    }
+
+    @Test
+    fun awgVariantsAddIpv6OnlyWithEndpointV6() {
+        val slots = PublicPlatformConfigParser.routeSlots(
+            config = parseConfig(featureClientConfig()),
+            deviceId = "device-a",
+            credentials = credentials(),
+        )
+        val awgRu = slots.awgRuVariants
+        assertEquals(listOf(IpFamily.V4, IpFamily.V6), awgRu.map { it.family })
+        assertEquals("worker-a|awg-v2|awg|v6|", awgRu[1].key)
+        assertEquals(
+            listOf(IpFamily.V4),
+            RouteVariants.orderForNetwork(awgRu, AwgRouteVariant::family, NetworkIpFamilies.DEFAULT).map { it.family },
+        )
+        val noV6 = RouteVariants.expandAwgVariants(
+            PublicResolvedRoute(
+                PublicWorkerConfig("w", "W", 0, 100, emptyList()),
+                PublicRouteConfig("awg", true, "w.example", 51820, "", "", params = JSONObject()),
+            ),
+        )
+        assertEquals(1, noV6.size)
+    }
+
+    @Test
+    fun coreApplyRequestIsBackwardCompatibleAndCarriesNewFields() {
+        val config = parseConfig(featureClientConfig())
+        val stored = StoredPublicPlatformState(
+            deviceID = "device-a",
+            realityUUID = "11111111-1111-4111-8111-111111111111",
+            internalIP = "10.13.13.2/32",
+            psk2 = "psk",
+            serverAWGPublic = "server",
+            awgPrivateKey = "private",
+            awgPublicKey = "public",
+        )
+        val slots = PublicPlatformConfigParser.routeSlots(config, stored.deviceID, stored.toPublicPlatformCredentials())
+        val legacy = publicCoreApplyRequest(stored, config, slots, "127.0.0.1:18082", "127.0.0.1:18084", awgRuFamily = "", awgFamily = "")
+        assertEquals(false, legacy.has("awg_profiles"))
+        assertEquals(false, legacy.has("rendezvous_public_key"))
+        assertEquals(false, legacy.getJSONObject("awg_ru").has("ip_family"))
+        assertEquals(1420, legacy.getInt("mtu"))
+        assertEquals("127.0.0.1:18082", legacy.getString("socks_listen"))
+        assertEquals("127.0.0.1:18084", legacy.getString("awg_ru_socks_listen"))
+        assertEquals("private", legacy.getString("awg_private_key"))
+        assertEquals("[2001:db8::1]:51821", legacy.getJSONObject("awg_ru").getString("endpoint_v6"))
+        assertEquals("awg-v2", legacy.getJSONObject("awg_ru").getString("awg_profile"))
+        assertEquals("10.8.0.1", legacy.getJSONObject("awg_ru").getJSONArray("dns").getString(0))
+
+        val profiles = JSONObject().put("awg-v2", JSONObject().put("awg_public_key", "pk2").put("internal_ip", "10.14.0.2/32").put("psk2", "p2"))
+        val request = publicCoreApplyRequest(
+            stored.copy(awgProfilesJson = profiles.toString()),
+            config,
+            slots,
+            "127.0.0.1:18082",
+            "127.0.0.1:18084",
+            rendezvousPublicKey = "rv",
+            awgRuFamily = "v6",
+            awgFamily = "",
+        )
+        assertEquals("pk2", request.getJSONObject("awg_profiles").getJSONObject("awg-v2").getString("awg_public_key"))
+        assertEquals("rv", request.getString("rendezvous_public_key"))
+        assertEquals("v6", request.getJSONObject("awg_ru").getString("ip_family"))
+        // A slot without endpoint_v6 never asks the core for IPv6.
+        val noV6Slots = PublicPlatformConfigParser.routeSlots(parseConfig(nestedParamsClientConfig()), "device-a", stored.toPublicPlatformCredentials())
+        val noV6 = publicCoreApplyRequest(stored, parseConfig(nestedParamsClientConfig()), noV6Slots, "a", "b", awgRuFamily = "v6", awgFamily = "")
+        assertEquals(false, noV6.getJSONObject("awg_ru").has("ip_family"))
+    }
+
+    @Test
+    fun enrollmentVersionRefreshTriggersOnAnyVersionChange() {
+        assertTrue(publicEnrollmentNeedsVersionRefresh(0, 31))
+        assertTrue(publicEnrollmentNeedsVersionRefresh(32, 31))
+        assertTrue(publicEnrollmentNeedsVersionRefresh(30, 31))
+        assertEquals(false, publicEnrollmentNeedsVersionRefresh(31, 31))
+        assertTrue(shouldWaitForPublicVersionReEnroll(needed = true, lastFailureAtMs = 0L, nowMs = 5_000L))
+        assertEquals(false, shouldWaitForPublicVersionReEnroll(needed = false, lastFailureAtMs = 0L, nowMs = 5_000L))
+        assertEquals(false, shouldWaitForPublicVersionReEnroll(needed = true, lastFailureAtMs = 1_000L, nowMs = 60_000L))
+        assertTrue(
+            shouldWaitForPublicVersionReEnroll(
+                needed = true,
+                lastFailureAtMs = 1_000L,
+                nowMs = 1_000L + PUBLIC_REENROLL_RETRY_AFTER_MS,
+            ),
+        )
+    }
+
+    @Test
+    fun clientCapabilitiesAreTheAgreedSet() {
+        assertEquals(
+            listOf("reality_vision", "reality_profiles", "reality_short_id", "awg_dialect_wide", "ipv6_endpoints", "tunnel_dns"),
+            PUBLIC_CLIENT_CAPABILITIES,
+        )
+    }
+
+    private fun parseConfig(configJson: String): PublicClientConfig =
+        PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = JSONObject().put("config_json", configJson).put("minisig", "sig").toString(),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 0,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+
+    private fun credentials(realityFlow: String = "", realityFlowKnown: Boolean = false): PublicPlatformCredentials =
+        PublicPlatformCredentials(
+            deviceID = "device-a",
+            realityUUID = "11111111-1111-4111-8111-111111111111",
+            internalIP = "10.13.13.2/32",
+            psk2 = "psk",
+            serverAWGPublic = "server",
+            awgPrivateKey = "private",
+            awgPublicKey = "public",
+            realityFlow = realityFlow,
+            realityFlowKnown = realityFlowKnown,
+        )
+
+    /**
+     * Orchestrator bundle shape (PR #5/#6): worker-a has a primary REALITY route with cohorts and
+     * vision=true, fallback routes with "profile" (tcp with/without Vision, xhttp with IPv6) and an
+     * AWG profile route with endpoint_v6/dns; worker-b (lower priority) has a primary REALITY route.
+     */
+    private fun featureClientConfig(): String {
+        val cohorts = org.json.JSONArray((0 until 16).map { "c$it" })
+        val primary = JSONObject()
+            .put("type", "reality").put("enabled", true).put("address", "primary.example").put("port", 443)
+            .put("egress_ip", "198.51.100.40").put("vision", true).put("cohort_short_ids", cohorts)
+            .put(
+                "params",
+                JSONObject().put("public_key", "pk").put("short_id", "base").put("server_name", "sni.example")
+                    .put("network", "tcp").put("flow", "").put("cohort_short_ids", cohorts),
+            )
+        val tcpAlt = JSONObject()
+            .put("type", "reality").put("enabled", true).put("address", "primary.example").put("port", 2083)
+            .put("egress_ip", "198.51.100.40").put("profile", "tcp-alt").put("vision", true)
+            .put(
+                "params",
+                JSONObject().put("name", "tcp-alt").put("public_key", "pk").put("short_id", "base")
+                    .put("server_name", "sni.example").put("network", "tcp").put("address_v6", "2001:db8::1")
+                    .put("cohort_short_ids", cohorts),
+            )
+        val tcpNoVision = JSONObject()
+            .put("type", "reality").put("enabled", true).put("address", "primary.example").put("port", 2087)
+            .put("egress_ip", "198.51.100.40").put("profile", "tcp-novision").put("vision", false)
+            .put(
+                "params",
+                JSONObject().put("public_key", "pk").put("short_id", "base").put("server_name", "sni.example")
+                    .put("network", "tcp"),
+            )
+        val xhttp = JSONObject()
+            .put("type", "reality").put("enabled", true).put("address", "primary.example").put("port", 8443)
+            .put("egress_ip", "198.51.100.40").put("profile", "xhttp").put("vision", false)
+            .put(
+                "params",
+                JSONObject().put("public_key", "pk").put("short_id", "base").put("server_name", "sni.example")
+                    .put("network", "xhttp").put("address_v6", "2001:db8::1").put("cohort_short_ids", cohorts)
+                    .put("xhttp", JSONObject().put("path", "/xh").put("mode", "").put("host", "cdn.example")),
+            )
+        val awg = JSONObject()
+            .put("type", "awg").put("enabled", true).put("address", "primary.example").put("port", 51821)
+            .put("egress_ip", "198.51.100.40").put("profile", "awg-v2").put("awg_profile", "awg-v2")
+            .put("endpoint_v6", "[2001:db8::1]:51821").put("dns", org.json.JSONArray().put("10.8.0.1"))
+            .put("params", JSONObject().put("public_key", "awgpk").put("endpoint", "primary.example:51821"))
+        val workerA = JSONObject().put("worker_id", "worker-a").put("label", "A").put("priority", 0).put("weight", 100)
+            .put("routes", org.json.JSONArray().put(primary).put(xhttp).put(tcpNoVision).put(tcpAlt).put(awg))
+        val workerB = JSONObject().put("worker_id", "worker-b").put("label", "B").put("priority", 1).put("weight", 100)
+            .put(
+                "routes",
+                org.json.JSONArray().put(
+                    JSONObject().put("type", "reality").put("enabled", true).put("address", "b.example").put("port", 443)
+                        .put("egress_ip", "198.51.100.41")
+                        .put("params", JSONObject().put("public_key", "pkb").put("short_id", "sb").put("server_name", "sni.example")),
+                ),
+            )
+        return JSONObject()
+            .put("schema", 1).put("ns", "client-config-v1").put("seq", 30)
+            .put("issued_at", "2030-01-01T00:00:00Z").put("expires_at", "2035-01-01T00:00:00Z")
+            .put("workers", org.json.JSONArray().put(workerA).put(workerB))
+            .toString()
+    }
+
     private fun fakeVerifier(ok: Boolean): PublicMinisignVerifier =
         object : PublicMinisignVerifier {
             override fun verify(message: String, signature: String, publicKey: String): Boolean =
