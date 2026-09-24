@@ -135,7 +135,7 @@ export TW_PUBLIC_SIGNING_CERT_SHA256=<your-release-cert-sha256>
 | `TW_VERSION_CODE` | Android integer version code. | Опц. | Дефолт `1001`; для releases используйте монотонные значения. |
 | `TW_VERSION_NAME` | Android version name. | Опц. | Дефолт `public-1.0.0`; перекрывает `TW_PUBLIC_VERSION_NAME`. |
 | `TW_PUBLIC_VERSION_NAME` | Legacy/public fallback version name. | Опц. | Используется только если `TW_VERSION_NAME` не задан. |
-| `TW_ENROLLMENT_SECRET` | Optional BuildConfig enrollment secret. | Опц. | Обычно empty для public platform builds. |
+| `TW_ENROLLMENT_SECRET` | Optional BuildConfig enrollment-идентификатор (исторически называется «secret»). | Опц. | Обычно empty для public platform builds. **Это не секрет:** значение вкомпилировано в `BuildConfig` и извлекается из APK кем угодно; не используйте его для аутентификации или авторизации. |
 | `TW_VPN_ENABLED` | Включает optional Android `VpnService` mode и UI при сборке. | Опц. | Дефолт `false`; public APK по умолчанию остаётся SOCKS-only. |
 | `TW_RELEASE_KEYSTORE` | Путь к Android release keystore. | Обяз. для release | Генерируете сами через `keytool -genkeypair`. |
 | `TW_RELEASE_KEY_ALIAS` | Alias внутри release keystore. | Обяз. для release | Значение `-alias` из `keytool`. |

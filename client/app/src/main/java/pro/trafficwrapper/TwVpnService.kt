@@ -36,8 +36,8 @@ class TwVpnService : VpnService() {
     private val activeRebindInFlight = AtomicBoolean(false)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_VPN_START -> {
+        when (vpnStartKind(intent?.action)) {
+            VpnStartKind.APP_START -> {
                 if (TransportLifecycleStore.vpnEnabled(applicationContext)) {
                     startVpnForeground()
                     vpnExecutor.execute { establishAndStart() }
@@ -45,13 +45,113 @@ class TwVpnService : VpnService() {
                     stopStartRequestAfterForeground(startId, "vpn_disabled")
                 }
             }
-            ACTION_VPN_STOP -> {
+            VpnStartKind.SYSTEM_START -> {
+                // Always-on VPN (or a system restart of the VPN): the system starts the service
+                // with action android.net.VpnService (or no action) and expects it to come up
+                // without the app UI. Promote to foreground first, then do the checks off-thread.
+                startVpnForeground()
+                vpnExecutor.execute { startFromSystem(startId) }
+            }
+            VpnStartKind.STOP -> {
                 TransportLifecycleStore.setVpnEnabled(applicationContext, false)
                 notifyVpnConfigChanged()
                 vpnExecutor.execute { stopVpn() }
             }
+            VpnStartKind.IGNORE -> Unit
         }
         return START_NOT_STICKY
+    }
+
+    private fun startFromSystem(startId: Int) {
+        val appContext = applicationContext
+        if (!isEnrolledForSystemStart()) {
+            Log.w(LOG_TAG, "system VPN start without enrollment; stopping")
+            Telemetry.event(appContext, "vpn_state", "action" to "always_on_not_enrolled")
+            showEnrollmentRequiredNotification()
+            stopVpnBridgeOnly()
+            stopVpnForeground()
+            unbindFromUnderlyingNetwork()
+            stopSelf(startId)
+            return
+        }
+        Log.i(LOG_TAG, "system VPN start (always-on)")
+        TransportLifecycleStore.setVpnEnabled(appContext, true)
+        val transportWasRequested = TransportLifecycleStore.shouldKeepAlive(appContext)
+        if (!transportWasRequested) {
+            // The VPN bridge forwards into the local router, so the transport must run as well.
+            TransportLifecycleStore.rememberActiveTransport(appContext, TransportLifecycleStore.preferredMode(appContext))
+        }
+        mainHandler.post {
+            TransportRuntime.state = TransportRuntime.state.copy(
+                vpnEnabled = BuildConfig.VPN_ENABLED,
+                vpnTransition = VpnTransition.STARTING,
+            )
+        }
+        establishAndStart()
+        if (bridgeStarted || blackholePfd != null) {
+            startTransportForSystemVpn()
+        } else if (!transportWasRequested) {
+            // VPN could not be established (establishAndStart already stopped the service):
+            // do not leave a keep-alive request behind that the user never made.
+            TransportLifecycleStore.rememberStopped(appContext)
+        }
+    }
+
+    private fun isEnrolledForSystemStart(): Boolean {
+        val appContext = applicationContext
+        if (TransportRuntime.auth.authorized) return true
+        if (!DeploymentConfig.IS_PUBLIC_PLATFORM) {
+            return TransportLifecycleStore.shouldKeepAlive(appContext)
+        }
+        val stored = runCatching { SecureIdentityStore(appContext).readPublicPlatformState() }
+            .onFailure { Log.w(LOG_TAG, "enrollment state unavailable: ${it.message}") }
+            .getOrNull()
+            ?: return false
+        return stored.clientBundleJson.isNotBlank() &&
+            stored.configPubkeyPin.isNotBlank() &&
+            stored.realityUUID.isNotBlank() &&
+            stored.awgPrivateKey.isNotBlank()
+    }
+
+    private fun startTransportForSystemVpn() {
+        val appContext = applicationContext
+        val intent = Intent(appContext, AutoTransportService::class.java)
+            .setAction(AutoTransportService.ACTION_START)
+            .putExtra(AutoTransportService.EXTRA_MODE, TransportLifecycleStore.preferredMode(appContext).name)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 26) {
+                appContext.startForegroundService(intent)
+            } else {
+                appContext.startService(intent)
+            }
+        }.onFailure {
+            Log.w(LOG_TAG, "Unable to start transport for system VPN start", it)
+        }
+    }
+
+    private fun showEnrollmentRequiredNotification() {
+        runCatching {
+            val manager = getSystemService(NotificationManager::class.java) ?: return
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    SERVICE_ALERT_CHANNEL_ID,
+                    getString(R.string.service_alert_channel),
+                    NotificationManager.IMPORTANCE_DEFAULT,
+                ),
+            )
+            val text = getString(R.string.vpn_always_on_enrollment_required_text)
+            val notification = Notification.Builder(this, SERVICE_ALERT_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(getString(R.string.vpn_always_on_enrollment_required_title))
+                .setContentText(text)
+                .setStyle(Notification.BigTextStyle().bigText(text))
+                .setContentIntent(mainActivityLaunchPendingIntent(this))
+                .setAutoCancel(true)
+                .build()
+            manager.notify(ENROLLMENT_REQUIRED_NOTIFICATION_ID, notification)
+        }.onFailure {
+            Log.w(LOG_TAG, "enrollment notification failed: ${it.message}")
+        }
     }
 
     override fun onRevoke() {
@@ -491,11 +591,11 @@ class TwVpnService : VpnService() {
     private fun startVpnForeground() {
         createNotificationChannel()
         val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= 29) {
+        if (Build.VERSION.SDK_INT >= 34) {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
@@ -544,7 +644,12 @@ class TwVpnService : VpnService() {
 
         private const val LOG_TAG = "TwVpnService"
         private const val CHANNEL_ID = "tw_vpn"
-        private const val NOTIFICATION_ID = 1313
+        private const val SERVICE_ALERT_CHANNEL_ID = "service-alerts"
+
+        // Distinct from AutoTransportService alert ids (1313-1315): an alert must never replace
+        // the VPN foreground notification.
+        private const val NOTIFICATION_ID = 1316
+        private const val ENROLLMENT_REQUIRED_NOTIFICATION_ID = 1317
         private const val VPN_ADDRESS = "10.111.0.2"
         private const val VPN_IPV6_ADDRESS = "fd00:1111::1"
         private const val VPN_DNS_SERVER = "1.1.1.1"
@@ -554,3 +659,21 @@ class TwVpnService : VpnService() {
         private const val BLACKHOLE_RECONNECT_MAX_MS = 60_000L
     }
 }
+
+internal enum class VpnStartKind {
+    APP_START,
+    SYSTEM_START,
+    STOP,
+    IGNORE,
+}
+
+/** Action android.net.VpnService, used by the system for always-on VPN starts. */
+internal const val VPN_SERVICE_INTERFACE_ACTION = "android.net.VpnService"
+
+internal fun vpnStartKind(action: String?): VpnStartKind =
+    when (action) {
+        TwVpnService.ACTION_VPN_START -> VpnStartKind.APP_START
+        TwVpnService.ACTION_VPN_STOP -> VpnStartKind.STOP
+        null, VPN_SERVICE_INTERFACE_ACTION -> VpnStartKind.SYSTEM_START
+        else -> VpnStartKind.IGNORE
+    }

@@ -88,9 +88,23 @@ class RealityXrayConfigTest {
     }
 
     @Test
-    fun xhttpXrayConfigUsesDebugLogLevelForDialDiagnostics() {
-        assertEquals("debug", realityXrayLogLevel(baseConfig(network = "xhttp")))
-        assertEquals("warning", realityXrayLogLevel(baseConfig(network = "tcp")))
+    fun xhttpXrayConfigUsesDebugLogLevelOnlyInDebugBuilds() {
+        assertEquals("debug", realityXrayLogLevel(baseConfig(network = "xhttp"), debugBuild = true))
+        assertEquals("warning", realityXrayLogLevel(baseConfig(network = "xhttp"), debugBuild = false))
+        assertEquals("warning", realityXrayLogLevel(baseConfig(network = "tcp"), debugBuild = true))
+        assertEquals("warning", realityXrayLogLevel(baseConfig(network = "tcp"), debugBuild = false))
+    }
+
+    @Test
+    fun xraySocksInboundRequiresPasswordAuth() {
+        val settings = realityXraySocksInboundSettings(SocksCredentials("tw-internal", "s3cret"))
+
+        assertEquals("password", settings.getString("auth"))
+        assertFalse(settings.getBoolean("udp"))
+        val accounts = settings.getJSONArray("accounts")
+        assertEquals(1, accounts.length())
+        assertEquals("tw-internal", accounts.getJSONObject(0).getString("user"))
+        assertEquals("s3cret", accounts.getJSONObject(0).getString("pass"))
     }
 
     private fun baseConfig(

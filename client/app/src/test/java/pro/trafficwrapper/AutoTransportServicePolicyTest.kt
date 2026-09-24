@@ -1,10 +1,13 @@
 package pro.trafficwrapper
 
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class AutoTransportServicePolicyTest {
@@ -762,5 +765,235 @@ class AutoTransportServicePolicyTest {
                 sleepMs = ALL_DEAD_WAKELOCK_MIN_SLEEP_MS,
             ),
         )
+    }
+
+    @Test
+    fun screenOffStableTunnelBacksOffExponentiallyToCap() {
+        val nowMs = 1_000_000L
+        val idleRx = nowMs - STABLE_IDLE_RX_AGE_MS
+
+        fun sleep(cycles: Int) = probeLoopSleepMs(
+            stable = true,
+            nowMs = nowMs,
+            lastTunnelRxProgressAtMs = idleRx,
+            reconnectBackoffMs = 2_500L,
+            screenInteractive = false,
+            screenOffStableCycles = cycles,
+        )
+
+        assertEquals(SCREEN_OFF_STABLE_PROBE_BASE_MS, sleep(0))
+        assertEquals(SCREEN_OFF_STABLE_PROBE_BASE_MS * 2, sleep(1))
+        assertEquals(SCREEN_OFF_STABLE_PROBE_BASE_MS * 4, sleep(2))
+        assertEquals(SCREEN_OFF_STABLE_PROBE_MAX_MS, sleep(3))
+        assertEquals(SCREEN_OFF_STABLE_PROBE_MAX_MS, sleep(50))
+        assertTrue(sleep(0) >= 60_000L)
+    }
+
+    @Test
+    fun screenOffWithTrafficOrRecoveryKeepsShorterCadence() {
+        val nowMs = 1_000_000L
+        assertEquals(
+            SCREEN_OFF_ACTIVE_PROBE_INTERVAL_MS,
+            probeLoopSleepMs(
+                stable = true,
+                nowMs = nowMs,
+                lastTunnelRxProgressAtMs = nowMs - 1_000L,
+                reconnectBackoffMs = 2_500L,
+                screenInteractive = false,
+                screenOffStableCycles = 3,
+            ),
+        )
+        // Recovery is never slowed down by the screen state.
+        assertEquals(
+            5_000L,
+            probeLoopSleepMs(
+                stable = false,
+                nowMs = nowMs,
+                lastTunnelRxProgressAtMs = 0L,
+                reconnectBackoffMs = 5_000L,
+                screenInteractive = false,
+                screenOffStableCycles = 3,
+            ),
+        )
+        // Screen on: the regular short intervals.
+        assertEquals(
+            STABLE_IDLE_PROBE_INTERVAL_MS,
+            probeLoopSleepMs(
+                stable = true,
+                nowMs = nowMs,
+                lastTunnelRxProgressAtMs = 0L,
+                reconnectBackoffMs = 2_500L,
+                screenInteractive = true,
+                screenOffStableCycles = 3,
+            ),
+        )
+    }
+
+    @Test
+    fun wakeLockIsNotHeldAcrossSleepForStableTunnel() {
+        assertFalse(
+            shouldHoldWakeLockDuringSleep(
+                stable = true,
+                routeHealthy = true,
+                hasUsableRoute = true,
+                consecutiveAllDeadCycles = 0,
+                sleepMs = STABLE_IDLE_PROBE_INTERVAL_MS,
+            ),
+        )
+        assertFalse(
+            shouldHoldWakeLockDuringSleep(
+                stable = true,
+                routeHealthy = true,
+                hasUsableRoute = true,
+                consecutiveAllDeadCycles = 0,
+                sleepMs = PROBE_INTERVAL_MS,
+            ),
+        )
+    }
+
+    @Test
+    fun wakeLockIsHeldOnlyForShortRecoveryBackoff() {
+        assertTrue(
+            shouldHoldWakeLockDuringSleep(
+                stable = false,
+                routeHealthy = false,
+                hasUsableRoute = true,
+                consecutiveAllDeadCycles = 0,
+                sleepMs = 5_000L,
+            ),
+        )
+        // All routes dead for several cycles: sleep without the lock (backstop alarm wakes us).
+        assertFalse(
+            shouldHoldWakeLockDuringSleep(
+                stable = false,
+                routeHealthy = false,
+                hasUsableRoute = false,
+                consecutiveAllDeadCycles = ALL_DEAD_WAKELOCK_RELEASE_CYCLES,
+                sleepMs = ALL_DEAD_WAKELOCK_MIN_SLEEP_MS,
+            ),
+        )
+        assertFalse(
+            shouldHoldWakeLockDuringSleep(
+                stable = false,
+                routeHealthy = true,
+                hasUsableRoute = true,
+                consecutiveAllDeadCycles = 0,
+                sleepMs = RECOVERY_WAKELOCK_MAX_SLEEP_MS + 1,
+            ),
+        )
+        // A long outage stops pinning the CPU after the recovery window.
+        assertFalse(
+            shouldHoldWakeLockDuringSleep(
+                stable = false,
+                routeHealthy = true,
+                hasUsableRoute = true,
+                consecutiveAllDeadCycles = 0,
+                sleepMs = 5_000L,
+                unstableForMs = RECOVERY_WAKELOCK_MAX_DURATION_MS + 1,
+            ),
+        )
+        assertEquals(WAKELOCK_ACTIVE_WORK_TIMEOUT_MS, workerCycleWakeLockTimeoutMs(holdDuringSleep = false, sleepMs = 5_000L))
+        assertEquals(WAKELOCK_ACTIVE_WORK_TIMEOUT_MS + 5_000L, workerCycleWakeLockTimeoutMs(holdDuringSleep = true, sleepMs = 5_000L))
+    }
+
+    private val internalCreds = SocksCredentials("tw-int", "internal-pass")
+    private val frontEndCreds = SocksCredentials("tw", "front-pass")
+
+    private fun userPassRequest(creds: SocksCredentials, methods: ByteArray = byteArrayOf(0x02)): ByteArray {
+        val user = creds.username.toByteArray()
+        val pass = creds.password.toByteArray()
+        return byteArrayOf(0x05, methods.size.toByte()) + methods +
+            byteArrayOf(0x01, user.size.toByte()) + user + byteArrayOf(pass.size.toByte()) + pass
+    }
+
+    @Test
+    fun routerAcceptsNoAuthOnlyWhileFrontEndPasswordIsDisabled() {
+        val out = ByteArrayOutputStream()
+        val matched = negotiateLocalSocksServerAuth(
+            ByteArrayInputStream(byteArrayOf(0x05, 0x01, 0x00)),
+            out,
+            internalCreds,
+            frontEnd = null,
+        )
+        assertNull(matched)
+        assertArrayEquals(byteArrayOf(0x05, 0x00), out.toByteArray())
+
+        val rejectedOut = ByteArrayOutputStream()
+        try {
+            negotiateLocalSocksServerAuth(
+                ByteArrayInputStream(byteArrayOf(0x05, 0x01, 0x00)),
+                rejectedOut,
+                internalCreds,
+                frontEnd = frontEndCreds,
+            )
+            fail("no-auth must be rejected when the front-end password is enabled")
+        } catch (_: SocksAuthRejectedException) {
+        }
+        assertArrayEquals(byteArrayOf(0x05, 0xff.toByte()), rejectedOut.toByteArray())
+    }
+
+    @Test
+    fun routerAcceptsInternalCredentialsInBothModes() {
+        for (frontEnd in listOf(null, frontEndCreds)) {
+            val out = ByteArrayOutputStream()
+            val matched = negotiateLocalSocksServerAuth(
+                ByteArrayInputStream(userPassRequest(internalCreds)),
+                out,
+                internalCreds,
+                frontEnd,
+            )
+            assertEquals(internalCreds, matched)
+            assertArrayEquals(byteArrayOf(0x05, 0x02, 0x01, 0x00), out.toByteArray())
+        }
+    }
+
+    @Test
+    fun routerAcceptsFrontEndCredentialsAndRejectsWrongOnes() {
+        val out = ByteArrayOutputStream()
+        val matched = negotiateLocalSocksServerAuth(
+            ByteArrayInputStream(userPassRequest(frontEndCreds, byteArrayOf(0x00, 0x02))),
+            out,
+            internalCreds,
+            frontEndCreds,
+        )
+        assertEquals(frontEndCreds, matched)
+
+        val wrongOut = ByteArrayOutputStream()
+        try {
+            negotiateLocalSocksServerAuth(
+                ByteArrayInputStream(userPassRequest(SocksCredentials("tw", "guess"))),
+                wrongOut,
+                internalCreds,
+                frontEndCreds,
+            )
+            fail("wrong password must be rejected")
+        } catch (_: SocksAuthRejectedException) {
+        }
+        assertArrayEquals(byteArrayOf(0x05, 0x02, 0x01, 0x01), wrongOut.toByteArray())
+    }
+
+    @Test
+    fun routerRejectsFrontEndCredentialsWhenFrontEndPasswordIsDisabled() {
+        try {
+            negotiateLocalSocksServerAuth(
+                ByteArrayInputStream(userPassRequest(frontEndCreds)),
+                ByteArrayOutputStream(),
+                internalCreds,
+                frontEnd = null,
+            )
+            fail("stale front-end credentials are not internal credentials")
+        } catch (_: SocksAuthRejectedException) {
+        }
+    }
+
+    @Test
+    fun releaseXrayLogLinesAreRedacted() {
+        val line = "2026/01/01 [Warning] failed to dial tcp:203.0.113.7:443 for www.example.com:443 via [2001:db8::1]:443"
+        val redacted = redactXrayLogLine(line)
+
+        assertFalse(redacted.contains("203.0.113.7"))
+        assertFalse(redacted.contains("example.com"))
+        assertFalse(redacted.contains("2001:db8"))
+        assertTrue(redacted.contains("[Warning]"))
     }
 }

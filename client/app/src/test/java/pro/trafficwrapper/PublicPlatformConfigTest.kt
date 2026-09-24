@@ -112,6 +112,131 @@ class PublicPlatformConfigTest {
     }
 
     @Test
+    fun externalBootstrapWithDifferentUpdateKeyOrSeedsRequiresConfirmation() {
+        val activeRaw = bootstrapJson("2035-01-01T00:00:00Z").replace(
+            "\"seed_workers\"",
+            "\"update_pubkey\":\"RWQupdate\",\"seed_workers\"",
+        )
+        val active = PublicPlatformConfigParser.parseBootstrap(activeRaw, nowMs = 0)
+        assertEquals("RWQupdate", active.updatePubkey)
+
+        // Only token/expiry changed: silent refresh is fine.
+        val refreshed = PublicPlatformConfigParser.parseBootstrap(
+            activeRaw.replace("once-token", "fresh-token"),
+            nowMs = 0,
+        )
+        assertEquals(ExternalBootstrapDecision.REFRESH, externalBootstrapDecision(activeRaw, refreshed, "RWQupdate"))
+
+        // A different update key is a trust-root change.
+        val otherUpdateKey = PublicPlatformConfigParser.parseBootstrap(
+            activeRaw.replace("RWQupdate", "RWQattacker").replace("once-token", "fresh-token"),
+            nowMs = 0,
+        )
+        assertEquals(false, publicBootstrapMatchesActive(activeRaw, otherUpdateKey))
+        assertEquals(
+            ExternalBootstrapDecision.CONFIRM_REPLACE,
+            externalBootstrapDecision(activeRaw, otherUpdateKey, "RWQupdate"),
+        )
+
+        // Dropping or adding the update key also counts as a change.
+        val withoutUpdateKey = PublicPlatformConfigParser.parseBootstrap(
+            bootstrapJson("2035-01-01T00:00:00Z").replace("once-token", "fresh-token"),
+            nowMs = 0,
+        )
+        assertEquals(
+            ExternalBootstrapDecision.CONFIRM_REPLACE,
+            externalBootstrapDecision(activeRaw, withoutUpdateKey),
+        )
+
+        // Seed workers are trusted routing data too.
+        val otherSeeds = PublicPlatformConfigParser.parseBootstrap(
+            activeRaw.replace("https://worker-a.dev/tw/v1", "https://evil.dev/tw/v1"),
+            nowMs = 0,
+        )
+        assertEquals(
+            ExternalBootstrapDecision.CONFIRM_REPLACE,
+            externalBootstrapDecision(activeRaw, otherSeeds, "RWQupdate"),
+        )
+    }
+
+    @Test
+    fun externalBootstrapConflictingWithPinnedUpdateKeyRequiresConfirmation() {
+        val raw = bootstrapJson("2035-01-01T00:00:00Z").replace(
+            "\"seed_workers\"",
+            "\"update_pubkey\":\"RWQother\",\"seed_workers\"",
+        )
+        val parsed = PublicPlatformConfigParser.parseBootstrap(raw.replace("once-token", "fresh-token"), nowMs = 0)
+        // Stored raw bootstrap matches, but the pin (e.g. from signed config) differs.
+        assertEquals(
+            ExternalBootstrapDecision.CONFIRM_REPLACE,
+            externalBootstrapDecision(raw, parsed, pinnedUpdatePubkey = "RWQpinned"),
+        )
+        assertTrue(updatePubkeyCompatibleWithPin("", "RWQother"))
+        assertTrue(updatePubkeyCompatibleWithPin("RWQpinned", ""))
+        assertEquals(false, updatePubkeyCompatibleWithPin("RWQpinned", "RWQother"))
+    }
+
+    @Test
+    fun updatePubkeyPinIsNotReplacedByBootstrap() {
+        val bootstrap = PublicPlatformConfigParser.parseBootstrap(
+            bootstrapJson("2035-01-01T00:00:00Z").replace(
+                "\"seed_workers\"",
+                "\"update_pubkey\":\"RWQbootstrap\",\"seed_workers\"",
+            ),
+            nowMs = 0,
+        )
+        val pinned = StoredPublicPlatformState(configPubkeyPin = PUBLIC_KEY, updatePubkeyPin = "RWQpinned")
+
+        // Signed client config wins.
+        assertEquals("RWQsigned", resolveUpdatePubkeyPin("RWQsigned", pinned, bootstrap))
+        // Existing pin is kept against an (unsigned) bootstrap for the same platform.
+        assertEquals("RWQpinned", resolveUpdatePubkeyPin("", pinned, bootstrap))
+        // First enrollment: trust on first use of the bootstrap key.
+        assertEquals("RWQbootstrap", resolveUpdatePubkeyPin("", StoredPublicPlatformState(), bootstrap))
+        // User-confirmed switch to another platform (different config key) takes the new key.
+        val otherPlatform = pinned.copy(configPubkeyPin = "RWQotherConfig")
+        assertEquals("RWQbootstrap", resolveUpdatePubkeyPin("", otherPlatform, bootstrap))
+    }
+
+    @Test
+    fun mergeEnrolledStateKeepsMonotonicCountersAndTrustedTime() {
+        val bootstrap = PublicPlatformConfigParser.parseBootstrap(bootstrapJson("2035-01-01T00:00:00Z"), nowMs = 0)
+        val current = StoredPublicPlatformState(
+            configPubkeyPin = PUBLIC_KEY,
+            updatePubkeyPin = "RWQpinned",
+            maxSeenConfigSeq = 5,
+            maxSeenUpdateSeq = 9,
+            trustedWallTimeMs = 2_000,
+            trustedElapsedRealtimeMs = 20,
+        )
+        val enrolled = StoredPublicPlatformState(
+            configPubkeyPin = PUBLIC_KEY,
+            updatePubkeyPin = "",
+            maxSeenConfigSeq = 6,
+            maxSeenUpdateSeq = 3,
+            deviceID = "dev",
+        )
+        val merged = mergeEnrolledPublicPlatformState(current, enrolled, configSeq = 6, signedConfigUpdatePubkey = "", bootstrap = bootstrap)
+        assertEquals("dev", merged.deviceID)
+        assertEquals("RWQpinned", merged.updatePubkeyPin)
+        assertEquals(6L, merged.maxSeenConfigSeq)
+        assertEquals(9L, merged.maxSeenUpdateSeq)
+        assertEquals(2_000L, merged.trustedWallTimeMs)
+        assertEquals(20L, merged.trustedElapsedRealtimeMs)
+
+        assertThrows(PublicConfigVerificationException::class.java) {
+            mergeEnrolledPublicPlatformState(current.copy(maxSeenConfigSeq = 7), enrolled, 6, "", bootstrap)
+        }
+    }
+
+    @Test
+    fun discoveryValidationTimeNeverRewindsBelowLocalClock() {
+        assertEquals(5_000L, discoveryValidationNowMs(mirrorDateMs = 1_000L, localNowMs = 5_000L))
+        assertEquals(9_000L, discoveryValidationNowMs(mirrorDateMs = 9_000L, localNowMs = 5_000L))
+        assertEquals(5_000L, discoveryValidationNowMs(mirrorDateMs = null, localNowMs = 5_000L))
+    }
+
+    @Test
     fun awgRouteJsonEmitsCanonicalEgressIPForCoreApply() {
         val route = PublicRouteConfig(
             type = "awg",

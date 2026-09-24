@@ -1,13 +1,18 @@
 package pro.trafficwrapper
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.lang.reflect.Modifier
 
 class SecureIdentityStoreTest {
     @Test
-    fun identityCreationMethodsAreSynchronized() {
+    fun identityStoreUsesProcessWideLock() {
+        // Instances are created ad hoc all over the app, so per-instance @Synchronized is not
+        // enough: the store must serialize on a static (companion) lock.
+        val lock = SecureIdentityStore::class.java.getDeclaredField("LOCK")
+        assertTrue("LOCK must be static", Modifier.isStatic(lock.modifiers))
         val methods = listOf(
             "getOrCreateIdentity",
             "getOrCreateDeviceIdentity",
@@ -15,11 +20,17 @@ class SecureIdentityStoreTest {
             "getOrCreatePublicAWGKeyPair",
             "getOrCreateWrappingKey",
         )
-
         methods.forEach { name ->
             val method = SecureIdentityStore::class.java.declaredMethods.first { it.name == name }
-            assertTrue("$name must be synchronized", Modifier.isSynchronized(method.modifiers))
+            assertFalse("$name must not rely on the instance monitor", Modifier.isSynchronized(method.modifiers))
         }
+    }
+
+    @Test
+    fun updatePublicPlatformStateHasAtomicSignature() {
+        val method = SecureIdentityStore::class.java.declaredMethods.first { it.name == "updatePublicPlatformState" }
+        assertEquals(StoredPublicPlatformState::class.java, method.returnType)
+        assertEquals(1, method.parameterTypes.size)
     }
 
     @Test(expected = IllegalStateException::class)

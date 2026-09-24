@@ -293,4 +293,13 @@
     <string name="oem_background_hint_title">Проверьте ограничения производителя</string>
     <string name="oem_background_hint_text">На Huawei/Honor добавьте TrafficWrapper в «Защищённые приложения», разрешите автозапуск и работу в фоне, а также снимите ограничения батареи/PowerGenie для приложения.</string>
     <string name="oem_background_hint_open">Открыть карточку приложения</string>
+    <string name="local_proxy_auth_title">Пароль локального прокси</string>
+    <string name="local_proxy_auth_switch">Требовать пароль для локального прокси</string>
+    <string name="local_proxy_auth_description">Другие приложения на устройстве не смогут пользоваться туннелем или обнаружить его без логина и пароля. По умолчанию выключено.</string>
+    <string name="local_proxy_auth_username">Логин</string>
+    <string name="local_proxy_auth_password">Пароль</string>
+    <string name="local_proxy_auth_regenerate">Сгенерировать новый пароль</string>
+    <string name="local_proxy_auth_copied">Скопировано</string>
+    <string name="local_proxy_auth_hint">Приложения, которые используют прокси 127.0.0.1:18080 (SOCKS5) или 127.0.0.1:18090 (HTTP), нужно настроить с этими логином и паролем. Telegram получит их автоматически по кнопке «Настроить прокси». Системный прокси Wi-Fi не поддерживает пароль — при включённой защите он работать не будет. После смены пароля обновите его в приложениях.</string>
+    <string name="local_proxy_auth_apps_hint">Прокси защищён паролем: логин %1$s, пароль %2$s.</string>
 </resources>

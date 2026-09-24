@@ -10,7 +10,6 @@ import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import pro.trafficwrapper.go.transport.Transport
-import java.net.InetSocketAddress
 import java.net.Proxy
 import java.time.Instant
 import java.time.ZonedDateTime
@@ -47,6 +46,8 @@ class DiscoveryRepository(private val context: Context) {
             maxSeenSeq = stored.maxSeenConfigSeq,
             nowMs = 0L,
         )
+        // Fallback to the update key is safe only because updatePubkeyPin is never taken from an
+        // unconfirmed external bootstrap once set (see externalBootstrapDecision in MainActivity).
         val publicKey = config.discoveryPubkey.ifBlank { stored.updatePubkeyPin }
         if (publicKey.isBlank()) return null
         val rendezvousState = store.readRendezvousState()
@@ -92,7 +93,7 @@ class DiscoveryRepository(private val context: Context) {
         }
         val seq = response.getLong("seq")
         val issuedAtMs = parseIssuedAt(jsonResponse.body)
-        val trusted = trustedTime(jsonResponse.dateHeaderMs, issuedAtMs)
+        val trusted = trustedTime(issuedAtMs)
         store.recordVerifiedRendezvous(
             seq = seq,
             trustedWallTimeMs = trusted.first,
@@ -242,12 +243,15 @@ class DiscoveryRepository(private val context: Context) {
                 .callTimeout(18, TimeUnit.SECONDS)
                 .connectTimeout(6, TimeUnit.SECONDS)
                 .readTimeout(8, TimeUnit.SECONDS)
-            if (socksListen.isBlank()) {
-                builder.proxy(Proxy.NO_PROXY)
-            } else {
-                val host = socksListen.substringBefore(":", "127.0.0.1").ifBlank { "127.0.0.1" }
-                val port = socksListen.substringAfterLast(":", "18080").toIntOrNull() ?: 18080
-                builder.proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress(host, port)))
+            builder.proxy(Proxy.NO_PROXY)
+            if (socksListen.isNotBlank()) {
+                // The loopback SOCKS listeners require RFC 1929 auth with the in-process
+                // credentials; java.net SOCKS proxies can only authenticate via the global
+                // Authenticator, so tunnel through our own socket factory instead. Host names are
+                // resolved by the tunnel (PlaceholderDns keeps them intact, no local DNS leak).
+                builder
+                    .socketFactory(LocalSocksSocketFactory.forListen(socksListen))
+                    .dns(PlaceholderDns)
             }
             return builder.build()
         }
@@ -372,10 +376,27 @@ private fun parseIssuedAt(endpointsJson: String): Long =
     Instant.parse(JSONObject(endpointsJson).getString("issued_at")).toEpochMilli()
 
 private fun discoveryNowMs(httpsDateMs: Long?): Long =
-    httpsDateMs ?: runCatching { ClockDiagnostics.trustedTime().wallTimeMs }.getOrDefault(System.currentTimeMillis())
+    discoveryValidationNowMs(
+        mirrorDateMs = httpsDateMs,
+        localNowMs = runCatching { ClockDiagnostics.trustedTime().wallTimeMs }.getOrDefault(System.currentTimeMillis()),
+    )
 
-private fun trustedTime(httpsDateMs: Long?, issuedAtMs: Long): Pair<Long, Long> {
+/**
+ * Time used to validate discovery bundles / rescue pointers. The mirror's `Date` header is not
+ * authenticated: a stale or replaying mirror could send an old Date to make an expired bundle look
+ * fresh. Taking the max with the local (SNTP-backed when available) clock means the header can
+ * only help when the device clock is behind, never rewind validation time. A forward-skewed Date
+ * can at worst reject a bundle, which a hostile mirror could do anyway by withholding it.
+ */
+internal fun discoveryValidationNowMs(mirrorDateMs: Long?, localNowMs: Long): Long =
+    maxOf(mirrorDateMs ?: 0L, localNowMs)
+
+/**
+ * Trusted time persisted after a verified rendezvous. Only signed data (issued_at) and the local
+ * clock ratchet it forward; the unauthenticated mirror Date header must not be persisted.
+ */
+private fun trustedTime(issuedAtMs: Long): Pair<Long, Long> {
     val elapsed = SystemClock.elapsedRealtime()
     val trusted = runCatching { ClockDiagnostics.trustedTime().wallTimeMs }.getOrDefault(System.currentTimeMillis())
-    return maxOf(trusted, httpsDateMs ?: 0L, issuedAtMs) to elapsed
+    return maxOf(trusted, issuedAtMs) to elapsed
 }

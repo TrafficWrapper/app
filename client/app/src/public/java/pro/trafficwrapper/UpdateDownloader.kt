@@ -1,7 +1,7 @@
 package pro.trafficwrapper
 
+import android.util.Log
 import java.io.Closeable
-import java.io.EOFException
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
@@ -31,9 +31,16 @@ class UpdateDownloader(
         val finalFile = File(outputDir, "app-release-${manifest.versionCode}.apk")
         val partFile = File(outputDir, finalFile.name + ".part")
         val etagFile = File(outputDir, finalFile.name + ".etag")
-        if (finalFile.exists() && finalFile.length() == manifest.apkSize) {
-            onProgress(finalFile.length(), manifest.apkSize)
-            return finalFile
+        if (manifest.apkSize <= 0 || manifest.apkSize > UPDATE_APK_MAX_BYTES) {
+            throw UpdateVerificationException(R.string.update_error_download)
+        }
+        if (finalFile.exists()) {
+            // Reuse a cached APK only if it is byte-identical to what the verified manifest pins.
+            if (finalFile.length() == manifest.apkSize && fileSha256Matches(finalFile, manifest.sha256)) {
+                onProgress(finalFile.length(), manifest.apkSize)
+                return finalFile
+            }
+            finalFile.delete()
         }
 
         val apkUrl = apkDownloadUrl(manifest)
@@ -78,21 +85,27 @@ class UpdateDownloader(
         } else {
             emptyMap()
         }
-        openHttp(apkUrl, "GET", headers).use { response ->
+        val expectedBodyBytes = manifest.apkSize - resumeFrom
+        openHttp(apkUrl, "GET", headers, manifest.apkSize).use { response ->
             if (resumeFrom > 0 && response.code == HTTP_RANGE_NOT_SATISFIABLE) {
                 if (partFile.length() == manifest.apkSize) return
                 partFile.delete()
                 throw UpdateVerificationException(R.string.update_error_download)
             }
             val append = resumeFrom > 0 && response.code == HTTP_PARTIAL
-            if (!response.isSuccessful || (resumeFrom > 0 && !append)) {
+            if (!response.isSuccessful || (resumeFrom > 0 && !append) || (resumeFrom == 0L && response.code != HTTP_OK)) {
                 if (response.code == HTTP_OK) {
                     partFile.delete()
                 }
                 throw UpdateVerificationException(R.string.update_error_download)
             }
+            if (append && !updateContentRangeMatches(response.headers["content-range"], resumeFrom, manifest.apkSize)) {
+                partFile.delete()
+                throw UpdateVerificationException(R.string.update_error_download)
+            }
+            // Never let the partial file grow beyond the size pinned by the verified manifest.
             FileOutputStream(partFile, append).use { out ->
-                response.input.use { input ->
+                UpdateMaxBytesInputStream(response.input, expectedBodyBytes).use { input ->
                     val buffer = ByteArray(DOWNLOAD_BUFFER_BYTES)
                     while (true) {
                         val read = input.read(buffer)
@@ -114,6 +127,12 @@ class UpdateDownloader(
     ): File {
         if (partFile.length() != manifest.apkSize) {
             throw UpdateVerificationException(R.string.update_error_download)
+        }
+        if (!fileSha256Matches(partFile, manifest.sha256)) {
+            Log.w(TAG, "public update APK hash mismatch after download; discarding partial file")
+            partFile.delete()
+            etagFile.delete()
+            throw UpdateVerificationException(R.string.update_error_apk_hash)
         }
         finalFile.delete()
         if (!partFile.renameTo(finalFile)) {
@@ -206,16 +225,22 @@ class UpdateDownloader(
     }
 
     private fun fetchString(url: String): String {
-        openHttp(url, "GET").use { response ->
+        openHttp(url, "GET", maxBodyBytes = UPDATE_MANIFEST_MAX_BYTES).use { response ->
             if (!response.isSuccessful) {
                 throw UpdateVerificationException(R.string.update_error_download)
             }
-            return response.input.readBytes().toString(Charsets.UTF_8)
+            return readUpdateBodyLimited(response.input, UPDATE_MANIFEST_MAX_BYTES).toString(Charsets.UTF_8)
         }
     }
 
+    private fun fileSha256Matches(file: File, expectedSha256: String): Boolean =
+        expectedSha256.isNotBlank() &&
+            runCatching { file.inputStream().use { updateSha256HexOfStream(it) } }
+                .getOrNull()
+                ?.equals(expectedSha256.trim(), ignoreCase = true) == true
+
     private fun head(url: String): HeadMetadata {
-        openHttp(url, "HEAD").use { response ->
+        openHttp(url, "HEAD", maxBodyBytes = 0).use { response ->
             if (!response.isSuccessful) {
                 throw UpdateVerificationException(R.string.update_error_download)
             }
@@ -268,12 +293,7 @@ class UpdateDownloader(
         private const val MAX_DOWNLOAD_ATTEMPTS = 8
         private val RETRY_DELAYS_MS = longArrayOf(750L, 1500L, 3000L, 5000L, 8000L, 13000L, 21000L)
 
-        private const val HTTP_HEADER_LIMIT_BYTES = 64 * 1024
-        private const val SOCKS_VERSION = 0x05
-        private const val SOCKS_NO_AUTH = 0x00
-        private const val SOCKS_CONNECT = 0x01
-        private const val SOCKS_ATYP_DOMAIN = 0x03
-        private const val SOCKS_OK = 0x00
+        private const val TAG = "TWPublicUpdate"
 
         private const val DEFAULT_SOCKS_HOST = "127.0.0.1"
         private const val DEFAULT_SOCKS_PORT = "18080"
@@ -287,9 +307,10 @@ class UpdateDownloader(
         url: String,
         method: String,
         headers: Map<String, String> = emptyMap(),
+        maxBodyBytes: Long,
     ): HttpResponse {
         if (source == UpdateSource.DIRECT) {
-            return openDirectHttps(url, method, headers)
+            return openDirectHttps(url, method, headers, maxBodyBytes)
         }
         val uri = URI(url)
         if ((uri.scheme ?: "").lowercase() != "http") {
@@ -311,17 +332,12 @@ class UpdateDownloader(
             }
             socket.getOutputStream().write(request.toByteArray(Charsets.US_ASCII))
             socket.getOutputStream().flush()
-            val input = socket.getInputStream()
-            val rawHeader = readHttpHeader(input)
-            val lines = rawHeader.lineSequence().filter { it.isNotBlank() }.toList()
-            val statusLine = lines.firstOrNull().orEmpty()
-            val code = statusLine.split(' ').getOrNull(1)?.toIntOrNull()
-                ?: throw UpdateVerificationException(R.string.update_error_download)
-            val responseHeaders = lines.drop(1).mapNotNull { line ->
-                val index = line.indexOf(':')
-                if (index <= 0) null else line.substring(0, index).lowercase() to line.substring(index + 1).trim()
-            }.toMap()
-            return HttpResponse(code, responseHeaders, input, socket)
+            val input = socket.getInputStream().buffered(DOWNLOAD_BUFFER_BYTES)
+            val head = parseUpdateHttpHead(readUpdateHttpHead(input))
+            // Error bodies are never consumed, so only successful responses get the caller's limit.
+            val bodyLimit = if (head.code in 200..299) maxBodyBytes else UPDATE_MANIFEST_MAX_BYTES
+            val body = updateHttpBodyStream(input, method, head, bodyLimit)
+            return HttpResponse(head.code, head.headers, body, socket)
         } catch (error: Throwable) {
             runCatching { socket.close() }
             throw error
@@ -332,6 +348,7 @@ class UpdateDownloader(
         url: String,
         method: String,
         headers: Map<String, String>,
+        maxBodyBytes: Long,
     ): HttpResponse {
         val uri = URI(url)
         if ((uri.scheme ?: "").lowercase() != "https") {
@@ -345,7 +362,14 @@ class UpdateDownloader(
             }
             .build()
         val response = directClient.newCall(request).execute()
-        val input = response.body.byteStream()
+        // OkHttp already enforces framing (chunked / Content-Length, truncation = error); we only
+        // add the size ceiling here.
+        val declaredLength = response.body.contentLength()
+        if (response.isSuccessful && !method.equals("HEAD", ignoreCase = true) && declaredLength > maxBodyBytes) {
+            response.close()
+            throw UpdateHttpException("body of $declaredLength bytes exceeds limit $maxBodyBytes")
+        }
+        val input = UpdateMaxBytesInputStream(response.body.byteStream(), maxOf(maxBodyBytes, 0L))
         return HttpResponse(
             code = response.code,
             headers = response.headers.toMultimap().mapValues { it.value.joinToString(",") },
@@ -355,82 +379,25 @@ class UpdateDownloader(
     }
 
     private fun openSocks5Socket(targetHost: String, targetPort: Int): Socket {
-        val proxyHost = socksListen.substringBefore(":", DEFAULT_SOCKS_HOST).ifBlank { DEFAULT_SOCKS_HOST }
+        val proxyHost = socksListen.substringBeforeLast(":", DEFAULT_SOCKS_HOST).ifBlank { DEFAULT_SOCKS_HOST }
         val proxyPort = socksListen.substringAfterLast(":", DEFAULT_SOCKS_PORT).toIntOrNull()
             ?: DEFAULT_SOCKS_PORT.toInt()
         val socket = Socket()
         try {
             socket.soTimeout = 90_000
             socket.connect(InetSocketAddress(proxyHost, proxyPort), 15_000)
-            val input = socket.getInputStream()
-            val output = socket.getOutputStream()
-            output.write(byteArrayOf(SOCKS_VERSION.toByte(), 0x01, SOCKS_NO_AUTH.toByte()))
-            output.flush()
-            if (readByte(input) != SOCKS_VERSION || readByte(input) != SOCKS_NO_AUTH) {
-                throw UpdateVerificationException(R.string.update_error_download)
-            }
-            val hostBytes = targetHost.toByteArray(Charsets.UTF_8)
-            if (hostBytes.size > 255) {
-                throw UpdateVerificationException(R.string.update_error_download)
-            }
-            output.write(byteArrayOf(SOCKS_VERSION.toByte(), SOCKS_CONNECT.toByte(), 0x00, SOCKS_ATYP_DOMAIN.toByte(), hostBytes.size.toByte()))
-            output.write(hostBytes)
-            output.write(byteArrayOf(((targetPort ushr 8) and 0xff).toByte(), (targetPort and 0xff).toByte()))
-            output.flush()
-            if (readByte(input) != SOCKS_VERSION) {
-                throw UpdateVerificationException(R.string.update_error_download)
-            }
-            val reply = readByte(input)
-            readByte(input)
-            val atyp = readByte(input)
-            if (reply != SOCKS_OK) {
-                throw UpdateVerificationException(R.string.update_error_download)
-            }
-            val bindLength = when (atyp) {
-                0x01 -> 4
-                0x03 -> readByte(input)
-                0x04 -> 16
-                else -> throw UpdateVerificationException(R.string.update_error_download)
-            }
-            readFully(input, bindLength + 2)
+            // Loopback SOCKS listeners require the in-process credentials (RFC 1929).
+            socks5Connect(
+                input = socket.getInputStream(),
+                output = socket.getOutputStream(),
+                host = targetHost,
+                port = targetPort,
+                credentials = LocalSocksAuth.internal,
+            )
             return socket
         } catch (error: Throwable) {
             runCatching { socket.close() }
             throw error
-        }
-    }
-
-    private fun readHttpHeader(input: InputStream): String {
-        val bytes = ArrayList<Byte>(1024)
-        var state = 0
-        while (bytes.size < HTTP_HEADER_LIMIT_BYTES) {
-            val value = input.read()
-            if (value < 0) throw EOFException("unexpected EOF while reading HTTP header")
-            bytes += value.toByte()
-            state = when (state) {
-                0 -> if (value == '\r'.code) 1 else 0
-                1 -> if (value == '\n'.code) 2 else 0
-                2 -> if (value == '\r'.code) 3 else 0
-                3 -> if (value == '\n'.code) return bytes.toByteArray().toString(Charsets.ISO_8859_1) else 0
-                else -> 0
-            }
-        }
-        throw UpdateVerificationException(R.string.update_error_download)
-    }
-
-    private fun readByte(input: InputStream): Int {
-        val value = input.read()
-        if (value < 0) throw EOFException("unexpected EOF")
-        return value
-    }
-
-    private fun readFully(input: InputStream, length: Int) {
-        var remaining = length
-        val buffer = ByteArray(256)
-        while (remaining > 0) {
-            val read = input.read(buffer, 0, minOf(buffer.size, remaining))
-            if (read < 0) throw EOFException("unexpected EOF")
-            remaining -= read
         }
     }
 }

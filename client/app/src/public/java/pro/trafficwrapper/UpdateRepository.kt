@@ -103,6 +103,9 @@ class UpdateRepository(private val context: Context) {
                             continue
                         }
                         verifier.verifyApk(apk, decision.manifest)
+                        // Hand the manifest-pinned hash to the installer, which re-verifies the
+                        // bytes it streams into the PackageInstaller session (TOCTOU guard).
+                        VerifiedUpdateApks.register(apk, decision.manifest.sha256)
                         return UpdateCheckOutcome(
                             status = UpdateCheckStatus.AVAILABLE,
                             manifest = decision.manifest,

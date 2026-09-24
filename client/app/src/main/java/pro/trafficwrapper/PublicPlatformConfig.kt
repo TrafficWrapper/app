@@ -581,3 +581,74 @@ object PublicPlatformConfigParser {
     private val AWG_ROUTE_TYPES = setOf("awg", "awgru", "awg_ru")
     private val FORBIDDEN_KEYS = setOf("private_key", "psk2", "internal_ip", "server_private_key")
 }
+
+/**
+ * Trusted fields of a bootstrap: everything that decides whom the client talks to and which keys
+ * it trusts. Only the one-time token, expiry and advisory limits may differ for an external
+ * bootstrap to be accepted without explicit user confirmation.
+ */
+internal fun publicBootstrapTrustedFieldsMatch(
+    current: PublicBootstrapConfig,
+    incoming: PublicBootstrapConfig,
+): Boolean =
+    current.orchestratorUrl == incoming.orchestratorUrl &&
+        current.configPubkeyPin == incoming.configPubkeyPin &&
+        current.orchNoisePublic == incoming.orchNoisePublic &&
+        current.updatePubkey.trim() == incoming.updatePubkey.trim() &&
+        current.seedWorkers.map { it.trim() }.toSet() == incoming.seedWorkers.map { it.trim() }.toSet()
+
+/** An external bootstrap must not carry an update key that contradicts an already pinned one. */
+internal fun updatePubkeyCompatibleWithPin(pinnedUpdatePubkey: String, incomingUpdatePubkey: String): Boolean {
+    val pinned = pinnedUpdatePubkey.trim()
+    val incoming = incomingUpdatePubkey.trim()
+    return pinned.isEmpty() || incoming.isEmpty() || pinned == incoming
+}
+
+/**
+ * Chooses the update_pubkey pin after enrollment:
+ *  1. a key from the client config signed by the pinned config key always wins;
+ *  2. otherwise an existing pin is kept - a bootstrap cannot replace it - unless the user switched
+ *     to a different platform (different config_pubkey_pin, which always requires confirmation);
+ *  3. only when nothing is pinned yet is the bootstrap's key used (trust on first use).
+ */
+internal fun resolveUpdatePubkeyPin(
+    signedConfigUpdatePubkey: String,
+    previous: StoredPublicPlatformState,
+    bootstrap: PublicBootstrapConfig,
+): String {
+    val signed = signedConfigUpdatePubkey.trim()
+    if (signed.isNotEmpty()) return signed
+    val pinned = previous.updatePubkeyPin.trim()
+    val samePlatform = previous.configPubkeyPin.isBlank() || previous.configPubkeyPin == bootstrap.configPubkeyPin
+    if (pinned.isNotEmpty() && samePlatform) return pinned
+    return bootstrap.updatePubkey.trim().ifEmpty { pinned }
+}
+
+/**
+ * Merges freshly enrolled credentials into the current stored state inside
+ * SecureIdentityStore.updatePublicPlatformState: monotonic counters and trusted time never go
+ * backwards, and the update key pin is recomputed against the current state.
+ */
+internal fun mergeEnrolledPublicPlatformState(
+    current: StoredPublicPlatformState,
+    enrolled: StoredPublicPlatformState,
+    configSeq: Long,
+    signedConfigUpdatePubkey: String,
+    bootstrap: PublicBootstrapConfig,
+): StoredPublicPlatformState {
+    if (configSeq < current.maxSeenConfigSeq) {
+        throw PublicConfigVerificationException("client config rollback")
+    }
+    val keepCurrentTime = current.trustedWallTimeMs >= enrolled.trustedWallTimeMs
+    return enrolled.copy(
+        updatePubkeyPin = resolveUpdatePubkeyPin(signedConfigUpdatePubkey, current, bootstrap),
+        maxSeenConfigSeq = maxOf(current.maxSeenConfigSeq, enrolled.maxSeenConfigSeq, configSeq),
+        maxSeenUpdateSeq = maxOf(current.maxSeenUpdateSeq, enrolled.maxSeenUpdateSeq),
+        trustedWallTimeMs = if (keepCurrentTime) current.trustedWallTimeMs else enrolled.trustedWallTimeMs,
+        trustedElapsedRealtimeMs = if (keepCurrentTime) {
+            current.trustedElapsedRealtimeMs
+        } else {
+            enrolled.trustedElapsedRealtimeMs
+        },
+    )
+}

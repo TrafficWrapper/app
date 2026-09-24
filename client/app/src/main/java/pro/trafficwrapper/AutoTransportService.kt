@@ -1,6 +1,5 @@
 package pro.trafficwrapper
 
-import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.AlarmManager
 import android.app.Notification
@@ -32,24 +31,23 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.Proxy
 import java.net.URI
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.URL
 import java.util.Locale
 import java.util.ArrayDeque
 import java.util.Collections
 import java.util.EnumMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
-import javax.net.ssl.HttpsURLConnection
 import kotlin.random.Random
 
 internal fun shouldFastFailActiveAwg(
@@ -353,16 +351,118 @@ internal fun shouldAllowPriorityRecovery(
         (lastRouteSwitchAtMs == 0L || nowMs - lastRouteSwitchAtMs >= activeDwellMs) &&
         (lastPriorityRecoveredSwitchAtMs == 0L || nowMs - lastPriorityRecoveredSwitchAtMs >= cooldownMs)
 
+/**
+ * Worker loop sleep. While the screen is on (or the tunnel is recovering) the loop keeps its short
+ * cadence. With the screen off and a stable tunnel it backs off exponentially from
+ * [SCREEN_OFF_STABLE_PROBE_BASE_MS] up to [SCREEN_OFF_STABLE_PROBE_MAX_MS]; screen-on and network
+ * events wake the loop immediately, so recovery latency is not affected.
+ */
 internal fun probeLoopSleepMs(
     stable: Boolean,
     nowMs: Long,
     lastTunnelRxProgressAtMs: Long,
     reconnectBackoffMs: Long,
+    screenInteractive: Boolean = true,
+    screenOffStableCycles: Int = 0,
 ): Long {
     if (!stable) return reconnectBackoffMs
     val rxIdle = lastTunnelRxProgressAtMs <= 0L || nowMs - lastTunnelRxProgressAtMs >= STABLE_IDLE_RX_AGE_MS
+    if (!screenInteractive) {
+        if (!rxIdle) return SCREEN_OFF_ACTIVE_PROBE_INTERVAL_MS
+        var sleepMs = SCREEN_OFF_STABLE_PROBE_BASE_MS
+        repeat(screenOffStableCycles.coerceIn(0, SCREEN_OFF_STABLE_PROBE_MAX_SHIFT)) {
+            sleepMs = (sleepMs * 2).coerceAtMost(SCREEN_OFF_STABLE_PROBE_MAX_MS)
+        }
+        return sleepMs
+    }
     return if (rxIdle) STABLE_IDLE_PROBE_INTERVAL_MS else PROBE_INTERVAL_MS
 }
+
+/**
+ * The partial wake lock is only kept across the loop sleep while the tunnel is being recovered
+ * (short reconnect backoff), and only for the first [RECOVERY_WAKELOCK_MAX_DURATION_MS] of an
+ * unstable period. A stable tunnel, a long-lasting outage and an "all routes dead" long backoff
+ * sleep without it: the backstop alarm, network callbacks and screen-on events wake the worker.
+ */
+internal fun shouldHoldWakeLockDuringSleep(
+    stable: Boolean,
+    routeHealthy: Boolean,
+    hasUsableRoute: Boolean,
+    consecutiveAllDeadCycles: Int,
+    sleepMs: Long,
+    unstableForMs: Long = 0L,
+): Boolean =
+    !stable &&
+        sleepMs <= RECOVERY_WAKELOCK_MAX_SLEEP_MS &&
+        unstableForMs <= RECOVERY_WAKELOCK_MAX_DURATION_MS &&
+        !shouldReleaseWakeLockForAllDeadSleep(
+            routeHealthy = routeHealthy,
+            hasUsableRoute = hasUsableRoute,
+            consecutiveAllDeadCycles = consecutiveAllDeadCycles,
+            sleepMs = sleepMs,
+        )
+
+/** Wake lock timeout for one active worker cycle (probes, route switches, restarts). */
+internal fun workerCycleWakeLockTimeoutMs(holdDuringSleep: Boolean, sleepMs: Long): Long =
+    if (holdDuringSleep) sleepMs + WAKELOCK_ACTIVE_WORK_TIMEOUT_MS else WAKELOCK_ACTIVE_WORK_TIMEOUT_MS
+
+/**
+ * Server side of the SOCKS5 method negotiation for the front-end router (127.0.0.1:18080).
+ *
+ * In-process clients always authenticate with [internal] credentials. When the user enabled a
+ * front-end password ([frontEnd] != null) only user/pass is accepted (internal or front-end
+ * credentials). Otherwise unauthenticated clients (for example Telegram configured without a
+ * password) may still select no-auth. Returns the matched credentials or null for no-auth; throws
+ * after replying with a failure when the client cannot be accepted.
+ */
+internal fun negotiateLocalSocksServerAuth(
+    input: InputStream,
+    output: OutputStream,
+    internal: SocksCredentials,
+    frontEnd: SocksCredentials?,
+): SocksCredentials? {
+    val version = input.read()
+    if (version < 0) throw EOFException()
+    if (version != SOCKS5_VERSION) throw EOFException("bad socks version")
+    val count = input.read()
+    if (count < 0) throw EOFException()
+    val methods = ByteArray(count)
+    var offset = 0
+    while (offset < count) {
+        val read = input.read(methods, offset, count - offset)
+        if (read < 0) throw EOFException()
+        offset += read
+    }
+    val offered = methods.map { it.toInt() and 0xff }.toSet()
+    if (frontEnd == null && Socks5Auth.METHOD_NO_AUTH in offered) {
+        output.write(byteArrayOf(SOCKS5_VERSION.toByte(), Socks5Auth.METHOD_NO_AUTH.toByte()))
+        output.flush()
+        return null
+    }
+    if (Socks5Auth.METHOD_USER_PASS !in offered) {
+        output.write(byteArrayOf(SOCKS5_VERSION.toByte(), Socks5Auth.METHOD_NO_ACCEPTABLE.toByte()))
+        output.flush()
+        throw SocksAuthRejectedException("no acceptable socks auth method")
+    }
+    // Re-enter the shared helper with the method list we already consumed.
+    val replay = byteArrayOf(SOCKS5_VERSION.toByte(), 1, Socks5Auth.METHOD_USER_PASS.toByte())
+    val chained = java.io.SequenceInputStream(java.io.ByteArrayInputStream(replay), input)
+    return try {
+        Socks5Auth.negotiateServer(chained, output, listOfNotNull(internal, frontEnd))
+    } catch (error: EOFException) {
+        throw SocksAuthRejectedException(error.message ?: "socks authentication failed")
+    }
+}
+
+internal class SocksAuthRejectedException(message: String) : Exception(message)
+
+/** Removes addresses and host names from an xray log line before it is written to logcat. */
+internal fun redactXrayLogLine(line: String): String =
+    line
+        .replace(Regex("\\[[0-9a-fA-F:.]+\\](:\\d+)?"), "<ip6>")
+        .replace(Regex("\\b\\d{1,3}(?:\\.\\d{1,3}){3}(?::\\d+)?\\b"), "<ip>")
+        .replace(Regex("\\b(?:[A-Za-z0-9-]+\\.)+[A-Za-z]{2,}(?::\\d+)?\\b"), "<host>")
+        .take(XRAY_RELEASE_LOG_MAX_CHARS)
 
 @Suppress("UNUSED_PARAMETER")
 internal fun shouldSkipNonDestructiveForegroundResync(
@@ -403,6 +503,14 @@ internal const val REALITY_PROBE_ATTEMPTS = 2
 internal const val PROBE_INTERVAL_MS = 2_500L
 internal const val STABLE_IDLE_PROBE_INTERVAL_MS = 8_000L
 internal const val STABLE_IDLE_RX_AGE_MS = 8_000L
+internal const val SCREEN_OFF_ACTIVE_PROBE_INTERVAL_MS = 15_000L
+internal const val SCREEN_OFF_STABLE_PROBE_BASE_MS = 60_000L
+internal const val SCREEN_OFF_STABLE_PROBE_MAX_MS = 8 * 60 * 1000L
+internal const val SCREEN_OFF_STABLE_PROBE_MAX_SHIFT = 4
+internal const val RECOVERY_WAKELOCK_MAX_SLEEP_MS = 15_000L
+internal const val RECOVERY_WAKELOCK_MAX_DURATION_MS = 5 * 60 * 1000L
+internal const val WAKELOCK_ACTIVE_WORK_TIMEOUT_MS = 2 * 60 * 1000L
+internal const val XRAY_RELEASE_LOG_MAX_CHARS = 240
 internal const val STABLE_TRAFFIC_MAX_AGE_SECONDS = 30L
 internal const val STABLE_TRAFFIC_MAX_AGE_MS = STABLE_TRAFFIC_MAX_AGE_SECONDS * 1000L
 internal const val REALITY_RX_STALL_MS = 12_000L
@@ -465,6 +573,15 @@ class AutoTransportService : Service() {
 
     private val workerActive = AtomicBoolean(false)
 
+    /** Id (unique across service instances) of the most recently started worker of this instance. */
+    private val currentWorkerGeneration = AtomicLong(0)
+
+    /** Guards router / sidecar process / HTTP proxy handover between the worker and stop paths. */
+    private val resourceLock = Any()
+
+    @Volatile
+    private var screenInteractive: Boolean = true
+
     @Volatile
     private var xrayProcess: Process? = null
 
@@ -486,6 +603,7 @@ class AutoTransportService : Service() {
     private var httpProxy: LocalHttpProxy? = null
 
     private val currentVpnUdpRoute = AtomicReference<Route?>(null)
+    private val lastDispatchedVpnUdpDescriptor = AtomicReference<String?>(null)
 
     private var serviceTunnelDownSinceMs: Long = 0L
 
@@ -571,6 +689,8 @@ class AutoTransportService : Service() {
 
     private fun startAuto(): Boolean {
         if (!workerActive.compareAndSet(false, true)) return false
+        val generation = workerGenerationCounter.incrementAndGet()
+        currentWorkerGeneration.set(generation)
         acquireWakeLock()
         publishState(
             TransportUiState(
@@ -641,6 +761,8 @@ class AutoTransportService : Service() {
             var nextAwgStartAtMs = 0L
             var nextTelemetryHeartbeatAtMs = 0L
             var nextBatteryRestrictionNotifyCheckAtMs = 0L
+            var screenOffStableCycles = 0
+            var unstableSinceMs = 0L
             var stableSinceElapsedRealtimeMs: Long? = null
             var lastHealthyRouteAtMs: Long? = null
             var lastTunnelDisruptionAtMs = 0L
@@ -1007,9 +1129,17 @@ class AutoTransportService : Service() {
             }
             fun awgLocallyHealthy(route: Route, probe: AWGProbeResult, atMs: Long): Boolean =
                 probe.handshakeEstablished && awgLocalRxFresh(route, atMs)
+            fun isCurrentWorker(): Boolean =
+                workerActive.get() && currentWorkerGeneration.get() == generation
+            val workerThread = Thread.currentThread()
             val clock = checkClock()
             try {
-                if (!workerActive.get()) return@execute
+                if (!isCurrentWorker()) return@execute
+                awaitPreviousWorker(workerThread)
+                if (!isCurrentWorker()) return@execute
+                synchronized(nativeLock) {
+                    nativeOwnerGeneration.set(generation)
+                }
                 acquireWakeLock()
                 Telemetry.flush(applicationContext)
                 if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
@@ -1140,7 +1270,7 @@ class AutoTransportService : Service() {
                     )
                 }
                 if (initialRouteReady) {
-                    router = startSocksRouter()
+                    installRouter(generation)
                     startHttpProxyIfEnabled()
                 } else {
                     telemetryEvent("route_guard",
@@ -1181,8 +1311,9 @@ class AutoTransportService : Service() {
                     }
                 }
 
-                while (workerActive.get()) {
+                while (isCurrentWorker()) {
                     val nowMs = SystemClock.elapsedRealtime()
+                    acquireWakeLock()
                     if (nowMs >= nextBatteryRestrictionNotifyCheckAtMs) {
                         BatteryRestrictionNotifier.maybeNotify(applicationContext)
                         nextBatteryRestrictionNotifyCheckAtMs = nowMs + BATTERY_RESTRICTION_NOTIFY_CHECK_INTERVAL_MS
@@ -1199,6 +1330,8 @@ class AutoTransportService : Service() {
                     }
                     val pendingNetworkEvent = networkEvent.getAndSet(null)
                     if (pendingNetworkEvent != null) {
+                        // A network/lifecycle event opens a new recovery window for the wake lock.
+                        unstableSinceMs = 0L
                         if (pendingNetworkEvent.marksTunnelDisruption) {
                             markTunnelDisruption(nowMs, pendingNetworkEvent.logText)
                         } else {
@@ -1431,7 +1564,7 @@ class AutoTransportService : Service() {
                                 routeReady = { route -> routeListenerReadyForTraffic(route) },
                             )
                             markRouteActive(activeRoute, nowMs, probeReady = false)
-                            router = startSocksRouter()
+                            installRouter(generation)
                             telemetryEvent("route_guard",
                                 "rsn" to "router_started",
                                 "route" to routeLabel(activeRoute),
@@ -2564,24 +2697,30 @@ class AutoTransportService : Service() {
                         lastRealityRxProgressAtMs,
                         lastReality2RxProgressAtMs,
                     )
+                    val interactive = screenInteractive
+                    screenOffStableCycles = if (stable && !interactive) screenOffStableCycles else 0
                     val sleepMs = probeLoopSleepMs(
                         stable = stable,
                         nowMs = nowMs,
                         lastTunnelRxProgressAtMs = lastTunnelRxProgressAtMs,
                         reconnectBackoffMs = reconnectBackoffMs,
+                        screenInteractive = interactive,
+                        screenOffStableCycles = screenOffStableCycles,
                     )
+                    if (stable && !interactive) screenOffStableCycles++
                     reconnectBackoffMs = if (stable) {
                         RECONNECT_MIN_BACKOFF_MS
                     } else {
                         (reconnectBackoffMs * 2).coerceAtMost(RECONNECT_MAX_BACKOFF_MS)
                     }
-                    val releaseWakeLockForSleep = shouldReleaseWakeLockForAllDeadSleep(
-                        routeHealthy = routeHealthy,
-                        hasUsableRoute = hasUsableRoute,
-                        consecutiveAllDeadCycles = consecutiveAllDeadCycles,
-                        sleepMs = sleepMs,
-                    )
-                    if (releaseWakeLockForSleep) {
+                    if (
+                        shouldReleaseWakeLockForAllDeadSleep(
+                            routeHealthy = routeHealthy,
+                            hasUsableRoute = hasUsableRoute,
+                            consecutiveAllDeadCycles = consecutiveAllDeadCycles,
+                            sleepMs = sleepMs,
+                        )
+                    ) {
                         scheduleBackstop()
                         telemetryEvent("wakelock_sleep",
                             "rsn" to "all_dead",
@@ -2589,17 +2728,29 @@ class AutoTransportService : Service() {
                             "healthy" to false,
                             "backoff_ms" to sleepMs,
                         )
-                        releaseWakeLock()
-                        try {
-                            sleepOrResync(sleepMs)
-                        } finally {
-                            if (workerActive.get()) {
-                                acquireWakeLock()
-                            }
-                        }
-                    } else {
-                        sleepOrResync(sleepMs)
                     }
+                    if (stable) {
+                        unstableSinceMs = 0L
+                    } else if (unstableSinceMs == 0L) {
+                        unstableSinceMs = nowMs
+                    }
+                    val holdWakeLock = shouldHoldWakeLockDuringSleep(
+                        stable = stable,
+                        routeHealthy = routeHealthy,
+                        hasUsableRoute = hasUsableRoute,
+                        consecutiveAllDeadCycles = consecutiveAllDeadCycles,
+                        sleepMs = sleepMs,
+                        unstableForMs = if (unstableSinceMs > 0L) nowMs - unstableSinceMs else 0L,
+                    )
+                    if (holdWakeLock) {
+                        // Recovering: keep the CPU up through the short reconnect backoff, but
+                        // never without a timeout.
+                        acquireWakeLock(workerCycleWakeLockTimeoutMs(holdDuringSleep = true, sleepMs = sleepMs))
+                    } else {
+                        releaseWakeLock()
+                    }
+                    if (!isCurrentWorker()) break
+                    sleepOrResync(sleepMs)
                 }
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
@@ -2618,42 +2769,113 @@ class AutoTransportService : Service() {
                     ),
                 )
             } finally {
-                workerActive.set(false)
-                routeHealthSnapshot.set(null)
-                stopHttpProxy()
-                setVpnBridgeUdpRoute(null)
-                router?.stop()
-                router = null
-                xrayProcess?.destroy()
-                xrayProcess = null
-                xray2Process?.destroy()
-                xray2Process = null
+                // A newer worker of this instance may already be queued (the executor is serial,
+                // so it has not started yet): only the latest worker may clear the shared flags.
+                val latestWorker = currentWorkerGeneration.get() == generation
+                if (latestWorker) {
+                    workerActive.set(false)
+                    routeHealthSnapshot.set(null)
+                }
+                takeHttpProxy()?.let { proxy ->
+                    proxy.stop()
+                    publishHttpProxyState()
+                }
+                takeRouter()?.stop()
+                takeXrayProcess(Route.REALITY)?.destroy()
+                takeXrayProcess(Route.REALITY2)?.destroy()
                 setAppliedReality2Uuid("")
-                if (awgRuStarted) {
-                    Transport.stopAWGRU()
+                // Global native state is torn down only while this worker still owns it: a worker
+                // of a newer service instance may already have started its own cores.
+                synchronized(nativeLock) {
+                    if (nativeOwnerGeneration.get() == generation) {
+                        setVpnBridgeUdpRoute(null)
+                        if (awgRuStarted) {
+                            runCatching { Transport.stopAWGRU() }
+                        }
+                        if (awgStarted) {
+                            runCatching { Transport.stop() }
+                        }
+                    }
                 }
-                if (awgStarted) {
-                    Transport.stop()
-                }
+                runningWorkerThread.compareAndSet(workerThread, null)
                 if (rekeyAfterStop) {
                     recoverStoredTransportKeys(applicationContext)
                 }
-                releaseWakeLock()
-                if (TransportLifecycleStore.shouldKeepAlive(applicationContext)) {
-                    scheduleBackstop()
-                    if (networkEvent.get() != null) {
-                        reviveWorkerAfterNetworkAvailable("pending lifecycle event")
+                if (latestWorker) {
+                    releaseWakeLock()
+                    if (TransportLifecycleStore.shouldKeepAlive(applicationContext)) {
+                        scheduleBackstop()
+                        if (networkEvent.get() != null) {
+                            reviveWorkerAfterNetworkAvailable("pending lifecycle event")
+                        }
                     }
                 }
             }
             }
         } catch (_: RejectedExecutionException) {
-            workerActive.set(false)
-            releaseWakeLock()
+            if (currentWorkerGeneration.get() == generation) {
+                workerActive.set(false)
+                releaseWakeLock()
+            }
             return false
         }
         return true
     }
+
+    /**
+     * Blocks the new worker (never the main thread) until the worker of a previous service
+     * instance has finished and pending stop cleanups have released ports and native cores.
+     */
+    private fun awaitPreviousWorker(current: Thread) {
+        val previous = runningWorkerThread.getAndSet(current)
+        if (previous != null && previous !== current && previous.isAlive) {
+            Log.i(LOG_TAG, "waiting for previous transport worker to finish")
+            previous.join(PREVIOUS_WORKER_JOIN_TIMEOUT_MS)
+            if (previous.isAlive) {
+                Log.w(LOG_TAG, "previous transport worker still running after ${PREVIOUS_WORKER_JOIN_TIMEOUT_MS}ms")
+            }
+        }
+        try {
+            lifecycleExecutor.submit(Runnable {}).get(PREVIOUS_WORKER_JOIN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (_: TimeoutException) {
+            Log.w(LOG_TAG, "pending transport cleanup still running")
+        } catch (_: ExecutionException) {
+        } catch (_: RejectedExecutionException) {
+        }
+    }
+
+    private fun installRouter(generation: Long) {
+        val started = startSocksRouter()
+        var replaced: SocksRouter? = null
+        val installed = synchronized(resourceLock) {
+            if (workerActive.get() && currentWorkerGeneration.get() == generation) {
+                replaced = router
+                router = started
+                true
+            } else {
+                false
+            }
+        }
+        replaced?.stop()
+        if (!installed) {
+            started.stop()
+        }
+    }
+
+    private fun takeRouter(): SocksRouter? =
+        synchronized(resourceLock) {
+            router.also { router = null }
+        }
+
+    private fun takeHttpProxy(): LocalHttpProxy? =
+        synchronized(resourceLock) {
+            httpProxy.also { httpProxy = null }
+        }
+
+    private fun takeXrayProcess(route: Route): Process? =
+        synchronized(resourceLock) {
+            xrayProcess(route).also { setXrayProcessLocked(route, null) }
+        }
 
     private fun stopAuto(cancelBackstop: Boolean) {
         workerActive.set(false)
@@ -2663,24 +2885,54 @@ class AutoTransportService : Service() {
         }
         unregisterNetworkCallback()
         unregisterScreenReceiver()
-        stopHttpProxy()
-        setVpnBridgeUdpRoute(null)
-        router?.stop()
-        router = null
-        xrayProcess?.destroy()
-        xrayProcess = null
-        xray2Process?.destroy()
-        xray2Process = null
+        // Only non-blocking work happens here (this runs on the main thread): listeners are
+        // closed so the ports are released at once, and the draining joins, process teardown and
+        // native core shutdown run on the shared lifecycle executor.
+        val proxyToStop = takeHttpProxy()
+        proxyToStop?.closeListener()
+        val routerToStop = takeRouter()
+        routerToStop?.closeListener()
+        val realityToStop = takeXrayProcess(Route.REALITY)
+        val reality2ToStop = takeXrayProcess(Route.REALITY2)
         setAppliedReality2Uuid("")
-        Transport.stopAWGRU()
-        Transport.stop()
+        val nativeOwnerAtStop = nativeOwnerGeneration.get()
+        runLifecycleTask("stop") {
+            // Native cores first (quick), then the potentially slow session draining.
+            realityToStop?.destroy()
+            reality2ToStop?.destroy()
+            synchronized(nativeLock) {
+                if (nativeOwnerGeneration.get() == nativeOwnerAtStop) {
+                    setVpnBridgeUdpRoute(null)
+                    runCatching { Transport.stopAWGRU() }
+                        .onFailure { Log.w(LOG_TAG, "AWG-RU core stop failed: ${it.message}") }
+                    runCatching { Transport.stop() }
+                        .onFailure { Log.w(LOG_TAG, "AWG core stop failed: ${it.message}") }
+                } else {
+                    Log.i(LOG_TAG, "native stop skipped: a newer transport worker owns the cores")
+                }
+            }
+            proxyToStop?.stop()
+            routerToStop?.stop()
+        }
         if (cancelBackstop) {
             cancelBackstop()
         } else if (TransportLifecycleStore.shouldKeepAlive(this)) {
             scheduleBackstop()
         }
         releaseWakeLock()
-        publishState(TransportUiState(stateTextRes = R.string.state_idle))
+        publishState(TransportUiState(stateTextRes = R.string.state_idle), updateVpnRoute = false)
+    }
+
+    private fun runLifecycleTask(label: String, task: () -> Unit) {
+        try {
+            lifecycleExecutor.execute {
+                runCatching(task).onFailure { error ->
+                    Log.w(LOG_TAG, "lifecycle task $label failed: ${error.message}")
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            Log.w(LOG_TAG, "lifecycle task $label rejected")
+        }
     }
 
     private fun registerNetworkCallback() {
@@ -2732,13 +2984,23 @@ class AutoTransportService : Service() {
         if (screenReceiver != null) return
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == Intent.ACTION_SCREEN_ON) {
-                    requestLifecycleResync(NetworkEvent.SCREEN_ON)
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_ON -> {
+                        screenInteractive = true
+                        // Wakes the worker at once (it may be in a long screen-off sleep).
+                        requestLifecycleResync(NetworkEvent.SCREEN_ON)
+                    }
+                    Intent.ACTION_SCREEN_OFF -> screenInteractive = false
                 }
             }
         }
+        screenInteractive = runCatching {
+            getSystemService(PowerManager::class.java)?.isInteractive
+        }.getOrNull() ?: true
         runCatching {
-            val filter = IntentFilter(Intent.ACTION_SCREEN_ON)
+            val filter = IntentFilter(Intent.ACTION_SCREEN_ON).apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+            }
             if (Build.VERSION.SDK_INT >= 33) {
                 registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
             } else {
@@ -2843,18 +3105,23 @@ class AutoTransportService : Service() {
         )
     }
 
-    @SuppressLint("WakelockTimeout")
-    private fun acquireWakeLock() {
+    /**
+     * Holds the partial wake lock for at most [timeoutMs]. The lock is not reference counted, so
+     * re-acquiring while held only extends (or shortens) the timeout; it is never held without one.
+     */
+    private fun acquireWakeLock(timeoutMs: Long = WAKELOCK_ACTIVE_WORK_TIMEOUT_MS) {
         synchronized(wakeLockMonitor) {
-            val current = wakeLock
-            if (current?.isHeld == true) return
-            wakeLock = getSystemService(PowerManager::class.java)
-                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
-                .apply {
-                    setReferenceCounted(false)
-                    acquire()
-                }
-            Log.i(LOG_TAG, "partial wake lock acquired")
+            val lock = wakeLock ?: runCatching {
+                getSystemService(PowerManager::class.java)
+                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+                    .apply { setReferenceCounted(false) }
+            }.getOrNull() ?: return
+            wakeLock = lock
+            val wasHeld = lock.isHeld
+            runCatching { lock.acquire(timeoutMs.coerceAtLeast(1_000L)) }
+            if (!wasHeld && BuildConfig.DEBUG) {
+                Log.d(LOG_TAG, "partial wake lock acquired timeout_ms=$timeoutMs")
+            }
         }
     }
 
@@ -2864,10 +3131,11 @@ class AutoTransportService : Service() {
             runCatching {
                 if (current.isHeld) {
                     current.release()
-                    Log.i(LOG_TAG, "partial wake lock released")
+                    if (BuildConfig.DEBUG) {
+                        Log.d(LOG_TAG, "partial wake lock released")
+                    }
                 }
             }
-            wakeLock = null
         }
     }
 
@@ -2879,9 +3147,12 @@ class AutoTransportService : Service() {
         cancelBackstopAlarm(this)
     }
 
+    /** Sleeps until [durationMs] passes or a resync/stop is signalled; interruption propagates. */
     private fun sleepOrResync(durationMs: Long) {
+        if (Thread.interrupted()) throw InterruptedException()
         synchronized(resyncSignal) {
-            resyncSignal.wait(durationMs)
+            if (!workerActive.get()) return
+            resyncSignal.wait(durationMs.coerceAtLeast(1L))
         }
     }
 
@@ -3018,15 +3289,21 @@ class AutoTransportService : Service() {
                 if (config.seq <= stored.maxSeenConfigSeq) {
                     return PublicConfigPollResult(applied = false, seq = config.seq)
                 }
-                val next = stored.copy(
-                    maxSeenConfigSeq = config.seq,
-                    updatePubkeyPin = config.updatePubkey.ifBlank { stored.updatePubkeyPin },
-                    clientConfigJson = configJson,
-                    clientBundleJson = envelope.toString(),
-                )
-                applyPublicPlatformRuntime(next, config)
-                store.writePublicPlatformState(next)
-                Log.i(LOG_TAG, "public config hot-applied seq=${config.seq} from $baseUrl")
+                val bundleJson = envelope.toString()
+                fun withConfig(base: StoredPublicPlatformState): StoredPublicPlatformState =
+                    base.copy(
+                        maxSeenConfigSeq = config.seq,
+                        updatePubkeyPin = config.updatePubkey.ifBlank { base.updatePubkeyPin },
+                        clientConfigJson = configJson,
+                        clientBundleJson = bundleJson,
+                    )
+                applyPublicPlatformRuntime(withConfig(stored), config)
+                // Atomic read-modify-write: enrollment/re-auth may have updated other fields of the
+                // state while the config was being fetched; never overwrite them with the stale copy.
+                store.updatePublicPlatformState { current ->
+                    if (config.seq <= current.maxSeenConfigSeq) current else withConfig(current)
+                }
+                Log.i(LOG_TAG, "public config hot-applied seq=${config.seq}")
                 return PublicConfigPollResult(applied = true, seq = config.seq)
             } catch (error: Throwable) {
                 val message = Telemetry.safeErrorMessage(error)
@@ -3072,7 +3349,7 @@ class AutoTransportService : Service() {
             }
             socket.getOutputStream().write(request.toByteArray(Charsets.US_ASCII))
             socket.getOutputStream().flush()
-            val input = socket.getInputStream()
+            val input = java.io.BufferedInputStream(socket.getInputStream(), INTERNAL_HTTP_READ_BUFFER_BYTES)
             val header = readInternalHttpHeader(input)
             val status = header.lineSequence().firstOrNull().orEmpty()
             val body = input.readBytes().toString(Charsets.UTF_8)
@@ -3083,42 +3360,15 @@ class AutoTransportService : Service() {
         }
     }
 
-    private fun openRouterSocks5Socket(targetHost: String, targetPort: Int, timeoutMs: Int): Socket {
-        val socket = Socket()
-        try {
-            socket.soTimeout = timeoutMs
-            socket.connect(InetSocketAddress(ROUTER_HOST, ROUTER_PORT), timeoutMs)
-            val input = socket.getInputStream()
-            val output = socket.getOutputStream()
-            output.write(byteArrayOf(SOCKS_VERSION.toByte(), 0x01, SOCKS_NO_AUTH.toByte()))
-            output.flush()
-            if (readSocksByte(input) != SOCKS_VERSION || readSocksByte(input) != SOCKS_NO_AUTH) {
-                error("bad router socks greeting")
-            }
-            val hostBytes = targetHost.toByteArray(Charsets.UTF_8)
-            if (hostBytes.size > BYTE_MASK) error("router target host is too long")
-            output.write(byteArrayOf(SOCKS_VERSION.toByte(), SOCKS_CONNECT.toByte(), 0x00, SOCKS_ATYP_DOMAIN.toByte(), hostBytes.size.toByte()))
-            output.write(hostBytes)
-            output.write(byteArrayOf(((targetPort ushr 8) and BYTE_MASK).toByte(), (targetPort and BYTE_MASK).toByte()))
-            output.flush()
-            if (readSocksByte(input) != SOCKS_VERSION) error("bad router socks response")
-            val reply = readSocksByte(input)
-            readSocksByte(input)
-            val atyp = readSocksByte(input)
-            if (reply != 0) error("router socks connect failed rep=$reply")
-            val bindLength = when (atyp) {
-                SOCKS_ATYP_IPV4 -> 4
-                SOCKS_ATYP_DOMAIN -> readSocksByte(input)
-                SOCKS_ATYP_IPV6 -> 16
-                else -> error("bad router socks bind atyp=$atyp")
-            }
-            readSocksExact(input, bindLength + 2)
-            return socket
-        } catch (error: Throwable) {
-            runCatching { socket.close() }
-            throw error
-        }
-    }
+    private fun openRouterSocks5Socket(targetHost: String, targetPort: Int, timeoutMs: Int): Socket =
+        openLocalSocks5Connection(
+            proxyHost = ROUTER_HOST,
+            proxyPort = ROUTER_PORT,
+            targetHost = targetHost,
+            targetPort = targetPort,
+            timeoutMs = timeoutMs,
+            credentials = LocalSocksAuth.internal,
+        )
 
     private fun readInternalHttpHeader(input: InputStream): String {
         val bytes = ArrayList<Byte>(1024)
@@ -3136,35 +3386,6 @@ class AutoTransportService : Service() {
             }
         }
         error("http header is too large")
-    }
-
-    private fun readSocksByte(input: InputStream): Int {
-        val value = input.read()
-        if (value < 0) throw EOFException()
-        return value and BYTE_MASK
-    }
-
-    private fun readSocksExact(input: InputStream, size: Int) {
-        var remaining = size
-        val buffer = ByteArray(256)
-        while (remaining > 0) {
-            val read = input.read(buffer, 0, minOf(buffer.size, remaining))
-            if (read < 0) throw EOFException()
-            remaining -= read
-        }
-    }
-
-    private fun ByteArray.indexOfHeaderEnd(): Int {
-        for (index in 0 until size - 3) {
-            if (this[index] == '\r'.code.toByte() &&
-                this[index + 1] == '\n'.code.toByte() &&
-                this[index + 2] == '\r'.code.toByte() &&
-                this[index + 3] == '\n'.code.toByte()
-            ) {
-                return index
-            }
-        }
-        return -1
     }
 
     private fun publicAwgEndpoint(route: PublicRouteConfig?): String {
@@ -3218,7 +3439,11 @@ class AutoTransportService : Service() {
             )
                 .redirectErrorStream(true)
                 .start()
-            setXrayProcess(route, process)
+            if (!registerXrayProcess(route, process)) {
+                process.destroy()
+                markRouteProcessStarted(route, generation, started = false, failure = "worker_stopped")
+                return XrayStartResult(started = false, error = "worker_stopped", errorKind = "process")
+            }
             drainProcessOutput(route, generation, process)
             if (process.isAlive) {
                 markRouteProcessStarted(route, generation, started = true)
@@ -3228,6 +3453,10 @@ class AutoTransportService : Service() {
                 XrayStartResult(started = false, error = "xray_process_exited", errorKind = "process")
             }
         }.getOrElse { error ->
+            if (error is InterruptedException) {
+                // runCatching swallowed the interrupt; restore it so the worker loop exits.
+                Thread.currentThread().interrupt()
+            }
             if (generation > 0L) {
                 markRouteProcessStarted(route, generation, started = false, failure = Telemetry.safeErrorMessage(error))
             }
@@ -3272,7 +3501,7 @@ class AutoTransportService : Service() {
             "route" to routeLabel(route),
             "delay_ms" to delayMs,
         )
-        SystemClock.sleep(delayMs)
+        Thread.sleep(delayMs)
     }
 
     private fun stopXraySidecar(route: Route) {
@@ -3453,7 +3682,9 @@ class AutoTransportService : Service() {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         do {
             if (connectLocalListener(routePort(route), XRAY_LISTENER_CONNECT_TIMEOUT_MS)) return true
-            runCatching { Thread.sleep(XRAY_LISTENER_POLL_MS) }
+            if (!workerActive.get()) return false
+            // Interruption (service stop) propagates and ends the worker instead of being lost.
+            Thread.sleep(XRAY_LISTENER_POLL_MS)
         } while (SystemClock.elapsedRealtime() < deadline)
         return false
     }
@@ -3480,6 +3711,12 @@ class AutoTransportService : Service() {
         }
 
     private fun setXrayProcess(route: Route, process: Process?) {
+        synchronized(resourceLock) {
+            setXrayProcessLocked(route, process)
+        }
+    }
+
+    private fun setXrayProcessLocked(route: Route, process: Process?) {
         when (route) {
             Route.REALITY -> xrayProcess = process
             Route.REALITY2 -> xray2Process = process
@@ -3487,6 +3724,17 @@ class AutoTransportService : Service() {
             Route.AWG -> Unit
         }
     }
+
+    /** Publishes a freshly started sidecar unless the service is stopping (then the caller kills it). */
+    private fun registerXrayProcess(route: Route, process: Process): Boolean =
+        synchronized(resourceLock) {
+            if (!workerActive.get()) {
+                false
+            } else {
+                setXrayProcessLocked(route, process)
+                true
+            }
+        }
 
     private fun writeXrayConfig(cfg: RealityUiConfig, route: Route): File {
         val dir = File(filesDir, routeXrayDir(route))
@@ -3499,12 +3747,7 @@ class AutoTransportService : Service() {
             .put("listen", REALITY_HOST)
             .put("port", routePort(route))
             .put("protocol", "socks")
-            .put(
-                "settings",
-                JSONObject()
-                    .put("auth", "noauth")
-                    .put("udp", false),
-            )
+            .put("settings", realityXraySocksInboundSettings(LocalSocksAuth.internal))
         val user = JSONObject()
             .put("id", cfg.uuid)
             .put("encryption", "none")
@@ -3820,16 +4063,20 @@ class AutoTransportService : Service() {
             else -> Route.REALITY
         }
 
-    private fun startSocksRouter(): SocksRouter =
-        SocksRouter(
+    private fun startSocksRouter(): SocksRouter {
+        val appContext = applicationContext
+        return SocksRouter(
             host = ROUTER_HOST,
             port = ROUTER_PORT,
             upstreamProvider = { upstreamRef.get() },
+            internalCredentials = { LocalSocksAuth.internal },
+            frontEndCredentials = { LocalSocksAuth.requiredFrontEndCredentials(appContext) },
             realityRxCounter = realityRxBytes,
             realityTxCounter = realityTxBytes,
             reality2RxCounter = reality2RxBytes,
             reality2TxCounter = reality2TxBytes,
         ).also { it.start() }
+    }
 
     private fun applyHttpProxyPreference() {
         if (TransportLifecycleStore.httpProxyEnabled(applicationContext) && workerActive.get() && router != null) {
@@ -3848,15 +4095,29 @@ class AutoTransportService : Service() {
             publishHttpProxyState()
             return
         }
+        val appContext = applicationContext
         runCatching {
             LocalHttpProxy(
                 host = LOCAL_HTTP_PROXY_HOST,
                 port = LOCAL_HTTP_PROXY_PORT,
                 socksHost = ROUTER_HOST,
                 socksPort = ROUTER_PORT,
+                frontEndCredentials = { LocalSocksAuth.requiredFrontEndCredentials(appContext) },
+                upstreamCredentials = { LocalSocksAuth.internal },
             ).also { proxy ->
                 proxy.start()
-                httpProxy = proxy
+                val accepted = synchronized(resourceLock) {
+                    if (workerActive.get() && httpProxy == null) {
+                        httpProxy = proxy
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!accepted) {
+                    proxy.closeListener()
+                    runLifecycleTask("http_proxy_discard") { proxy.stop() }
+                }
             }
         }.onSuccess {
             Log.i(LOG_TAG, "local HTTP proxy listening on $LOCAL_HTTP_PROXY_LISTEN")
@@ -3874,9 +4135,12 @@ class AutoTransportService : Service() {
     }
 
     private fun stopHttpProxy() {
-        val current = httpProxy
-        httpProxy = null
-        current?.stop()
+        val current = takeHttpProxy()
+        if (current != null) {
+            // Free the port immediately; draining sessions may block, so it runs off-thread.
+            current.closeListener()
+            runLifecycleTask("http_proxy_stop") { current.stop() }
+        }
         publishHttpProxyState()
     }
 
@@ -4334,15 +4598,20 @@ class AutoTransportService : Service() {
         )
     }
 
+    /**
+     * Egress probe through one of the loopback SOCKS listeners (router, AWG or xray sidecar). All
+     * of them require the process-internal credentials.
+     */
     private fun fetchOutboundIp(socksListen: String, timeoutMs: Int): String {
         val address = socksListen.substringBefore(":")
         val port = socksListen.substringAfter(":", ROUTER_PORT.toString()).toInt()
-        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress(address, port))
-        val connection = URL(OUTBOUND_URL).openConnection(proxy) as HttpsURLConnection
-        connection.connectTimeout = timeoutMs
-        connection.readTimeout = timeoutMs
-        connection.setRequestProperty("Connection", "keep-alive")
-        return connection.inputStream.bufferedReader().use { it.readText().trim() }
+        return httpGetViaLocalSocks(
+            proxyHost = address,
+            proxyPort = port,
+            url = OUTBOUND_URL,
+            timeoutMs = timeoutMs,
+            credentials = LocalSocksAuth.internal,
+        ).trim()
     }
 
     private fun checkClock(): ClockCheckResult =
@@ -4352,9 +4621,11 @@ class AutoTransportService : Service() {
             ClockDiagnostics.unavailable()
         }
 
-    private fun publishState(state: TransportUiState) {
+    private fun publishState(state: TransportUiState, updateVpnRoute: Boolean = true) {
         val enriched = withVpnState(withHttpProxyState(state))
-        setVpnBridgeUdpRoute(routeForVpnUdp(enriched))
+        if (updateVpnRoute) {
+            setVpnBridgeUdpRoute(routeForVpnUdp(enriched))
+        }
         latestCarryingState.set(enriched.takeIf { it.carryingTransport.isNotBlank() || it.handshakeEstablished })
         mainHandler.post {
             TransportRuntime.state = enriched
@@ -4389,7 +4660,7 @@ class AutoTransportService : Service() {
     }
 
     private fun applyVpnPreference() {
-        setVpnBridgeUdpRoute(routeForVpnUdp(TransportRuntime.state))
+        setVpnBridgeUdpRoute(routeForVpnUdp(TransportRuntime.state), force = true)
         mainHandler.post {
             TransportRuntime.state = withVpnState(TransportRuntime.state)
         }
@@ -4401,13 +4672,19 @@ class AutoTransportService : Service() {
         return routeFromLabel(label)?.takeIf { it == Route.AWG || it == Route.AWG_RU }
     }
 
-    private fun setVpnBridgeUdpRoute(route: Route?) {
+    private fun setVpnBridgeUdpRoute(route: Route?, force: Boolean = false) {
         if (!BuildConfig.VPN_ENABLED) return
         val descriptor = vpnUdpRouteDescriptor(route)
         currentVpnUdpRoute.set(route)
-        TransportLifecycleStore.setLastVpnUdpRoute(applicationContext, descriptor)
-        runCatching { Transport.setVpnBridgeUDPRoute(descriptor.ifBlank { "disabled" }) }
-            .onFailure { Log.w(LOG_TAG, "VPN UDP route update failed: ${it.message}") }
+        if (lastDispatchedVpnUdpDescriptor.getAndSet(descriptor) == descriptor && !force) return
+        val appContext = applicationContext
+        // The native call may block on the Go side; it is serialized on the lifecycle executor so
+        // callers (including the main thread) never wait for it and updates keep their order.
+        runLifecycleTask("vpn_udp_route") {
+            TransportLifecycleStore.setLastVpnUdpRoute(appContext, descriptor)
+            runCatching { Transport.setVpnBridgeUDPRoute(descriptor.ifBlank { "disabled" }) }
+                .onFailure { Log.w(LOG_TAG, "VPN UDP route update failed: ${it.message}") }
+        }
     }
 
     private fun vpnUdpRouteDescriptor(route: Route?): String =
@@ -4426,7 +4703,13 @@ class AutoTransportService : Service() {
                 process.inputStream.bufferedReader().useLines { lines ->
                     lines.forEach { line ->
                         if (line.isNotBlank()) {
-                            Log.i(XRAY_LOG_TAG, "route=${routeLabel(route)} gen=$generation $line")
+                            if (BuildConfig.DEBUG) {
+                                Log.i(XRAY_LOG_TAG, "route=${routeLabel(route)} gen=$generation $line")
+                            } else {
+                                // Release xray runs at "warning": only problems reach this point,
+                                // and destinations are redacted before they hit logcat.
+                                Log.w(XRAY_LOG_TAG, "route=${routeLabel(route)} gen=$generation ${redactXrayLogLine(line)}")
+                            }
                         }
                     }
                 }
@@ -4600,11 +4883,11 @@ class AutoTransportService : Service() {
 
     private fun startTransportForeground() {
         val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= 29) {
+        if (Build.VERSION.SDK_INT >= 34) {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
@@ -4705,6 +4988,8 @@ class AutoTransportService : Service() {
         private val host: String,
         private val port: Int,
         private val upstreamProvider: () -> Upstream,
+        private val internalCredentials: () -> SocksCredentials,
+        private val frontEndCredentials: () -> SocksCredentials?,
         private val realityRxCounter: AtomicLong,
         private val realityTxCounter: AtomicLong,
         private val reality2RxCounter: AtomicLong,
@@ -4751,8 +5036,11 @@ class AutoTransportService : Service() {
                             runCatching { client.close() }
                         }
                     } catch (_: Throwable) {
-                        if (active.get()) {
-                            runCatching { Thread.sleep(100) }
+                        if (!active.get()) break
+                        try {
+                            Thread.sleep(ACCEPT_RETRY_DELAY_MS)
+                        } catch (_: InterruptedException) {
+                            break
                         }
                     }
                 }
@@ -4851,10 +5139,16 @@ class AutoTransportService : Service() {
                     .distinctBy { System.identityHashCode(it) }
             }
 
-        fun stop() {
+        /** Non-blocking: stops accepting and frees the port. Follow with [stop] off the main thread. */
+        fun closeListener() {
             active.set(false)
             runCatching { serverSocket?.close() }
             runCatching { acceptThread?.interrupt() }
+        }
+
+        /** Blocking (joins for up to [SOCKS_STOP_DRAIN_TIMEOUT_MS]); never call on the main thread. */
+        fun stop() {
+            closeListener()
             closeSessions()
             ioPool.shutdownNow()
             runCatching { acceptThread?.join(SOCKS_STOP_DRAIN_TIMEOUT_MS) }
@@ -4870,6 +5164,7 @@ class AutoTransportService : Service() {
             try {
                 client.use { clientSocket ->
                     tuneSocket(clientSocket)
+                    clientSocket.soTimeout = CLIENT_HANDSHAKE_TIMEOUT_MS
                     val clientIn = clientSocket.getInputStream()
                     val clientOut = clientSocket.getOutputStream()
                     val request = readClientConnectRequest(clientIn, clientOut)
@@ -4878,24 +5173,31 @@ class AutoTransportService : Service() {
                     tracked.upstreamGeneration = selected.generation
                     tracked.isHealthProbe = isHealthProbeDestination(request.destination, OUTBOUND_URL)
                     val counters = countersFor(selected, request.destination)
-                    Log.d(
-                        LOG_TAG,
-                        "session=$sessionID connect dest=${request.destination} upstream=${selected.host}:${selected.port} gen=${selected.generation}",
-                    )
+                    if (BuildConfig.DEBUG) {
+                        Log.d(
+                            LOG_TAG,
+                            "session=$sessionID connect dest=${request.destination} upstream=${selected.host}:${selected.port} gen=${selected.generation}",
+                        )
+                    }
                     val upstreamSocketForSession = connectUpstream(request.raw, selected)
                     upstream = upstreamSocketForSession
                     sessions[upstreamSocketForSession] = tracked
                     upstreamSocketForSession.use { upstreamSocket ->
                         sendSuccess(clientOut)
+                        clientSocket.soTimeout = 0
                         val totals = proxy(sessionID, clientSocket, upstreamSocket, counters, tracked)
-                        Log.d(
-                            LOG_TAG,
-                            "session=$sessionID closed dest=${request.destination} up=${totals.upBytes} down=${totals.downBytes}",
-                        )
+                        if (BuildConfig.DEBUG) {
+                            Log.d(
+                                LOG_TAG,
+                                "session=$sessionID closed dest=${request.destination} up=${totals.upBytes} down=${totals.downBytes}",
+                            )
+                        }
                     }
                 }
             } catch (rejected: SocksRequestRejectedException) {
-                Log.i(LOG_TAG, "session=$sessionID rejected: ${rejected.message}")
+                Log.i(LOG_TAG, "session=$sessionID rejected: ${if (BuildConfig.DEBUG) rejected.message else "unsupported request"}")
+            } catch (rejected: SocksAuthRejectedException) {
+                Log.i(LOG_TAG, "session=$sessionID auth rejected")
             } catch (error: Throwable) {
                 Log.w(LOG_TAG, "session=$sessionID failed: ${error.message}")
                 if (error is UpstreamConnectException) {
@@ -4911,11 +5213,12 @@ class AutoTransportService : Service() {
         }
 
         private fun readClientConnectRequest(input: InputStream, output: OutputStream): SocksConnectRequest {
-            if (input.readByteOrThrow() != SOCKS_VERSION) throw EOFException()
-            val methods = input.readByteOrThrow()
-            input.readExact(methods)
-            output.write(byteArrayOf(SOCKS_VERSION.toByte(), SOCKS_NO_AUTH.toByte()))
-            output.flush()
+            negotiateLocalSocksServerAuth(
+                input = input,
+                output = output,
+                internal = internalCredentials(),
+                frontEnd = frontEndCredentials(),
+            )
 
             val header = input.readExact(4)
             if (header[0].toInt() and BYTE_MASK != SOCKS_VERSION) throw EOFException()
@@ -4958,16 +5261,11 @@ class AutoTransportService : Service() {
             try {
                 tuneSocket(socket)
                 socket.connect(InetSocketAddress(upstream.host, upstream.port), UPSTREAM_CONNECT_TIMEOUT_MS)
+                // Bound the handshake; the data phase relies on half-close and session teardown.
+                socket.soTimeout = UPSTREAM_CONNECT_TIMEOUT_MS
                 val input = socket.getInputStream()
                 val output = socket.getOutputStream()
-                output.write(byteArrayOf(SOCKS_VERSION.toByte(), 1, SOCKS_NO_AUTH.toByte()))
-                output.flush()
-                val greeting = input.readExact(2)
-                if ((greeting[0].toInt() and BYTE_MASK) != SOCKS_VERSION ||
-                    (greeting[1].toInt() and BYTE_MASK) != SOCKS_NO_AUTH
-                ) {
-                    throw EOFException("bad upstream socks greeting")
-                }
+                Socks5Auth.negotiateClient(input, output, internalCredentials())
                 output.write(request)
                 output.flush()
                 val responseHeader = input.readExact(4)
@@ -4983,6 +5281,7 @@ class AutoTransportService : Service() {
                     else -> throw EOFException()
                 }
                 input.readExact(bindAddressLength + 2)
+                socket.soTimeout = 0
                 return socket
             } catch (error: Throwable) {
                 runCatching { socket.close() }
@@ -4990,6 +5289,11 @@ class AutoTransportService : Service() {
             }
         }
 
+        /**
+         * Relays both directions. EOF on one side is propagated as a half-close (shutdownOutput)
+         * to the other side, so request/response protocols that close their sending side early
+         * keep receiving; both sockets are closed once both directions finished or on any error.
+         */
         private fun proxy(
             sessionID: Long,
             client: Socket,
@@ -5007,9 +5311,20 @@ class AutoTransportService : Service() {
                     runCatching { upstream.close() }
                 }
             }
+            fun finishDirection(cleanEof: Boolean, destination: Socket) {
+                if (!cleanEof) {
+                    closeBoth()
+                    return
+                }
+                runCatching {
+                    if (!destination.isClosed && !destination.isOutputShutdown) {
+                        destination.shutdownOutput()
+                    }
+                }.onFailure { closeBoth() }
+            }
             val upstreamThread = Thread {
                 try {
-                    pipe(
+                    val clean = pipe(
                         sessionID = sessionID,
                         input = client.getInputStream(),
                         output = upstream.getOutputStream(),
@@ -5018,40 +5333,48 @@ class AutoTransportService : Service() {
                         direction = "up",
                         tracked = tracked,
                     )
-                } finally {
+                    finishDirection(clean, upstream)
+                } catch (_: Throwable) {
                     closeBoth()
-                    done.countDown()
-                }
-            }
-            val downstreamThread = Thread {
-                try {
-                    pipe(
-                        sessionID = sessionID,
-                        input = upstream.getInputStream(),
-                        output = client.getOutputStream(),
-                        counter = downBytes,
-                        aggregateCounter = counters?.rx,
-                        direction = "down",
-                        tracked = tracked,
-                    )
                 } finally {
-                    closeBoth()
                     done.countDown()
                 }
             }
             upstreamThread.isDaemon = true
-            downstreamThread.isDaemon = true
+            upstreamThread.name = "tw-socks-up-$sessionID"
             upstreamThread.start()
-            downstreamThread.start()
+            // The downstream direction runs on the session's pool thread: one thread less per session.
             try {
-                done.await()
+                val clean = pipe(
+                    sessionID = sessionID,
+                    input = upstream.getInputStream(),
+                    output = client.getOutputStream(),
+                    counter = downBytes,
+                    aggregateCounter = counters?.rx,
+                    direction = "down",
+                    tracked = tracked,
+                )
+                finishDirection(clean, client)
+            } catch (_: Throwable) {
+                closeBoth()
+            } finally {
+                done.countDown()
+            }
+            try {
+                if (!done.await(HALF_CLOSE_LINGER_MS, TimeUnit.MILLISECONDS)) {
+                    // The client keeps its half open long after the upstream finished: reclaim.
+                    closeBoth()
+                    done.await()
+                }
             } catch (error: InterruptedException) {
                 closeBoth()
                 Thread.currentThread().interrupt()
             }
+            closeBoth()
             return PipeTotals(upBytes = upBytes.get(), downBytes = downBytes.get())
         }
 
+        /** Returns true on a clean EOF from [input], false when the relay failed or was stopped. */
         private fun pipe(
             sessionID: Long,
             input: InputStream,
@@ -5060,27 +5383,31 @@ class AutoTransportService : Service() {
             aggregateCounter: AtomicLong?,
             direction: String,
             tracked: TrackedSocket,
-        ) {
+        ): Boolean {
             try {
                 val buffer = ByteArray(PROXY_BUFFER_BYTES)
+                val pipeDirection = if (direction == "down") TcpPipeDirection.DOWN else TcpPipeDirection.UP
                 while (active.get()) {
                     val read = input.read(buffer)
-                    if (read < 0) break
+                    if (read < 0) {
+                        output.flush()
+                        return true
+                    }
                     output.write(buffer, 0, read)
                     val readBytes = read.toLong()
                     counter.addAndGet(readBytes)
                     aggregateCounter?.addAndGet(readBytes)
-                    val pipeDirection = if (direction == "down") TcpPipeDirection.DOWN else TcpPipeDirection.UP
                     val nowMs = SystemClock.elapsedRealtime()
                     if (recordTrackedSocketProgress(tracked, readBytes, pipeDirection, nowMs)) {
                         lastUserTrafficAtMs.set(nowMs)
                     }
                 }
-                output.flush()
+                return false
             } catch (error: Throwable) {
-                if (active.get()) {
+                if (active.get() && BuildConfig.DEBUG) {
                     Log.d(LOG_TAG, "session=$sessionID pipe=$direction closed: ${error.message}")
                 }
+                return false
             }
         }
 
@@ -5148,6 +5475,11 @@ class AutoTransportService : Service() {
             private const val PROXY_BUFFER_BYTES = 64 * 1024
             private const val SOCKS_MAX_SESSIONS = 256L
             private const val SOCKS_STOP_DRAIN_TIMEOUT_MS = 2_000L
+            private const val ACCEPT_RETRY_DELAY_MS = 100L
+            private const val CLIENT_HANDSHAKE_TIMEOUT_MS = 30_000
+            // After the upstream finished sending, how long the client may keep its half open
+            // before the session is reclaimed.
+            private const val HALF_CLOSE_LINGER_MS = 2 * 60 * 1000L
         }
     }
 
@@ -5202,6 +5534,7 @@ class AutoTransportService : Service() {
         // Android deep Doze throttles exact allow-while-idle alarms to roughly
         // one delivery per 9 minutes, so this is a kill-recovery watchdog.
         private const val BACKSTOP_INTERVAL_MS = 10 * 60 * 1000L
+        private const val BACKSTOP_WINDOW_MS = 5 * 60 * 1000L
         private const val AWG_UNHEALTHY_PROBE_INTERVAL_MS = 75_000L
         private const val OUTBOUND_REFRESH_INTERVAL_MS = 15_000L
         private const val XRAY_STOP_GRACE_MS = 1_500L
@@ -5260,6 +5593,27 @@ class AutoTransportService : Service() {
         private const val ROUTE_REASON_NO_UPSTREAM = "no_upstream_ready"
 
         private val activeService = AtomicReference<AutoTransportService?>(null)
+
+        /** Source of worker ids, unique across service instances. */
+        private val workerGenerationCounter = AtomicLong(0)
+
+        /** Id of the worker that currently owns the global native (Go) transport cores. */
+        private val nativeOwnerGeneration = AtomicLong(0)
+        private val nativeLock = Any()
+
+        /** Thread of the most recently started worker (any service instance). */
+        private val runningWorkerThread = AtomicReference<Thread?>(null)
+
+        /**
+         * Serial background executor shared by all service instances for blocking lifecycle work
+         * (listener draining, sidecar teardown, native core stop, VPN route updates). It outlives
+         * a destroyed service instance so a stop requested from the main thread still completes.
+         */
+        private val lifecycleExecutor: ExecutorService = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "tw-transport-lifecycle").apply { isDaemon = true }
+        }
+        private const val PREVIOUS_WORKER_JOIN_TIMEOUT_MS = 5_000L
+        private const val INTERNAL_HTTP_READ_BUFFER_BYTES = 8 * 1024
         private val lastNetworkReviveAtMs = AtomicLong(0)
         private val latestCarryingState = AtomicReference<TransportUiState?>(null)
 
@@ -5278,21 +5632,43 @@ class AutoTransportService : Service() {
             val appContext = context.applicationContext
             if (!TransportLifecycleStore.shouldKeepAlive(appContext)) return
             val triggerAt = SystemClock.elapsedRealtime() + BACKSTOP_INTERVAL_MS
-            val alarmManager = appContext.getSystemService(AlarmManager::class.java)
-            runCatching {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerAt,
-                    backstopPendingIntent(appContext),
-                )
-                Log.i(LOG_TAG, "backstop exact alarm scheduled")
-            }.onFailure { error ->
-                Log.w(LOG_TAG, "backstop exact alarm failed: ${error.message}")
-                alarmManager.setAndAllowWhileIdle(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerAt,
-                    backstopPendingIntent(appContext),
-                )
+            val alarmManager = appContext.getSystemService(AlarmManager::class.java) ?: return
+            val pendingIntent = backstopPendingIntent(appContext)
+            // SCHEDULE_EXACT_ALARM is user-revocable (and denied by default on Android 14+):
+            // use exact alarms only when granted, otherwise an inexact while-idle alarm.
+            var exactScheduled = false
+            if (Build.VERSION.SDK_INT < 31 || alarmManager.canScheduleExactAlarms()) {
+                try {
+                    alarmManager.setExactAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        triggerAt,
+                        pendingIntent,
+                    )
+                    exactScheduled = true
+                } catch (error: SecurityException) {
+                    Log.w(LOG_TAG, "backstop exact alarm not permitted: ${error.message}")
+                } catch (error: RuntimeException) {
+                    Log.w(LOG_TAG, "backstop exact alarm failed: ${error.message}")
+                }
+            }
+            if (!exactScheduled) {
+                runCatching {
+                    alarmManager.setAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        triggerAt,
+                        pendingIntent,
+                    )
+                }.onFailure { error ->
+                    Log.w(LOG_TAG, "backstop inexact alarm failed: ${error.message}")
+                    runCatching {
+                        alarmManager.setWindow(
+                            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                            triggerAt,
+                            BACKSTOP_WINDOW_MS,
+                            pendingIntent,
+                        )
+                    }
+                }
             }
         }
 
@@ -5320,7 +5696,6 @@ class AutoTransportService : Service() {
         private const val JSON_TX = "tx_bytes"
 
         private const val SOCKS_VERSION = 5
-        private const val SOCKS_NO_AUTH = 0
         private const val SOCKS_CONNECT = 1
         private const val SOCKS_ATYP_IPV4 = 1
         private const val SOCKS_ATYP_DOMAIN = 3

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="vpn_always_on_enrollment_required_title">Always-on VPN is not running</string>
+    <string name="vpn_always_on_enrollment_required_text">This device is not enrolled in TrafficWrapper yet. Open the app, finish enrollment and turn the VPN on again.</string>
+</resources>

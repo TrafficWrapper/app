@@ -57,4 +57,13 @@
     <string name="public_enrollment_terminal_error">Enrollment was rejected. Check the bootstrap or contact the operator.</string>
     <string name="public_enrollment_retry">Retry</string>
     <string name="update_notification_ready">Update APK downloaded and verified</string>
+    <string name="local_proxy_auth_title">Local proxy password</string>
+    <string name="local_proxy_auth_switch">Require a password for the local proxy</string>
+    <string name="local_proxy_auth_description">Other apps on the device cannot use or detect the tunnel without the username and password. Disabled by default.</string>
+    <string name="local_proxy_auth_username">Username</string>
+    <string name="local_proxy_auth_password">Password</string>
+    <string name="local_proxy_auth_regenerate">Generate a new password</string>
+    <string name="local_proxy_auth_copied">Copied</string>
+    <string name="local_proxy_auth_hint">Apps that use the proxy at 127.0.0.1:18080 (SOCKS5) or 127.0.0.1:18090 (HTTP) must be configured with this username and password. Telegram receives them automatically via the proxy setup button. The Android Wi-Fi proxy setting does not support passwords and will not work while protection is on. Update the password in your apps after regenerating it.</string>
+    <string name="local_proxy_auth_apps_hint">The proxy is password-protected: username %1$s, password %2$s.</string>
 </resources>

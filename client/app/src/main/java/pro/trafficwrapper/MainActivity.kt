@@ -3,6 +3,7 @@ package pro.trafficwrapper
 import android.Manifest
 import android.app.Activity
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.ActivityNotFoundException
 import android.content.Context
@@ -14,6 +15,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PersistableBundle
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Base64
@@ -110,18 +112,31 @@ class MainActivity : ComponentActivity() {
         }
         requestNotificationPermission()
         if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
-            val restored = restorePublicPlatformState(applicationContext)
-            PUBLIC_BOOTSTRAP_IMPORTED = restored || publicBootstrapRaw(applicationContext).isNotBlank()
-            if (!restored) {
-                TransportRuntime.auth = AuthUiState(
-                    statusTextRes = if (PUBLIC_BOOTSTRAP_IMPORTED) {
-                        R.string.public_bootstrap_imported
-                    } else {
-                        R.string.public_bootstrap_required
-                    },
-                )
-                if (PUBLIC_BOOTSTRAP_IMPORTED) {
-                    startPublicDeviceEnrollment(applicationContext)
+            // Decrypting the sealed state (Keystore/StrongBox), minisign verification and the Go
+            // core apply are slow, so they run on the public-state executor; the UI shows a
+            // loading placeholder until the result is applied on the main thread. Intents queued
+            // below run on the same single-thread executor, i.e. strictly after the restore.
+            val appContext = applicationContext
+            PUBLIC_STATE_EXECUTOR.execute {
+                val restored = runCatching { restorePublicPlatformState(appContext) }
+                    .onFailure { Log.w(TAG, "public platform restore crashed", it) }
+                    .getOrDefault(false)
+                val bootstrapRaw = runCatching { publicBootstrapRaw(appContext) }.getOrDefault("")
+                MAIN_HANDLER.post {
+                    PUBLIC_BOOTSTRAP_IMPORTED = restored || bootstrapRaw.isNotBlank()
+                    if (!restored) {
+                        TransportRuntime.auth = AuthUiState(
+                            statusTextRes = if (PUBLIC_BOOTSTRAP_IMPORTED) {
+                                R.string.public_bootstrap_imported
+                            } else {
+                                R.string.public_bootstrap_required
+                            },
+                        )
+                        if (PUBLIC_BOOTSTRAP_IMPORTED) {
+                            startPublicDeviceEnrollment(appContext, bootstrapRaw)
+                        }
+                    }
+                    PUBLIC_STATE_LOADING = false
                 }
             }
             handlePublicBootstrapIntent(intent)
@@ -210,25 +225,13 @@ class MainActivity : ComponentActivity() {
             ?: intent.getStringExtra(Intent.EXTRA_TEXT)
             ?: return
         if (raw.isBlank()) return
-        try {
-            val parsed = PublicPlatformConfigParser.parseBootstrap(raw)
-            handleParsedExternalBootstrap(applicationContext, raw, parsed)
-            PUBLIC_BOOTSTRAP_ERROR = null
-        } catch (_: Throwable) {
-            PUBLIC_BOOTSTRAP_ERROR = getString(R.string.public_bootstrap_invalid)
-        }
+        handleExternalBootstrap(applicationContext, raw)
     }
 
     private fun handlePublicDeepLinkIntent(intent: Intent?) {
         if (!DeploymentConfig.IS_PUBLIC_PLATFORM || intent == null) return
         val raw = publicEnrollDeepLinkBootstrap(intent.dataString) ?: return
-        try {
-            val parsed = PublicPlatformConfigParser.parseBootstrap(raw)
-            handleParsedExternalBootstrap(applicationContext, raw, parsed)
-            PUBLIC_BOOTSTRAP_ERROR = null
-        } catch (_: Throwable) {
-            PUBLIC_BOOTSTRAP_ERROR = getString(R.string.public_bootstrap_invalid)
-        }
+        handleExternalBootstrap(applicationContext, raw)
     }
 }
 
@@ -282,7 +285,9 @@ private fun TrafficWrapperApp() {
                 horizontalAlignment = Alignment.Start,
                 verticalArrangement = Arrangement.Top,
             ) {
-                if (DeploymentConfig.IS_PUBLIC_PLATFORM && !PUBLIC_BOOTSTRAP_IMPORTED) {
+                if (DeploymentConfig.IS_PUBLIC_PLATFORM && PUBLIC_STATE_LOADING) {
+                    PublicStateLoadingScreen()
+                } else if (DeploymentConfig.IS_PUBLIC_PLATFORM && !PUBLIC_BOOTSTRAP_IMPORTED) {
                     PublicBootstrapScreen(context = context)
                 } else if (SHOW_SETTINGS_SCREEN) {
                     SettingsScreen(
@@ -360,6 +365,9 @@ private fun ExternalBootstrapConfirmDialog(
                 Text(text = "orchestrator_url: ${pending.orchestratorUrl}")
                 Text(text = "config_pubkey_pin: ${pending.configPubkeyPin}")
                 Text(text = "orch_noise_public: ${pending.orchNoisePublic}")
+                if (pending.updatePubkey.isNotBlank()) {
+                    Text(text = "update_pubkey: ${pending.updatePubkey}")
+                }
             }
         },
         confirmButton = {
@@ -373,6 +381,17 @@ private fun ExternalBootstrapConfirmDialog(
             }
         },
     )
+}
+
+@Composable
+private fun PublicStateLoadingScreen() {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        AppHeader()
+        CircularProgressIndicator(modifier = Modifier.size(24.dp))
+    }
 }
 
 @Composable
@@ -413,10 +432,12 @@ private fun PublicBootstrapPendingScreen(context: Context, auth: AuthUiState) {
                 if (auth.enrollmentRetryAllowed && !auth.inProgress) {
                     Button(
                         onClick = {
-                            retryPublicEnrollmentIfAllowed(
-                                auth = TransportRuntime.auth,
-                                bootstrapRaw = publicBootstrapRaw(context),
-                            ) { raw -> startPublicDeviceEnrollment(context.applicationContext, raw) }
+                            withPublicBootstrapRaw(context) { bootstrapRaw ->
+                                retryPublicEnrollmentIfAllowed(
+                                    auth = TransportRuntime.auth,
+                                    bootstrapRaw = bootstrapRaw,
+                                ) { raw -> startPublicDeviceEnrollment(context.applicationContext, raw) }
+                            }
                         },
                     ) {
                         Text(text = stringResource(R.string.public_enrollment_retry))
@@ -429,7 +450,9 @@ private fun PublicBootstrapPendingScreen(context: Context, auth: AuthUiState) {
 
 @Composable
 private fun PublicBootstrapScreen(context: Context) {
-    var input by remember { mutableStateOf(publicBootstrapRaw(context)) }
+    // This screen is only shown when no bootstrap is stored (see PUBLIC_BOOTSTRAP_IMPORTED), so
+    // there is nothing to prefill; avoid decrypting the secure store on the main thread.
+    var input by remember { mutableStateOf("") }
     var showScanner by remember { mutableStateOf(false) }
     fun importBootstrap(raw: String) {
         try {
@@ -1532,6 +1555,9 @@ private fun ConsumerAppsPanel(
 ) {
     val telegramLabel = apps.apps.firstOrNull { it.packageName == TELEGRAM_PACKAGE }?.label ?: "Telegram"
     val effectiveSocks = socksListen.ifBlank { DEFAULT_ROUTER_SOCKS_LISTEN }
+    val frontEndCredentials = remember {
+        LocalSocksAuth.requiredFrontEndCredentials(context.applicationContext)
+    }
     Text(
         text = stringResource(R.string.apps_title),
         modifier = Modifier.padding(top = 18.dp),
@@ -1587,6 +1613,18 @@ private fun ConsumerAppsPanel(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (frontEndCredentials != null) {
+                Text(
+                    text = stringResource(
+                        R.string.local_proxy_auth_apps_hint,
+                        frontEndCredentials.username,
+                        frontEndCredentials.password,
+                    ),
+                    modifier = Modifier.padding(top = 6.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             if (apps.loading) {
                 Text(
                     text = stringResource(R.string.app_choice_loading),
@@ -1883,6 +1921,10 @@ private fun SettingsScreen(
         HttpProxyPanel(context, transport)
     }
 
+    SettingsSection(title = stringResource(R.string.local_proxy_auth_title)) {
+        LocalProxyAuthPanel(context)
+    }
+
     if (BuildConfig.VPN_ENABLED) {
         SettingsSection(title = stringResource(R.string.vpn_mode_title)) {
             VpnModePanel(context, transport)
@@ -2107,6 +2149,81 @@ private fun HttpProxyPanel(context: Context, transport: TransportUiState) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+    }
+}
+
+@Composable
+private fun LocalProxyAuthPanel(context: Context) {
+    val appContext = context.applicationContext
+    var authOn by remember { mutableStateOf(LocalSocksAuth.isFrontEndAuthEnabled(appContext)) }
+    var credentials by remember {
+        mutableStateOf(if (authOn) LocalSocksAuth.frontEndCredentials(appContext) else null)
+    }
+    SettingsToggleRow(
+        title = stringResource(R.string.local_proxy_auth_switch),
+        body = stringResource(R.string.local_proxy_auth_description),
+        checked = authOn,
+        onCheckedChange = { enabled ->
+            LocalSocksAuth.setFrontEndAuthEnabled(appContext, enabled)
+            authOn = LocalSocksAuth.isFrontEndAuthEnabled(appContext)
+            credentials = if (authOn) LocalSocksAuth.frontEndCredentials(appContext) else null
+            notifyHttpProxyPreferenceChanged(appContext)
+        },
+    )
+    val current = credentials
+    if (authOn && current != null) {
+        CredentialRow(
+            label = stringResource(R.string.local_proxy_auth_username),
+            value = current.username,
+            onCopy = { copySensitiveText(appContext, "TrafficWrapper proxy username", current.username, sensitive = false) },
+        )
+        CredentialRow(
+            label = stringResource(R.string.local_proxy_auth_password),
+            value = current.password,
+            onCopy = { copySensitiveText(appContext, "TrafficWrapper proxy password", current.password, sensitive = true) },
+        )
+        OutlinedButton(
+            onClick = {
+                credentials = LocalSocksAuth.regenerateFrontEndCredentials(appContext)
+                notifyHttpProxyPreferenceChanged(appContext)
+            },
+            modifier = Modifier.padding(top = 8.dp),
+        ) {
+            Text(text = stringResource(R.string.local_proxy_auth_regenerate))
+        }
+        Text(
+            text = stringResource(R.string.local_proxy_auth_hint),
+            modifier = Modifier.padding(top = 8.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun CredentialRow(label: String, value: String, onCopy: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        OutlinedButton(onClick = onCopy) {
+            Text(text = stringResource(R.string.copy_button))
+        }
     }
 }
 
@@ -2542,6 +2659,18 @@ private fun openThisAppDetailsSettings(context: Context) {
     runCatching { context.startActivity(intent) }
 }
 
+private fun copySensitiveText(context: Context, label: String, text: String, sensitive: Boolean) {
+    val clipboard = context.getSystemService(ClipboardManager::class.java) ?: return
+    val clip = ClipData.newPlainText(label, text)
+    if (sensitive && Build.VERSION.SDK_INT >= 33) {
+        clip.description.extras = PersistableBundle().apply {
+            putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+        }
+    }
+    clipboard.setPrimaryClip(clip)
+    Toast.makeText(context, R.string.local_proxy_auth_copied, Toast.LENGTH_SHORT).show()
+}
+
 private fun copySocksAddress(context: Context, socksListen: String) {
     val clipboard = context.getSystemService(ClipboardManager::class.java)
     clipboard?.setPrimaryClip(ClipData.newPlainText("TrafficWrapper SOCKS5", socksListen))
@@ -2556,32 +2685,61 @@ private fun publicBootstrapRaw(context: Context): String =
             .orEmpty()
     }
 
-private fun handleParsedExternalBootstrap(context: Context, raw: String, parsed: PublicBootstrapConfig) {
-    when (externalBootstrapDecision(publicBootstrapRaw(context), parsed)) {
-        ExternalBootstrapDecision.IGNORE -> {
-            PENDING_EXTERNAL_BOOTSTRAP = null
+/**
+ * Handles a bootstrap that arrived from outside the app (intent extra, SEND text, deep link).
+ * Parsing and the comparison with the stored bootstrap (which needs the Keystore) run on the
+ * public-state executor; the decision is applied to UI state on the main thread.
+ */
+private fun handleExternalBootstrap(context: Context, raw: String) {
+    val appContext = context.applicationContext
+    PUBLIC_STATE_EXECUTOR.execute {
+        val outcome = runCatching {
+            val parsed = PublicPlatformConfigParser.parseBootstrap(raw)
+            val currentRaw = publicBootstrapRaw(appContext)
+            val pinnedUpdatePubkey = runCatching {
+                SecureIdentityStore(appContext).readPublicPlatformState().updatePubkeyPin
+            }.getOrDefault("")
+            val decision = externalBootstrapDecision(currentRaw, parsed, pinnedUpdatePubkey)
+            val pending = when (decision) {
+                ExternalBootstrapDecision.CONFIRM_NEW ->
+                    pendingExternalBootstrap(currentRaw, raw, parsed, replacesExisting = false)
+                ExternalBootstrapDecision.CONFIRM_REPLACE ->
+                    pendingExternalBootstrap(currentRaw, raw, parsed, replacesExisting = true)
+                else -> null
+            }
+            if (decision == ExternalBootstrapDecision.REFRESH) {
+                // Every trusted field (orchestrator, pins, noise key, update key, seed workers)
+                // matches the active bootstrap; only the one-time token / expiry changed.
+                savePublicBootstrap(appContext, raw)
+            }
+            decision to pending
         }
-        ExternalBootstrapDecision.REFRESH -> {
-            savePublicBootstrap(context, raw)
-            PUBLIC_BOOTSTRAP_IMPORTED = true
-            PENDING_EXTERNAL_BOOTSTRAP = null
-        }
-        ExternalBootstrapDecision.CONFIRM_NEW -> {
-            PENDING_EXTERNAL_BOOTSTRAP = pendingExternalBootstrap(context, raw, parsed, replacesExisting = false)
-        }
-        ExternalBootstrapDecision.CONFIRM_REPLACE -> {
-            PENDING_EXTERNAL_BOOTSTRAP = pendingExternalBootstrap(context, raw, parsed, replacesExisting = true)
+        MAIN_HANDLER.post {
+            outcome.onSuccess { (decision, pending) ->
+                when (decision) {
+                    ExternalBootstrapDecision.IGNORE -> PENDING_EXTERNAL_BOOTSTRAP = null
+                    ExternalBootstrapDecision.REFRESH -> {
+                        PUBLIC_BOOTSTRAP_IMPORTED = true
+                        PENDING_EXTERNAL_BOOTSTRAP = null
+                    }
+                    ExternalBootstrapDecision.CONFIRM_NEW,
+                    ExternalBootstrapDecision.CONFIRM_REPLACE,
+                    -> PENDING_EXTERNAL_BOOTSTRAP = pending
+                }
+                PUBLIC_BOOTSTRAP_ERROR = null
+            }.onFailure {
+                PUBLIC_BOOTSTRAP_ERROR = appContext.getString(R.string.public_bootstrap_invalid)
+            }
         }
     }
 }
 
 private fun pendingExternalBootstrap(
-    context: Context,
+    currentRaw: String,
     raw: String,
     parsed: PublicBootstrapConfig,
     replacesExisting: Boolean,
-): PendingExternalBootstrap? {
-    val currentRaw = publicBootstrapRaw(context)
+): PendingExternalBootstrap {
     val current = runCatching {
         currentRaw.takeIf { it.isNotBlank() }?.let { PublicPlatformConfigParser.parseBootstrap(it) }
     }.getOrNull()
@@ -2590,25 +2748,53 @@ private fun pendingExternalBootstrap(
         orchestratorUrl = parsed.orchestratorUrl,
         configPubkeyPin = parsed.configPubkeyPin,
         orchNoisePublic = parsed.orchNoisePublic,
+        updatePubkey = parsed.updatePubkey,
         replacesExisting = replacesExisting,
         currentOrchestratorUrl = current?.orchestratorUrl.orEmpty(),
     )
 }
 
+/** Runs [action] on the main thread with the stored bootstrap, read off the main thread. */
+private fun withPublicBootstrapRaw(context: Context, action: (String) -> Unit) {
+    val appContext = context.applicationContext
+    PUBLIC_STATE_EXECUTOR.execute {
+        val raw = runCatching { publicBootstrapRaw(appContext) }.getOrDefault("")
+        MAIN_HANDLER.post { action(raw) }
+    }
+}
+
+/** Restores the cached public platform state off the main thread; [onResult] runs on main. */
+private fun restorePublicPlatformStateAsync(context: Context, onResult: (Boolean) -> Unit) {
+    val appContext = context.applicationContext
+    PUBLIC_STATE_EXECUTOR.execute {
+        val restored = runCatching { restorePublicPlatformState(appContext) }
+            .onFailure { Log.w(TAG, "public platform restore crashed", it) }
+            .getOrDefault(false)
+        MAIN_HANDLER.post { onResult(restored) }
+    }
+}
+
 internal fun publicBootstrapMatchesActive(currentRaw: String, incoming: PublicBootstrapConfig): Boolean {
     if (currentRaw.isBlank()) return false
     val current = runCatching { PublicPlatformConfigParser.parseBootstrap(currentRaw) }.getOrNull() ?: return false
-    return current.orchestratorUrl == incoming.orchestratorUrl &&
-        current.configPubkeyPin == incoming.configPubkeyPin &&
-        current.orchNoisePublic == incoming.orchNoisePublic
+    return publicBootstrapTrustedFieldsMatch(current, incoming)
 }
 
+/**
+ * Decides how to treat an external (not scanned/typed in the app) bootstrap. Anything that
+ * changes a trusted field - including update_pubkey and seed workers - or conflicts with an
+ * already pinned update key needs explicit user confirmation, exactly like a new import.
+ */
 internal fun externalBootstrapDecision(
     currentRaw: String,
     incoming: PublicBootstrapConfig,
+    pinnedUpdatePubkey: String = "",
 ): ExternalBootstrapDecision {
     if (currentRaw.isBlank()) return ExternalBootstrapDecision.CONFIRM_NEW
     if (!publicBootstrapMatchesActive(currentRaw, incoming)) return ExternalBootstrapDecision.CONFIRM_REPLACE
+    if (!updatePubkeyCompatibleWithPin(pinnedUpdatePubkey, incoming.updatePubkey)) {
+        return ExternalBootstrapDecision.CONFIRM_REPLACE
+    }
     val current = runCatching { PublicPlatformConfigParser.parseBootstrap(currentRaw) }.getOrNull()
     return if (
         current != null &&
@@ -2649,6 +2835,7 @@ private data class PendingExternalBootstrap(
     val orchestratorUrl: String,
     val configPubkeyPin: String,
     val orchNoisePublic: String,
+    val updatePubkey: String,
     val replacesExisting: Boolean,
     val currentOrchestratorUrl: String,
 )
@@ -2755,7 +2942,7 @@ private fun restorePublicPlatformState(context: Context): Boolean {
             store = store,
             stored = stored,
             config = config,
-            persist = false,
+            persist = null,
         )
         true
     }.getOrElse { error ->
@@ -2764,7 +2951,7 @@ private fun restorePublicPlatformState(context: Context): Boolean {
     }
 }
 
-private fun startPublicDeviceEnrollment(context: Context, bootstrapRaw: String = publicBootstrapRaw(context)) {
+private fun startPublicDeviceEnrollment(context: Context, bootstrapRawOverride: String? = null) {
     if (!DeploymentConfig.IS_PUBLIC_PLATFORM) return
     if (!ENROLLMENT_ACTIVE.compareAndSet(false, true)) return
     TransportRuntime.auth = TransportRuntime.auth.copy(
@@ -2778,6 +2965,8 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRaw: String =
     ENROLLMENT_EXECUTOR.execute {
         val mainHandler = Handler(Looper.getMainLooper())
         try {
+            // Resolved here (background) rather than as a default argument on the caller's thread.
+            val bootstrapRaw = bootstrapRawOverride ?: publicBootstrapRaw(context)
             val parsed = PublicPlatformConfigParser.parseBootstrap(bootstrapRaw)
             val androidID = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
             if (androidID.isBlank()) {
@@ -2829,7 +3018,12 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRaw: String =
             val stored = StoredPublicPlatformState(
                 bootstrapRaw = bootstrapRaw.trim(),
                 configPubkeyPin = parsed.configPubkeyPin,
-                updatePubkeyPin = config.updatePubkey.ifBlank { parsed.updatePubkey },
+                // Recomputed atomically against the freshest state in mergeEnrolledPublicPlatformState.
+                updatePubkeyPin = resolveUpdatePubkeyPin(
+                    signedConfigUpdatePubkey = config.updatePubkey,
+                    previous = previous,
+                    bootstrap = parsed,
+                ),
                 maxSeenConfigSeq = maxOf(previous.maxSeenConfigSeq, config.seq),
                 maxSeenUpdateSeq = previous.maxSeenUpdateSeq,
                 clientConfigJson = clientBundle.getString(JSON_PUBLIC_CONFIG_JSON),
@@ -2852,7 +3046,15 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRaw: String =
                 deviceIdentity = deviceIdentity,
                 androidID = androidID,
                 model = model,
-                persist = true,
+                persist = { current ->
+                    mergeEnrolledPublicPlatformState(
+                        current = current,
+                        enrolled = stored,
+                        configSeq = config.seq,
+                        signedConfigUpdatePubkey = config.updatePubkey,
+                        bootstrap = parsed,
+                    )
+                },
             )
             savePublicBootstrap(context, bootstrapRaw)
         } catch (error: Throwable) {
@@ -2886,7 +3088,9 @@ private fun applyPublicPlatformState(
     deviceIdentity: StoredDeviceIdentity = store.getOrCreateDeviceIdentity(),
     androidID: String = stored.deviceID,
     model: String = deviceModel(),
-    persist: Boolean,
+    // Atomic read-modify-write applied to the stored state after the core accepted the config;
+    // null means "restore only" (nothing is written).
+    persist: ((StoredPublicPlatformState) -> StoredPublicPlatformState)?,
 ) {
     val credentials = PublicPlatformCredentials(
         deviceID = stored.deviceID,
@@ -2916,15 +3120,19 @@ private fun applyPublicPlatformState(
     if (!applyResponse.optBoolean(JSON_OK, false)) {
         throw IllegalStateException(applyResponse.optString(JSON_ERROR))
     }
-    if (persist) {
-        store.writePublicPlatformState(stored)
+    if (persist != null) {
+        store.updatePublicPlatformState(persist)
     }
-    TransportRuntime.publicPlatformConfig = config
-    TransportRuntime.publicPlatformRouteSlots = slots
-    TransportRuntime.publicReality2EgressIp = slots.reality2ExpectedEgressIp
-    TransportRuntime.publicRealityEgressIp = slots.realityExpectedEgressIp
-    TransportRuntime.selectedTransport = TransportChoice.AUTO
     val mainHandler = Handler(Looper.getMainLooper())
+    // Compose-backed runtime state is updated on the main thread; posts are FIFO, so anything the
+    // caller posts afterwards (e.g. starting the transport) observes these values.
+    runOnMainThread(mainHandler) {
+        TransportRuntime.publicPlatformConfig = config
+        TransportRuntime.publicPlatformRouteSlots = slots
+        TransportRuntime.publicReality2EgressIp = slots.reality2ExpectedEgressIp
+        TransportRuntime.publicRealityEgressIp = slots.realityExpectedEgressIp
+        TransportRuntime.selectedTransport = TransportChoice.AUTO
+    }
     postEnrollmentBaseState(
         mainHandler = mainHandler,
         noiseIdentity = noiseIdentity,
@@ -2944,6 +3152,14 @@ private fun applyPublicPlatformState(
         reality2 = slots.reality2,
         quota = (config.limits ?: stored.limitsJson.toJsonObjectOrNull())?.toQuotaUiState() ?: QuotaUiState(),
     )
+}
+
+private fun runOnMainThread(handler: Handler, action: () -> Unit) {
+    if (Looper.myLooper() == Looper.getMainLooper()) {
+        action()
+    } else {
+        handler.post(action)
+    }
 }
 
 private fun publicAwgUiConfig(route: PublicRouteConfig?, stored: StoredPublicPlatformState): AwgUiConfig? {
@@ -3221,14 +3437,16 @@ private fun startDeviceEnrollment(context: Context) {
 fun requestFreshDeviceKeys(context: Context, userInitiated: Boolean = true) {
     val appContext = context.applicationContext
     if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
-        if (restorePublicPlatformState(appContext)) {
-            if (userInitiated) {
-                TRANSPORT_KEEP_ALIVE.set(true)
-                TransportLifecycleStore.rememberActiveTransport(appContext, TransportRuntime.selectedTransport)
+        restorePublicPlatformStateAsync(appContext) { restored ->
+            if (restored) {
+                if (userInitiated) {
+                    TRANSPORT_KEEP_ALIVE.set(true)
+                    TransportLifecycleStore.rememberActiveTransport(appContext, TransportRuntime.selectedTransport)
+                }
+                startSelectedTransport(appContext)
+            } else {
+                startPublicDeviceEnrollment(appContext)
             }
-            startSelectedTransport(appContext)
-        } else {
-            startPublicDeviceEnrollment(appContext)
         }
         return
     }
@@ -3282,10 +3500,17 @@ private fun connectSelectedTransport(context: Context) {
         socksListen = DEFAULT_ROUTER_SOCKS_LISTEN,
     )
     if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
-        if (TransportRuntime.auth.authorized || restorePublicPlatformState(context.applicationContext)) {
-            startSelectedTransport(context.applicationContext)
+        val appContext = context.applicationContext
+        if (TransportRuntime.auth.authorized) {
+            startSelectedTransport(appContext)
         } else {
-            startPublicDeviceEnrollment(context.applicationContext)
+            restorePublicPlatformStateAsync(appContext) { restored ->
+                if (restored) {
+                    startSelectedTransport(appContext)
+                } else {
+                    startPublicDeviceEnrollment(appContext)
+                }
+            }
         }
         return
     }
@@ -3793,12 +4018,18 @@ private fun openTelegramProxy(context: Context, socksListen: String) {
     val port = listen.substringAfterLast(":", DEFAULT_SOCKS_PORT)
         .takeIf { it.toIntOrNull() != null }
         ?: DEFAULT_SOCKS_PORT
-    val uri = Uri.Builder()
+    val uriBuilder = Uri.Builder()
         .scheme(TELEGRAM_SCHEME)
         .authority(TELEGRAM_SOCKS_AUTHORITY)
         .appendQueryParameter(TELEGRAM_SERVER_PARAM, host)
         .appendQueryParameter(TELEGRAM_PORT_PARAM, port)
-        .build()
+    // When the local proxy requires a password, hand Telegram the front-end credentials too.
+    LocalSocksAuth.requiredFrontEndCredentials(context)?.let { credentials ->
+        uriBuilder
+            .appendQueryParameter(TELEGRAM_USER_PARAM, credentials.username)
+            .appendQueryParameter(TELEGRAM_PASS_PARAM, credentials.password)
+    }
+    val uri = uriBuilder.build()
     val intent = Intent(Intent.ACTION_VIEW, uri)
         .setPackage(TELEGRAM_PACKAGE)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -3924,6 +4155,11 @@ internal fun supportOrder(support: ProxySupport): Int =
     }
 
 private val ENROLLMENT_EXECUTOR = Executors.newSingleThreadExecutor()
+
+/** Serializes secure-store reads, restore and external-bootstrap handling off the main thread. */
+private val PUBLIC_STATE_EXECUTOR = Executors.newSingleThreadExecutor()
+// Lazy: MainActivityKt is loaded by JVM unit tests, where android.os.Looper is only a stub.
+private val MAIN_HANDLER by lazy { Handler(Looper.getMainLooper()) }
 private val ENROLLMENT_ACTIVE = AtomicBoolean(false)
 private val FORCE_KEY_REQUEST = AtomicBoolean(false)
 private val TRANSPORT_KEEP_ALIVE = AtomicBoolean(false)
@@ -3931,6 +4167,7 @@ private val STARTUP_AUTOCONNECT_REQUESTED = AtomicBoolean(false)
 private var CONNECT_IN_PROGRESS by mutableStateOf(false)
 private var SHOW_SETTINGS_SCREEN by mutableStateOf(false)
 private var PUBLIC_BOOTSTRAP_IMPORTED by mutableStateOf(false)
+private var PUBLIC_STATE_LOADING by mutableStateOf(DeploymentConfig.IS_PUBLIC_PLATFORM)
 private var PUBLIC_BOOTSTRAP_ERROR by mutableStateOf<String?>(null)
 private var PENDING_EXTERNAL_BOOTSTRAP by mutableStateOf<PendingExternalBootstrap?>(null)
 private var ATTENTION_REFRESH_TICK by mutableLongStateOf(0L)
@@ -3984,6 +4221,8 @@ private const val TELEGRAM_SCHEME = "tg"
 private const val TELEGRAM_SOCKS_AUTHORITY = "socks"
 private const val TELEGRAM_SERVER_PARAM = "server"
 private const val TELEGRAM_PORT_PARAM = "port"
+private const val TELEGRAM_USER_PARAM = "user"
+private const val TELEGRAM_PASS_PARAM = "pass"
 private const val TW_VPN_SERVICE_CLASS = "pro.trafficwrapper.TwVpnService"
 private const val TW_VPN_ACTION_STOP = "pro.trafficwrapper.action.VPN_STOP"
 private val VPN_COMMAND_EXECUTOR = Executors.newSingleThreadExecutor()
