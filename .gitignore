@@ -20,6 +20,7 @@ worker-state/
 .kotlin/
 .go-cache/
 .artifacts/
+client/build/
 client/app/build/
 client/app/libs/*.aar
 client/app/libs/*.jar
