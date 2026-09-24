@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -93,12 +94,16 @@ type discoveredRealityEndpoint struct {
 }
 
 type applyDiscoveredResult struct {
-	OK         bool                       `json:"ok"`
-	Error      string                     `json:"error,omitempty"`
-	Seq        int64                      `json:"seq,omitempty"`
-	ConfigJSON string                     `json:"config_json,omitempty"`
-	EgressIP   string                     `json:"egress_ip,omitempty"`
-	Reality    *discoveredRealityEndpoint `json:"reality,omitempty"`
+	OK         bool   `json:"ok"`
+	Error      string `json:"error,omitempty"`
+	Seq        int64  `json:"seq,omitempty"`
+	ConfigJSON string `json:"config_json,omitempty"`
+	// AWGMergeSkipped is set when the stored AWG config targets a non-base
+	// worker profile or an IPv6 endpoint: the bundle's base IPv4 endpoint
+	// would break it, so config_json is returned unchanged.
+	AWGMergeSkipped bool                       `json:"awg_merge_skipped,omitempty"`
+	EgressIP        string                     `json:"egress_ip,omitempty"`
+	Reality         *discoveredRealityEndpoint `json:"reality,omitempty"`
 }
 
 func ApplyDiscoveredEndpoints(requestJSON string) string {
@@ -148,10 +153,13 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 	}
 	reality := selectRealityEndpoint(bundle.Endpoints.Reality)
 	var mergedJSON string
+	mergeSkipped := false
 	if req.BaseConfigJSON != "" {
 		// Caller-supplied base: a pure function of the request. The shared
-		// provisioned config is neither read nor overwritten.
-		mergedJSON, err = mergeDiscoveredAWGConfig(req.BaseConfigJSON, awg)
+		// provisioned config is neither read nor overwritten. Without stored
+		// metadata only the endpoint family can be checked.
+		meta := provisionedConfigMeta{v6: configEndpointIsIPv6(req.BaseConfigJSON)}
+		mergedJSON, mergeSkipped, err = mergeDiscoveredAWGConfigFor(req.BaseConfigJSON, meta, awg)
 		if err == nil {
 			err = recordDiscoveredSeq(pubkey, bundle.Seq)
 		}
@@ -166,7 +174,7 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 			pendingProvision.Unlock()
 			return applyDiscoveredResult{}, errors.New("provisioned config is missing")
 		}
-		mergedJSON, err = mergeDiscoveredAWGConfig(pendingProvision.configJSON, awg)
+		mergedJSON, mergeSkipped, err = mergeDiscoveredAWGConfigFor(pendingProvision.configJSON, pendingProvision.configMeta, awg)
 		if err == nil {
 			err = recordDiscoveredSeq(pubkey, bundle.Seq)
 		}
@@ -182,6 +190,8 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 		OK:         true,
 		Seq:        bundle.Seq,
 		ConfigJSON: mergedJSON,
+
+		AWGMergeSkipped: mergeSkipped,
 	}
 	if reality != nil {
 		result.Reality = reality
@@ -313,6 +323,31 @@ func validateDiscoveredBundle(bundle discoveredBundle, maxSeenSeq int64, now tim
 		return errors.New("rendezvous bundle expired")
 	}
 	return nil
+}
+
+// mergeDiscoveredAWGConfigFor merges the rendezvous base-AWG endpoint unless
+// the stored config targets a non-base profile or an IPv6 endpoint; then the
+// base config is only validated and returned unchanged (skipped=true).
+func mergeDiscoveredAWGConfigFor(baseJSON string, meta provisionedConfigMeta, awg discoveredAWGEndpoint) (string, bool, error) {
+	if meta.acceptsDiscoveryMerge() {
+		merged, err := mergeDiscoveredAWGConfig(baseJSON, awg)
+		return merged, false, err
+	}
+	if _, err := parseConfig(baseJSON); err != nil {
+		return "", false, fmt.Errorf("base config: %w", err)
+	}
+	return baseJSON, true, nil
+}
+
+// configEndpointIsIPv6 reports whether a stored config's endpoint is an IPv6
+// literal; parse errors are left to the merge's own validation.
+func configEndpointIsIPv6(configJSON string) bool {
+	var cfg config
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		return false
+	}
+	ap, err := netip.ParseAddrPort(strings.TrimSpace(cfg.Endpoint))
+	return err == nil && ap.Addr().Is6() && !ap.Addr().Is4In6()
 }
 
 func mergeDiscoveredAWGConfig(baseJSON string, awg discoveredAWGEndpoint) (string, error) {

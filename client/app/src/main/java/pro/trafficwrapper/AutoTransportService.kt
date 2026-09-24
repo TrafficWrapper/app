@@ -98,15 +98,24 @@ internal fun <T> selectRouteWithFallbackPolicy(
 ): T =
     if (mode == TransportChoice.AUTO) fallback() else preferred
 
-internal fun shouldRestartReality2ForUuid(
-    appliedUuid: String,
-    desiredUuid: String,
+/**
+ * A running REALITY sidecar is restarted when the config it was started with differs from the
+ * desired one: a new UUID (re-enrollment), a new flow (Vision negotiated at enrollment) or another
+ * variant of the slot (profile/network/address family). Nothing is restarted while the applied
+ * config is unknown or the sidecar is not alive (the regular start path handles that).
+ */
+internal fun shouldRestartRealityForConfig(
+    applied: RealityUiConfig?,
+    desired: RealityUiConfig?,
     sidecarAlive: Boolean,
-): Boolean =
-    sidecarAlive &&
-        appliedUuid.isNotBlank() &&
-        desiredUuid.isNotBlank() &&
-        !appliedUuid.trim().equals(desiredUuid.trim(), ignoreCase = true)
+): Boolean {
+    if (!sidecarAlive || applied == null || desired == null) return false
+    if (applied.uuid.isBlank() || !desired.isComplete()) return false
+    return applied.normalizedForRestart() != desired.normalizedForRestart()
+}
+
+private fun RealityUiConfig.normalizedForRestart(): RealityUiConfig =
+    copy(uuid = uuid.trim().lowercase(), flow = flow.trim(), address = address.trim())
 
 internal fun realityUuid8(uuid: String): String {
     val hex = buildString {
@@ -594,6 +603,22 @@ class AutoTransportService : Service() {
     @Volatile
     private var appliedReality2Uuid: String = ""
 
+    /** Config each REALITY sidecar was last started with (see shouldRestartRealityForConfig). */
+    private val appliedXrayConfigs = java.util.concurrent.ConcurrentHashMap<Route, RealityUiConfig>()
+
+    /** Variant cursors of the public-platform slots (worker thread only). */
+    private val realityVariantSlots = EnumMap<Route, VariantSlot<RealityRouteVariant>>(Route::class.java).apply {
+        put(Route.REALITY, VariantSlot { it.key })
+        put(Route.REALITY2, VariantSlot { it.key })
+    }
+    private val awgVariantSlots = EnumMap<Route, VariantSlot<AwgRouteVariant>>(Route::class.java).apply {
+        put(Route.AWG_RU, VariantSlot { it.key })
+        put(Route.AWG, VariantSlot { it.key })
+    }
+
+    @Volatile
+    private var networkIpFamilies: NetworkIpFamilies = NetworkIpFamilies.DEFAULT
+
     @Volatile
     private var router: SocksRouter? = null
 
@@ -1065,6 +1090,9 @@ class AutoTransportService : Service() {
                     val pendingBytes = tcpPendingBytes(route, currentTx)
                     val pendingAgeMs = tcpPendingAgeMs(route, atMs)
                     recordTcpRouteHealthLost(route, atMs)
+                    // The next iteration restarts the (now inactive) sidecar on the next variant
+                    // if the cursor moves.
+                    onRealityVariantProbe(route, healthy = false, atMs = atMs, reason = "rx_stall")
                     val backoffMs = demoteRoute(route, atMs, "rx_stall_watchdog")
                     markTcpRouteForcedUnhealthy(route, atMs, backoffMs)
                     clearTcpPending(route, currentTx)
@@ -1098,13 +1126,18 @@ class AutoTransportService : Service() {
                 val oldGeneration = routeGeneration(route)
                 val closedSessions = router?.closeSessionsForRouteGeneration(upstreamPort, oldGeneration) ?: 0
                 Log.w(LOG_TAG, "restarting inactive ${routeLabel(route)} sidecar after rx stall gen=$oldGeneration closed=$closedSessions")
-                val result = startXraySidecar(cfg, route, forceRestart = true)
+                // A stall counts as a failed probe of the current variant; when the cursor moves,
+                // the restart already uses the next variant.
+                val restartCfg = onRealityVariantProbe(route, healthy = false, atMs = atMs, reason = "rx_stall")
+                    ?.takeIf { it.isComplete() }
+                    ?: cfg
+                val result = startXraySidecar(restartCfg, route, forceRestart = true)
                 when (route) {
                     Route.REALITY -> xrayStarted = result.started
                     Route.REALITY2 -> {
                         xray2Started = result.started
                         if (result.started) {
-                            setAppliedReality2Uuid(cfg.uuid)
+                            setAppliedReality2Uuid(restartCfg.uuid)
                         } else {
                             setAppliedReality2Uuid("")
                         }
@@ -1156,8 +1189,12 @@ class AutoTransportService : Service() {
                         "err_kind" to "config",
                     )
                 }
-                var realityConfig = TransportRuntime.auth.reality
-                var reality2Config = TransportRuntime.auth.reality2
+                refreshNetworkIpFamilies()
+                var realityConfig = resolveRealityVariantConfig(Route.REALITY, TransportRuntime.auth.reality)
+                var reality2Config = resolveRealityVariantConfig(Route.REALITY2, TransportRuntime.auth.reality2)
+                // IPv6-only network: AWG slots with an IPv6 endpoint start on it.
+                syncAwgVariant(Route.AWG_RU, advance = false, reason = "start")
+                syncAwgVariant(Route.AWG, advance = false, reason = "start")
                 if (reality2Config?.isComplete() == true) {
                     val xrayStart = startXraySidecar(reality2Config, Route.REALITY2)
                     xray2Started = xrayStart.started
@@ -1320,10 +1357,10 @@ class AutoTransportService : Service() {
                     }
                     val latestAuth = TransportRuntime.auth
                     if (latestAuth.reality?.isComplete() == true) {
-                        realityConfig = latestAuth.reality
+                        realityConfig = resolveRealityVariantConfig(Route.REALITY, latestAuth.reality)
                     }
                     if (latestAuth.reality2?.isComplete() == true) {
-                        reality2Config = latestAuth.reality2
+                        reality2Config = resolveRealityVariantConfig(Route.REALITY2, latestAuth.reality2)
                     }
                     if (xray2Process?.isAlive != true && appliedReality2Uuid.isNotBlank()) {
                         setAppliedReality2Uuid("")
@@ -1369,6 +1406,23 @@ class AutoTransportService : Service() {
                             nextAwgRuStartAtMs = 0L
                             nextAwgStartAtMs = 0L
                             reconnectBackoffMs = RECONNECT_MIN_BACKOFF_MS
+                            // A new network may have (or lack) IPv6: start every slot again from
+                            // its last good variant.
+                            resetVariantCursorsForNetwork()
+                            if (latestAuth.reality?.isComplete() == true) {
+                                realityConfig = resolveRealityVariantConfig(Route.REALITY, latestAuth.reality)
+                            }
+                            if (latestAuth.reality2?.isComplete() == true) {
+                                reality2Config = resolveRealityVariantConfig(Route.REALITY2, latestAuth.reality2)
+                            }
+                            if (syncAwgVariant(Route.AWG_RU, advance = false, reason = "network_changed") && awgRuStarted) {
+                                runCatching { Transport.stopAWGRU() }
+                                awgRuStarted = false
+                            }
+                            if (syncAwgVariant(Route.AWG, advance = false, reason = "network_changed") && awgStarted) {
+                                runCatching { Transport.stop() }
+                                awgStarted = false
+                            }
                         }
                         telemetryEvent("network_event",
                             "rsn" to pendingNetworkEvent.logText,
@@ -1379,40 +1433,67 @@ class AutoTransportService : Service() {
                     val previousAwgHandshakeEstablished = lastAwgHandshakeEstablished
                     val mode = requestedMode
                     val requestId = routeSwitchRequestId.get()
-                    if (
-                        reality2Config?.isComplete() == true &&
-                        shouldRestartReality2ForUuid(
-                            appliedUuid = appliedReality2Uuid,
-                            desiredUuid = reality2Config.uuid,
-                            sidecarAlive = xray2Process?.isAlive == true,
-                        )
-                    ) {
-                        val oldUid8 = realityUuid8(appliedReality2Uuid)
-                        val newUid8 = realityUuid8(reality2Config.uuid)
-                        Log.i(LOG_TAG, "REALITY2 uuid changed $oldUid8 -> $newUid8, restarting sidecar")
+                    for (sidecarRoute in listOf(Route.REALITY2, Route.REALITY)) {
+                        val desiredConfig = routeConfig(sidecarRoute, realityConfig, reality2Config) ?: continue
+                        val appliedConfig = appliedXrayConfigs[sidecarRoute]
+                        if (
+                            !desiredConfig.isComplete() ||
+                            !shouldRestartRealityForConfig(
+                                applied = appliedConfig,
+                                desired = desiredConfig,
+                                sidecarAlive = xrayProcess(sidecarRoute)?.isAlive == true,
+                            )
+                        ) {
+                            continue
+                        }
+                        val uuidChanged = appliedConfig != null &&
+                            !appliedConfig.uuid.trim().equals(desiredConfig.uuid.trim(), ignoreCase = true)
+                        val restartReason = if (uuidChanged) "uuid_changed" else "config_changed"
+                        val oldUid8 = realityUuid8(appliedConfig?.uuid.orEmpty())
+                        val newUid8 = realityUuid8(desiredConfig.uuid)
+                        Log.i(LOG_TAG, "${routeLabel(sidecarRoute)} $restartReason uid $oldUid8 -> $newUid8, restarting sidecar")
                         val xrayStart = startXraySidecar(
-                            cfg = reality2Config,
-                            route = Route.REALITY2,
+                            cfg = desiredConfig,
+                            route = sidecarRoute,
                             forceRestart = true,
                         )
-                        xray2Started = xrayStart.started
-                        if (xrayStart.started) {
-                            setAppliedReality2Uuid(reality2Config.uuid)
-                            nextReality2RestartAtMs = 0L
-                        } else {
-                            setAppliedReality2Uuid("")
-                            nextReality2RestartAtMs = nowMs + reconnectBackoffMs
-                        }
-                        telemetryEvent("xray_start_result",
-                            "rsn" to "uuid_changed",
-                            "route" to routeLabel(Route.REALITY2),
-                            "rl2_started" to xrayStart.started,
-                            "rl2_alive" to xrayStart.started,
-                            "rl2_uid8" to realityUuid8(appliedReality2Uuid),
-                            "err_where" to "xray2_uuid_restart",
-                            "err_kind" to xrayStart.errorKind,
-                            "err_msg" to xrayStart.error,
+                        val variantLabel = routeVariantTelemetryLabel(
+                            realityVariantSlots[sidecarRoute]?.cursor?.currentKey.orEmpty(),
                         )
+                        if (sidecarRoute == Route.REALITY2) {
+                            xray2Started = xrayStart.started
+                            if (xrayStart.started) {
+                                setAppliedReality2Uuid(desiredConfig.uuid)
+                                nextReality2RestartAtMs = 0L
+                            } else {
+                                setAppliedReality2Uuid("")
+                                nextReality2RestartAtMs = nowMs + reconnectBackoffMs
+                            }
+                            telemetryEvent("xray_start_result",
+                                "rsn" to restartReason,
+                                "route" to routeLabel(Route.REALITY2),
+                                "rl2_started" to xrayStart.started,
+                                "rl2_alive" to xrayStart.started,
+                                "rl2_uid8" to realityUuid8(appliedReality2Uuid),
+                                "rl_var" to variantLabel,
+                                "err_where" to "xray2_uuid_restart",
+                                "err_kind" to xrayStart.errorKind,
+                                "err_msg" to xrayStart.error,
+                            )
+                        } else {
+                            xrayStarted = xrayStart.started
+                            nextRealityRestartAtMs = if (xrayStart.started) 0L else nowMs + reconnectBackoffMs
+                            telemetryEvent("xray_start_result",
+                                "rsn" to restartReason,
+                                "route" to routeLabel(Route.REALITY),
+                                "rl_started" to xrayStart.started,
+                                "rl_alive" to xrayStart.started,
+                                "rl_var" to variantLabel,
+                                "err_where" to "xray_config_restart",
+                                "err_kind" to xrayStart.errorKind,
+                                "err_msg" to xrayStart.error,
+                            )
+                        }
                     }
                     if (
                         !awgRuStarted &&
@@ -1495,6 +1576,9 @@ class AutoTransportService : Service() {
                     ) {
                         val xrayStart = startXraySidecar(realityConfig, Route.REALITY)
                         xrayStarted = xrayStart.started
+                        if (!xrayStart.started) {
+                            onRealityVariantProbe(Route.REALITY, healthy = false, atMs = nowMs, reason = "start_failed")
+                        }
                         telemetryEvent("xray_start_result",
                             "rsn" to "restart",
                             "route" to routeLabel(Route.REALITY),
@@ -1517,6 +1601,7 @@ class AutoTransportService : Service() {
                             setAppliedReality2Uuid(reality2Config.uuid)
                         } else {
                             setAppliedReality2Uuid("")
+                            onRealityVariantProbe(Route.REALITY2, healthy = false, atMs = nowMs, reason = "start_failed")
                         }
                         telemetryEvent("xray_start_result",
                             "rsn" to "restart",
@@ -1767,6 +1852,15 @@ class AutoTransportService : Service() {
                             atMs = nowMs,
                         )
                         lastRealityProbeAtMs = nowMs
+                        // A moved cursor changes the desired config; the next iteration restarts
+                        // the sidecar through shouldRestartRealityForConfig.
+                        onRealityVariantProbe(
+                            route = Route.REALITY,
+                            healthy = cachedRealityProbe.healthy &&
+                                routeReadyForTraffic(Route.REALITY, XRAY_READY_PROBE_MAX_AGE_MS, nowMs),
+                            atMs = nowMs,
+                            reason = "probe_failed",
+                        )
                     }
                     val realityProbe = if (xrayStarted) cachedRealityProbe else RealityProbeResult(false)
                     val realityRxStalled = tcpRxStalled(Route.REALITY, currentRealityTx, nowMs)
@@ -1784,6 +1878,13 @@ class AutoTransportService : Service() {
                             atMs = nowMs,
                         )
                         lastReality2ProbeAtMs = nowMs
+                        onRealityVariantProbe(
+                            route = Route.REALITY2,
+                            healthy = cachedReality2Probe.healthy &&
+                                routeReadyForTraffic(Route.REALITY2, XRAY_READY_PROBE_MAX_AGE_MS, nowMs),
+                            atMs = nowMs,
+                            reason = "probe_failed",
+                        )
                     }
                     val reality2Probe = if (xray2Started) cachedReality2Probe else RealityProbeResult(false)
                     val reality2RxStalled = tcpRxStalled(Route.REALITY2, currentReality2Tx, nowMs)
@@ -1847,6 +1948,14 @@ class AutoTransportService : Service() {
                     ) {
                         val demotion = demoteAwg(Route.AWG_RU, nowMs)
                         nextAwgRuStartAtMs = maxOf(nextAwgRuStartAtMs, nowMs + AWG_UDP_DEAD_BACKOFF_MS)
+                        // Another address family of the endpoint (IPv6 <-> IPv4) is tried at once.
+                        if (syncAwgVariant(Route.AWG_RU, advance = true, reason = "awg_demote")) {
+                            runCatching { Transport.stopAWGRU() }
+                            awgRuStarted = false
+                            awgRuHandshakeFailures = 0
+                            awgRuRekeyRequested.set(false)
+                            nextAwgRuStartAtMs = nowMs
+                        }
                         Log.w(LOG_TAG, "AWG-RU handshake unhealthy for $awgRuHandshakeFailures probes, keeping existing keys")
                         telemetryEvent("awg_probe_fail",
                             "rsn" to "awgru_probe_threshold",
@@ -1872,6 +1981,13 @@ class AutoTransportService : Service() {
                     ) {
                         val demotion = demoteAwg(Route.AWG, nowMs)
                         nextAwgStartAtMs = maxOf(nextAwgStartAtMs, nowMs + AWG_UDP_DEAD_BACKOFF_MS)
+                        if (syncAwgVariant(Route.AWG, advance = true, reason = "awg_demote")) {
+                            runCatching { Transport.stop() }
+                            awgStarted = false
+                            awgHandshakeFailures = 0
+                            awgRekeyRequested.set(false)
+                            nextAwgStartAtMs = nowMs
+                        }
                         Log.w(LOG_TAG, "AWG handshake unhealthy for $awgHandshakeFailures probes, keeping existing keys")
                         telemetryEvent("awg_probe_fail",
                             "rsn" to "awg_probe_threshold",
@@ -1927,6 +2043,7 @@ class AutoTransportService : Service() {
                                         awgRuRetryFailures = 0
                                         awgRuUdpDeadFailures = 0
                                         awgRuRekeyRequested.set(false)
+                                        rememberAwgVariantCarrying(Route.AWG_RU)
                                         awgRuProbe = awgRuProbe.copy(
                                             carrying = awgCarrying(
                                                 handshakeEstablished = awgRuProbe.handshakeEstablished,
@@ -1946,6 +2063,7 @@ class AutoTransportService : Service() {
                                         awgRetryFailures = 0
                                         awgUdpDeadFailures = 0
                                         awgRekeyRequested.set(false)
+                                        rememberAwgVariantCarrying(Route.AWG)
                                         awgProbe = awgProbe.copy(
                                             carrying = awgCarrying(
                                                 handshakeEstablished = awgProbe.handshakeEstablished,
@@ -2669,6 +2787,7 @@ class AutoTransportService : Service() {
                             "rl2_carry" to reality2Healthy,
                             "rl2_rx" to currentReality2Rx,
                             "rl2_tx" to currentReality2Tx,
+                            "rl_var" to activeVariantTelemetryLabel(activeRoute),
                             "route_cd_s" to routeCooldownDelaySeconds(activeRoute, nowMs),
                         )
                         nextTelemetryHeartbeatAtMs = nowMs + telemetryHeartbeatDelay(stable)
@@ -2684,8 +2803,8 @@ class AutoTransportService : Service() {
                                 "seq" to pollResult.seq,
                                 "route" to routeLabel(activeRoute),
                             )
-                            realityConfig = TransportRuntime.auth.reality
-                            reality2Config = TransportRuntime.auth.reality2
+                            realityConfig = resolveRealityVariantConfig(Route.REALITY, TransportRuntime.auth.reality)
+                            reality2Config = resolveRealityVariantConfig(Route.REALITY2, TransportRuntime.auth.reality2)
                         } else if (pollResult.error.isNotBlank()) {
                             Log.w(LOG_TAG, "public config poll failed: ${pollResult.error}")
                         }
@@ -2784,6 +2903,7 @@ class AutoTransportService : Service() {
                 takeXrayProcess(Route.REALITY)?.destroy()
                 takeXrayProcess(Route.REALITY2)?.destroy()
                 setAppliedReality2Uuid("")
+                appliedXrayConfigs.clear()
                 // Global native state is torn down only while this worker still owns it: a worker
                 // of a newer service instance may already have started its own cores.
                 synchronized(nativeLock) {
@@ -3213,29 +3333,17 @@ class AutoTransportService : Service() {
         stored: StoredPublicPlatformState,
         config: PublicClientConfig,
     ) {
-        val credentials = PublicPlatformCredentials(
-            deviceID = stored.deviceID,
-            realityUUID = stored.realityUUID,
-            internalIP = stored.internalIP,
-            psk2 = stored.psk2,
-            serverAWGPublic = stored.serverAWGPublic,
-            awgPrivateKey = stored.awgPrivateKey,
-            awgPublicKey = stored.awgPublicKey,
-        )
+        val credentials = stored.toPublicPlatformCredentials()
         val slots = PublicPlatformConfigParser.routeSlots(config, stored.deviceID, credentials)
         if (!slots.hasUsableRoute()) error("public client config has no usable route")
 
-        val applyRequest = JSONObject()
-            .put("awg_private_key", stored.awgPrivateKey)
-            .put("internal_ip", stored.internalIP)
-            .put("psk2", stored.psk2)
-            .put("server_awg_public", stored.serverAWGPublic)
-            .put("socks_listen", AWG_UPSTREAM.host + ":" + AWG_UPSTREAM.port)
-            .put("awg_ru_socks_listen", AWG_RU_UPSTREAM.host + ":" + AWG_RU_UPSTREAM.port)
-            .put("mtu", 1420)
-            .put("dns_servers", JSONArray(config.dnsServers))
-        slots.awgRu?.let { applyRequest.put("awg_ru", PublicPlatformConfigParser.awgRouteJson(it)) }
-        slots.awg?.let { applyRequest.put("awg", PublicPlatformConfigParser.awgRouteJson(it)) }
+        val applyRequest = publicCoreApplyRequest(
+            stored = stored,
+            config = config,
+            slots = slots,
+            socksListen = AWG_UPSTREAM.host + ":" + AWG_UPSTREAM.port,
+            awgRuSocksListen = AWG_RU_UPSTREAM.host + ":" + AWG_RU_UPSTREAM.port,
+        )
         val applyResponse = JSONObject(Transport.applyPublicPlatformConfig(applyRequest.toString()))
         if (!applyResponse.optBoolean(JSON_OK, false)) {
             error(applyResponse.optString(JSON_ERROR))
@@ -3409,6 +3517,200 @@ class AutoTransportService : Service() {
             Route.AWG_RU, Route.AWG -> null
         }
 
+    private fun variantSlotName(route: Route): String = routeLabel(route)
+
+    /** Address families of the current default network (global IPv6 address + IPv6 default route). */
+    private fun refreshNetworkIpFamilies(): NetworkIpFamilies {
+        val families = runCatching {
+            val connectivity = getSystemService(ConnectivityManager::class.java)
+            val network = defaultNetwork.get() ?: connectivity.activeNetwork
+            val props = network?.let { connectivity.getLinkProperties(it) }
+            if (props == null) {
+                NetworkIpFamilies.DEFAULT
+            } else {
+                networkIpFamiliesOf(
+                    linkAddresses = props.linkAddresses.map { it.address },
+                    defaultRouteFamilies = props.routes
+                        .filter { it.isDefaultRoute }
+                        .mapNotNull { route ->
+                            when (route.destination?.address) {
+                                is java.net.Inet6Address -> IpFamily.V6
+                                is java.net.Inet4Address -> IpFamily.V4
+                                else -> null
+                            }
+                        }
+                        .toSet(),
+                )
+            }
+        }.getOrDefault(NetworkIpFamilies.DEFAULT)
+        networkIpFamilies = families
+        return families
+    }
+
+    private fun realityVariantsFor(route: Route): List<RealityRouteVariant> {
+        val slots = TransportRuntime.publicPlatformRouteSlots
+        val variants = when (route) {
+            Route.REALITY -> slots.realityVariants
+            Route.REALITY2 -> slots.reality2Variants
+            else -> emptyList()
+        }
+        return RouteVariants.orderForNetwork(variants, RealityRouteVariant::family, networkIpFamilies)
+    }
+
+    private fun awgVariantsFor(route: Route): List<AwgRouteVariant> {
+        val slots = TransportRuntime.publicPlatformRouteSlots
+        val variants = when (route) {
+            Route.AWG_RU -> slots.awgRuVariants
+            Route.AWG -> slots.awgVariants
+            else -> emptyList()
+        }
+        return RouteVariants.orderForNetwork(variants, AwgRouteVariant::family, networkIpFamilies)
+    }
+
+    /**
+     * The config a REALITY slot should run: [base] (the slot's primary config) unless the slot has
+     * several variants, in which case the cursor's current variant. A single variant, or a base
+     * that is not the public slot's primary config, keeps the pre-variant behaviour.
+     */
+    private fun resolveRealityVariantConfig(route: Route, base: RealityUiConfig?): RealityUiConfig? {
+        val slot = realityVariantSlots[route] ?: return base
+        val variants = realityVariantsFor(route)
+        val primary = when (route) {
+            Route.REALITY -> TransportRuntime.publicPlatformRouteSlots.reality
+            Route.REALITY2 -> TransportRuntime.publicPlatformRouteSlots.reality2
+            else -> null
+        }
+        if (base == null || variants.size <= 1 || primary != base) {
+            slot.reset(emptyList(), null)
+            return base
+        }
+        val cursor = slot.sync(variants, TransportLifecycleStore.lastGoodVariant(applicationContext, variantSlotName(route)))
+        return cursor?.current?.config ?: base
+    }
+
+    /**
+     * Feeds a probe result of a REALITY slot to its variant cursor. Returns the new config when
+     * the cursor moved to another variant (the caller restarts the sidecar), else null.
+     */
+    private fun onRealityVariantProbe(route: Route, healthy: Boolean, atMs: Long, reason: String): RealityUiConfig? {
+        val cursor = realityVariantSlots[route]?.cursor ?: return null
+        if (cursor.size <= 1) return null
+        val previousKey = cursor.currentKey
+        val moved = cursor.onProbe(healthy, atMs)
+        if (healthy) {
+            val slotName = variantSlotName(route)
+            if (TransportLifecycleStore.lastGoodVariant(applicationContext, slotName) != cursor.currentKey) {
+                TransportLifecycleStore.rememberLastGoodVariant(applicationContext, slotName, cursor.currentKey)
+            }
+            return null
+        }
+        if (!moved) return null
+        Log.i(LOG_TAG, "route_variant route=${routeLabel(route)} ${previousKey} -> ${cursor.currentKey} rsn=$reason")
+        telemetryEvent(
+            "route_variant",
+            "rsn" to reason,
+            "route" to routeLabel(route),
+            "rl_var" to routeVariantTelemetryLabel(cursor.currentKey),
+        )
+        return cursor.current?.config
+    }
+
+    /** Network change: every slot starts again from its remembered (last good) variant. */
+    private fun resetVariantCursorsForNetwork() {
+        refreshNetworkIpFamilies()
+        realityVariantSlots.forEach { (route, slot) ->
+            slot.reset(realityVariantsFor(route), TransportLifecycleStore.lastGoodVariant(applicationContext, variantSlotName(route)))
+        }
+        awgVariantSlots.forEach { (route, slot) ->
+            slot.reset(awgVariantsFor(route), TransportLifecycleStore.lastGoodVariant(applicationContext, variantSlotName(route)))
+        }
+    }
+
+    /** Variant label of [route] for telemetry; blank when the slot has a single variant. */
+    private fun activeVariantTelemetryLabel(route: Route): String {
+        val key = when (route) {
+            Route.REALITY, Route.REALITY2 -> realityVariantSlots[route]?.cursor?.takeIf { it.size > 1 }?.currentKey
+            Route.AWG_RU, Route.AWG -> awgVariantSlots[route]?.cursor?.takeIf { it.size > 1 }?.currentKey
+        }
+        return key?.let(::routeVariantTelemetryLabel).orEmpty()
+    }
+
+    private fun currentAwgFamily(route: Route): String =
+        when (route) {
+            Route.AWG_RU -> PublicAwgFamilyState.awgRu
+            Route.AWG -> PublicAwgFamilyState.awg
+            else -> ""
+        }
+
+    private fun setCurrentAwgFamily(route: Route, family: String) {
+        when (route) {
+            Route.AWG_RU -> PublicAwgFamilyState.awgRu = family
+            Route.AWG -> PublicAwgFamilyState.awg = family
+            else -> Unit
+        }
+    }
+
+    /**
+     * Brings the core's AWG address family of [route] in line with its variant cursor, optionally
+     * advancing the cursor first (AWG demotion). Re-applies the public config to the core when the
+     * family changes; returns true when it changed (the caller restarts the AWG instance).
+     */
+    private fun syncAwgVariant(route: Route, advance: Boolean, reason: String): Boolean {
+        if (!DeploymentConfig.IS_PUBLIC_PLATFORM) return false
+        val slot = awgVariantSlots[route] ?: return false
+        val variants = awgVariantsFor(route)
+        val cursor = slot.sync(variants, TransportLifecycleStore.lastGoodVariant(applicationContext, variantSlotName(route)))
+        if (cursor == null || cursor.size <= 1) {
+            // No IPv6 alternative: never send ip_family, exactly as before.
+            if (currentAwgFamily(route).isEmpty()) return false
+            setCurrentAwgFamily(route, "")
+            return reapplyPublicCoreConfig(route, reason)
+        }
+        if (advance) cursor.advance()
+        val desired = cursor.current?.family?.wire.orEmpty()
+        if (desired == currentAwgFamily(route) || (desired == IpFamily.V4.wire && currentAwgFamily(route).isEmpty())) {
+            return false
+        }
+        setCurrentAwgFamily(route, desired)
+        telemetryEvent(
+            "route_variant",
+            "rsn" to reason,
+            "route" to routeLabel(route),
+            "rl_var" to routeVariantTelemetryLabel(cursor.currentKey),
+        )
+        return reapplyPublicCoreConfig(route, reason)
+    }
+
+    private fun rememberAwgVariantCarrying(route: Route) {
+        val cursor = awgVariantSlots[route]?.cursor ?: return
+        if (cursor.size <= 1) return
+        val slotName = variantSlotName(route)
+        if (TransportLifecycleStore.lastGoodVariant(applicationContext, slotName) != cursor.currentKey) {
+            TransportLifecycleStore.rememberLastGoodVariant(applicationContext, slotName, cursor.currentKey)
+        }
+    }
+
+    private fun reapplyPublicCoreConfig(route: Route, reason: String): Boolean {
+        val config = TransportRuntime.publicPlatformConfig ?: return false
+        return runCatching {
+            val stored = SecureIdentityStore(applicationContext).readPublicPlatformState()
+            val request = publicCoreApplyRequest(
+                stored = stored,
+                config = config,
+                slots = TransportRuntime.publicPlatformRouteSlots,
+                socksListen = AWG_UPSTREAM.host + ":" + AWG_UPSTREAM.port,
+                awgRuSocksListen = AWG_RU_UPSTREAM.host + ":" + AWG_RU_UPSTREAM.port,
+            )
+            val response = JSONObject(Transport.applyPublicPlatformConfig(request.toString()))
+            if (!response.optBoolean(JSON_OK, false)) error(response.optString(JSON_ERROR))
+            Log.i(LOG_TAG, "route_variant route=${routeLabel(route)} family=${currentAwgFamily(route)} rsn=$reason applied")
+            true
+        }.getOrElse { error ->
+            Log.w(LOG_TAG, "route_variant apply failed route=${routeLabel(route)}", error)
+            false
+        }
+    }
+
     private fun startXraySidecar(
         cfg: RealityUiConfig,
         route: Route,
@@ -3447,6 +3749,7 @@ class AutoTransportService : Service() {
             drainProcessOutput(route, generation, process)
             if (process.isAlive) {
                 markRouteProcessStarted(route, generation, started = true)
+                appliedXrayConfigs[route] = cfg
                 XrayStartResult(started = true)
             } else {
                 markRouteProcessStarted(route, generation, started = false, failure = "xray_process_exited")
@@ -3519,6 +3822,7 @@ class AutoTransportService : Service() {
             }
         }
         setXrayProcess(route, null)
+        appliedXrayConfigs.remove(route)
         routeRuntime(route).apply {
             processState = RouteProcessState.STOPPED
             listenerReadyAtMs = 0L

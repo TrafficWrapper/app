@@ -118,30 +118,17 @@ class DiscoveryRepository(private val context: Context) {
         config: PublicClientConfig,
         rendezvousPublicKey: String,
     ) {
-        val credentials = PublicPlatformCredentials(
-            deviceID = stored.deviceID,
-            realityUUID = stored.realityUUID,
-            internalIP = stored.internalIP,
-            psk2 = stored.psk2,
-            serverAWGPublic = stored.serverAWGPublic,
-            awgPrivateKey = stored.awgPrivateKey,
-            awgPublicKey = stored.awgPublicKey,
-        )
+        val credentials = stored.toPublicPlatformCredentials()
         val slots = PublicPlatformConfigParser.routeSlots(config, stored.deviceID, credentials)
-        val applyRequest = JSONObject()
-            .put("awg_private_key", stored.awgPrivateKey)
-            .put("internal_ip", stored.internalIP)
-            .put("psk2", stored.psk2)
-            .put("server_awg_public", stored.serverAWGPublic)
-            .put("socks_listen", AWG_SOCKS_LISTEN)
-            .put("awg_ru_socks_listen", AWG_RU_SOCKS_LISTEN)
-            .put("mtu", DEFAULT_MTU)
-            .put("dns_servers", JSONArray(config.dnsServers))
-            // The core only verifies discovery bundles against a key pinned here from the
-            // verified client config, never against the key sent with the bundle request.
-            .put("rendezvous_public_key", rendezvousPublicKey)
-        slots.awgRu?.let { applyRequest.put("awg_ru", PublicPlatformConfigParser.awgRouteJson(it)) }
-        slots.awg?.let { applyRequest.put("awg", PublicPlatformConfigParser.awgRouteJson(it)) }
+        val applyRequest = publicCoreApplyRequest(
+            stored = stored,
+            config = config,
+            slots = slots,
+            socksListen = AWG_SOCKS_LISTEN,
+            awgRuSocksListen = AWG_RU_SOCKS_LISTEN,
+            mtu = DEFAULT_MTU,
+            rendezvousPublicKey = rendezvousPublicKey,
+        )
         val response = JSONObject(Transport.applyPublicPlatformConfig(applyRequest.toString()))
         if (!response.optBoolean("ok", false)) {
             throw IllegalStateException(response.optString("error", "public core config restore failed"))

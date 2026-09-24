@@ -69,7 +69,87 @@ data class StoredPublicPlatformState(
     val awgPrivateKey: String = "",
     val awgPublicKey: String = "",
     val limitsJson: String = "",
+    /** Enroll-response awg_profiles (name -> {awg_public_key, internal_ip, psk2}) as JSON. */
+    val awgProfilesJson: String = "",
+    /** Enroll-response reality_flow; meaningful only when [realityFlowKnown]. */
+    val realityFlow: String = "",
+    /** True when the enroll response carried reality_flow (an empty flow is still known). */
+    val realityFlowKnown: Boolean = false,
+    /** BuildConfig.VERSION_CODE of the app that performed the last enrollment (0 = unknown). */
+    val enrollVersionCode: Long = 0,
 )
+
+internal fun publicPlatformStateToJson(state: StoredPublicPlatformState): JSONObject =
+    JSONObject()
+        .put(PPS_BOOTSTRAP_RAW, state.bootstrapRaw)
+        .put(PPS_CONFIG_PUBKEY_PIN, state.configPubkeyPin)
+        .put(PPS_UPDATE_PUBKEY_PIN, state.updatePubkeyPin)
+        .put(PPS_MAX_SEEN_CONFIG_SEQ, state.maxSeenConfigSeq)
+        .put(PPS_MAX_SEEN_UPDATE_SEQ, state.maxSeenUpdateSeq)
+        .put(PPS_TRUSTED_WALL_TIME_MS, state.trustedWallTimeMs)
+        .put(PPS_TRUSTED_ELAPSED_REALTIME_MS, state.trustedElapsedRealtimeMs)
+        .put(PPS_CLIENT_CONFIG_JSON, state.clientConfigJson)
+        .put(PPS_CLIENT_BUNDLE_JSON, state.clientBundleJson)
+        .put(PPS_DEVICE_ID, state.deviceID)
+        .put(PPS_REALITY_UUID, state.realityUUID)
+        .put(PPS_INTERNAL_IP, state.internalIP)
+        .put(PPS_PSK2, state.psk2)
+        .put(PPS_SERVER_AWG_PUBLIC, state.serverAWGPublic)
+        .put(PPS_AWG_PRIVATE_KEY, state.awgPrivateKey)
+        .put(PPS_AWG_PUBLIC_KEY, state.awgPublicKey)
+        .put(PPS_LIMITS_JSON, state.limitsJson)
+        .put(PPS_AWG_PROFILES_JSON, state.awgProfilesJson)
+        .put(PPS_REALITY_FLOW, state.realityFlow)
+        .put(PPS_REALITY_FLOW_KNOWN, state.realityFlowKnown)
+        .put(PPS_ENROLL_VERSION_CODE, state.enrollVersionCode)
+
+/** Reads a stored public platform state; fields missing in older JSON keep their defaults. */
+internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatformState =
+    StoredPublicPlatformState(
+        bootstrapRaw = root.optString(PPS_BOOTSTRAP_RAW),
+        configPubkeyPin = root.optString(PPS_CONFIG_PUBKEY_PIN),
+        updatePubkeyPin = root.optString(PPS_UPDATE_PUBKEY_PIN),
+        maxSeenConfigSeq = root.optLong(PPS_MAX_SEEN_CONFIG_SEQ, 0),
+        maxSeenUpdateSeq = root.optLong(PPS_MAX_SEEN_UPDATE_SEQ, 0),
+        trustedWallTimeMs = root.optLong(PPS_TRUSTED_WALL_TIME_MS, 0),
+        trustedElapsedRealtimeMs = root.optLong(PPS_TRUSTED_ELAPSED_REALTIME_MS, 0),
+        clientConfigJson = root.optString(PPS_CLIENT_CONFIG_JSON),
+        clientBundleJson = root.optString(PPS_CLIENT_BUNDLE_JSON),
+        deviceID = root.optString(PPS_DEVICE_ID),
+        realityUUID = root.optString(PPS_REALITY_UUID),
+        internalIP = root.optString(PPS_INTERNAL_IP),
+        psk2 = root.optString(PPS_PSK2),
+        serverAWGPublic = root.optString(PPS_SERVER_AWG_PUBLIC),
+        awgPrivateKey = root.optString(PPS_AWG_PRIVATE_KEY),
+        awgPublicKey = root.optString(PPS_AWG_PUBLIC_KEY),
+        limitsJson = root.optString(PPS_LIMITS_JSON),
+        awgProfilesJson = root.optString(PPS_AWG_PROFILES_JSON),
+        realityFlow = root.optString(PPS_REALITY_FLOW),
+        realityFlowKnown = root.optBoolean(PPS_REALITY_FLOW_KNOWN, false),
+        enrollVersionCode = root.optLong(PPS_ENROLL_VERSION_CODE, 0),
+    )
+
+private const val PPS_BOOTSTRAP_RAW = "bootstrap_raw"
+private const val PPS_CONFIG_PUBKEY_PIN = "config_pubkey_pin"
+private const val PPS_UPDATE_PUBKEY_PIN = "update_pubkey_pin"
+private const val PPS_MAX_SEEN_CONFIG_SEQ = "max_seen_config_seq"
+private const val PPS_MAX_SEEN_UPDATE_SEQ = "max_seen_update_seq"
+private const val PPS_TRUSTED_WALL_TIME_MS = "trusted_wall_time_ms"
+private const val PPS_TRUSTED_ELAPSED_REALTIME_MS = "trusted_elapsed_realtime_ms"
+private const val PPS_CLIENT_CONFIG_JSON = "client_config_json"
+private const val PPS_CLIENT_BUNDLE_JSON = "client_bundle_json"
+private const val PPS_DEVICE_ID = "device_id"
+private const val PPS_REALITY_UUID = "reality_uuid"
+private const val PPS_INTERNAL_IP = "internal_ip"
+private const val PPS_PSK2 = "psk2"
+private const val PPS_SERVER_AWG_PUBLIC = "server_awg_public"
+private const val PPS_AWG_PRIVATE_KEY = "awg_private_key"
+private const val PPS_AWG_PUBLIC_KEY = "awg_public_key"
+private const val PPS_LIMITS_JSON = "limits_json"
+private const val PPS_AWG_PROFILES_JSON = "awg_profiles_json"
+private const val PPS_REALITY_FLOW = "reality_flow"
+private const val PPS_REALITY_FLOW_KNOWN = "reality_flow_known"
+private const val PPS_ENROLL_VERSION_CODE = "enroll_version_code"
 
 data class StoredPublicAWGKeyPair(
     val privateKey: String,
@@ -397,46 +477,11 @@ class SecureIdentityStore(context: Context) {
         val sealed = prefs.getString(KEY_PUBLIC_PLATFORM_STATE, null) ?: return StoredPublicPlatformState()
         val opened = openOrNull(sealed, key, "public platform state") ?: return StoredPublicPlatformState()
         val root = runCatching { JSONObject(opened) }.getOrNull() ?: return StoredPublicPlatformState()
-        return StoredPublicPlatformState(
-            bootstrapRaw = root.optString(JSON_BOOTSTRAP_RAW),
-            configPubkeyPin = root.optString(JSON_CONFIG_PUBKEY_PIN),
-            updatePubkeyPin = root.optString(JSON_UPDATE_PUBKEY_PIN),
-            maxSeenConfigSeq = root.optLong(JSON_MAX_SEEN_CONFIG_SEQ, 0),
-            maxSeenUpdateSeq = root.optLong(JSON_MAX_SEEN_UPDATE_SEQ, 0),
-            trustedWallTimeMs = root.optLong(JSON_TRUSTED_WALL_TIME_MS, 0),
-            trustedElapsedRealtimeMs = root.optLong(JSON_TRUSTED_ELAPSED_REALTIME_MS, 0),
-            clientConfigJson = root.optString(JSON_CLIENT_CONFIG_JSON),
-            clientBundleJson = root.optString(JSON_CLIENT_BUNDLE_JSON),
-            deviceID = root.optString(JSON_DEVICE_ID),
-            realityUUID = root.optString(JSON_REALITY_UUID),
-            internalIP = root.optString(JSON_INTERNAL_IP),
-            psk2 = root.optString(JSON_PSK2),
-            serverAWGPublic = root.optString(JSON_SERVER_AWG_PUBLIC),
-            awgPrivateKey = root.optString(JSON_AWG_PRIVATE_KEY),
-            awgPublicKey = root.optString(JSON_AWG_PUBLIC_KEY),
-            limitsJson = root.optString(JSON_LIMITS_JSON),
-        )
+        return publicPlatformStateFromJson(root)
     }
 
     private fun writePublicPlatformStateLocked(key: SecretKey, state: StoredPublicPlatformState) {
-        val root = JSONObject()
-            .put(JSON_BOOTSTRAP_RAW, state.bootstrapRaw)
-            .put(JSON_CONFIG_PUBKEY_PIN, state.configPubkeyPin)
-            .put(JSON_UPDATE_PUBKEY_PIN, state.updatePubkeyPin)
-            .put(JSON_MAX_SEEN_CONFIG_SEQ, state.maxSeenConfigSeq)
-            .put(JSON_MAX_SEEN_UPDATE_SEQ, state.maxSeenUpdateSeq)
-            .put(JSON_TRUSTED_WALL_TIME_MS, state.trustedWallTimeMs)
-            .put(JSON_TRUSTED_ELAPSED_REALTIME_MS, state.trustedElapsedRealtimeMs)
-            .put(JSON_CLIENT_CONFIG_JSON, state.clientConfigJson)
-            .put(JSON_CLIENT_BUNDLE_JSON, state.clientBundleJson)
-            .put(JSON_DEVICE_ID, state.deviceID)
-            .put(JSON_REALITY_UUID, state.realityUUID)
-            .put(JSON_INTERNAL_IP, state.internalIP)
-            .put(JSON_PSK2, state.psk2)
-            .put(JSON_SERVER_AWG_PUBLIC, state.serverAWGPublic)
-            .put(JSON_AWG_PRIVATE_KEY, state.awgPrivateKey)
-            .put(JSON_AWG_PUBLIC_KEY, state.awgPublicKey)
-            .put(JSON_LIMITS_JSON, state.limitsJson)
+        val root = publicPlatformStateToJson(state)
         if (!prefs.edit().putString(KEY_PUBLIC_PLATFORM_STATE, seal(root.toString(), key)).commit()) {
             throw IllegalStateException("failed to persist public platform state")
         }
@@ -677,24 +722,11 @@ class SecureIdentityStore(context: Context) {
         private const val JSON_MAX_SEEN_VERSION_CODE = "max_seen_version_code"
         private const val JSON_MAX_MIN_SUPPORTED_VERSION = "max_min_supported_version"
         private const val JSON_MAX_SEEN_RENDEZVOUS_SEQ = "max_seen_rendezvous_seq"
-        private const val JSON_MAX_SEEN_CONFIG_SEQ = "max_seen_config_seq"
-        private const val JSON_MAX_SEEN_UPDATE_SEQ = "max_seen_update_seq"
         private const val JSON_DISCOVERY_SINKS = "discovery_sinks"
         private const val JSON_TRUSTED_WALL_TIME_MS = "trusted_wall_time_ms"
         private const val JSON_TRUSTED_ELAPSED_REALTIME_MS = "trusted_elapsed_realtime_ms"
         private const val JSON_LAST_VALID_ISSUED_AT_MS = "last_valid_issued_at_ms"
-        private const val JSON_BOOTSTRAP_RAW = "bootstrap_raw"
-        private const val JSON_CONFIG_PUBKEY_PIN = "config_pubkey_pin"
-        private const val JSON_UPDATE_PUBKEY_PIN = "update_pubkey_pin"
-        private const val JSON_CLIENT_CONFIG_JSON = "client_config_json"
-        private const val JSON_CLIENT_BUNDLE_JSON = "client_bundle_json"
-        private const val JSON_DEVICE_ID = "device_id"
-        private const val JSON_REALITY_UUID = "reality_uuid"
-        private const val JSON_INTERNAL_IP = "internal_ip"
-        private const val JSON_PSK2 = "psk2"
-        private const val JSON_SERVER_AWG_PUBLIC = "server_awg_public"
         private const val JSON_AWG_PRIVATE_KEY = "awg_private_key"
         private const val JSON_AWG_PUBLIC_KEY = "awg_public_key"
-        private const val JSON_LIMITS_JSON = "limits_json"
     }
 }

@@ -138,4 +138,58 @@ class SecureIdentityStoreTest {
         assertEquals(PublicAWGKeyPairSource.EXISTING, retry.source)
         assertTrue(!retry.newlyCreated)
     }
+
+    @Test
+    fun publicPlatformStateRoundTripsNewFields() {
+        val state = StoredPublicPlatformState(
+            bootstrapRaw = "{}",
+            configPubkeyPin = "pin",
+            updatePubkeyPin = "upd",
+            maxSeenConfigSeq = 7,
+            maxSeenUpdateSeq = 3,
+            trustedWallTimeMs = 11,
+            trustedElapsedRealtimeMs = 12,
+            clientConfigJson = "{\"a\":1}",
+            clientBundleJson = "{\"b\":2}",
+            deviceID = "device-a",
+            realityUUID = "uuid",
+            internalIP = "10.0.0.2/32",
+            psk2 = "psk",
+            serverAWGPublic = "srv",
+            awgPrivateKey = "priv",
+            awgPublicKey = "pub",
+            limitsJson = "{\"devices\":1}",
+            awgProfilesJson = "{\"awg-v2\":{\"awg_public_key\":\"k\",\"internal_ip\":\"10.1.0.2/32\",\"psk2\":\"p\"}}",
+            realityFlow = REALITY_FLOW_VISION,
+            realityFlowKnown = true,
+            enrollVersionCode = 42,
+        )
+        val restored = publicPlatformStateFromJson(org.json.JSONObject(publicPlatformStateToJson(state).toString()))
+        assertEquals(state, restored)
+        // A known empty flow survives the round trip as "known".
+        val emptyFlow = state.copy(realityFlow = "", realityFlowKnown = true)
+        assertEquals(emptyFlow, publicPlatformStateFromJson(publicPlatformStateToJson(emptyFlow)))
+    }
+
+    @Test
+    fun publicPlatformStateReadsJsonWrittenByOlderVersions() {
+        val legacy = org.json.JSONObject(
+            """{"bootstrap_raw":"{}","config_pubkey_pin":"pin","update_pubkey_pin":"upd","max_seen_config_seq":5,""" +
+                """"max_seen_update_seq":2,"trusted_wall_time_ms":1,"trusted_elapsed_realtime_ms":2,""" +
+                """"client_config_json":"","client_bundle_json":"bundle","device_id":"device-a","reality_uuid":"uuid",""" +
+                """"internal_ip":"10.0.0.2/32","psk2":"psk","server_awg_public":"srv","awg_private_key":"priv",""" +
+                """"awg_public_key":"pub","limits_json":""}""",
+        )
+        val state = publicPlatformStateFromJson(legacy)
+        assertEquals("device-a", state.deviceID)
+        assertEquals("bundle", state.clientBundleJson)
+        assertEquals(5L, state.maxSeenConfigSeq)
+        assertEquals("", state.awgProfilesJson)
+        assertEquals("", state.realityFlow)
+        assertFalse(state.realityFlowKnown)
+        assertEquals(0L, state.enrollVersionCode)
+        // The old reader's keys are unchanged, so an older app still reads what we write.
+        val written = publicPlatformStateToJson(state)
+        legacy.keys().forEach { key -> assertTrue(key, written.has(key)) }
+    }
 }

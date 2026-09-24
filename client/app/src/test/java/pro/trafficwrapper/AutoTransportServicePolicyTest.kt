@@ -625,29 +625,58 @@ class AutoTransportServicePolicyTest {
     }
 
     @Test
-    fun reality2UuidChangeRestartsOnlyWhenLiveAndChanged() {
+    fun realityConfigChangeRestartsOnlyWhenLiveAndChanged() {
+        val applied = policyRealityConfig(uuid = "11111111-0000-0000-0000-000000000000")
+        // UUID change (the previous REALITY2-only rule) now applies to both slots.
         assertTrue(
-            shouldRestartReality2ForUuid(
-                appliedUuid = "11111111-0000-0000-0000-000000000000",
-                desiredUuid = "4fad2182-1111-2222-3333-444444444444",
+            shouldRestartRealityForConfig(
+                applied = applied,
+                desired = applied.copy(uuid = "4fad2182-1111-2222-3333-444444444444"),
                 sidecarAlive = true,
             ),
         )
         assertFalse(
-            shouldRestartReality2ForUuid(
-                appliedUuid = "4FAD2182-1111-2222-3333-444444444444",
-                desiredUuid = "4fad2182-1111-2222-3333-444444444444",
+            shouldRestartRealityForConfig(
+                applied = applied.copy(uuid = "4FAD2182-1111-2222-3333-444444444444"),
+                desired = applied.copy(uuid = "4fad2182-1111-2222-3333-444444444444"),
                 sidecarAlive = true,
             ),
         )
         assertFalse(
-            shouldRestartReality2ForUuid(
-                appliedUuid = "11111111-0000-0000-0000-000000000000",
-                desiredUuid = "4fad2182-1111-2222-3333-444444444444",
+            shouldRestartRealityForConfig(
+                applied = applied,
+                desired = applied.copy(uuid = "4fad2182-1111-2222-3333-444444444444"),
                 sidecarAlive = false,
             ),
         )
+        // Flow negotiated at re-enrollment, another variant (port/network/address family).
+        assertTrue(shouldRestartRealityForConfig(applied, applied.copy(flow = REALITY_FLOW_VISION), sidecarAlive = true))
+        assertTrue(shouldRestartRealityForConfig(applied, applied.copy(port = 8443, network = "xhttp", xhttpPath = "/p", xhttpMode = "stream-up"), true))
+        assertTrue(shouldRestartRealityForConfig(applied, applied.copy(address = "2001:db8::1"), true))
+        assertTrue(shouldRestartRealityForConfig(applied, applied.copy(shortId = "c1"), true))
+        // Same config (a config poll with identical content) or unknown applied config: no restart.
+        assertFalse(shouldRestartRealityForConfig(applied, applied.copy(), sidecarAlive = true))
+        assertFalse(shouldRestartRealityForConfig(null, applied, sidecarAlive = true))
+        assertFalse(shouldRestartRealityForConfig(applied.copy(uuid = ""), applied, sidecarAlive = true))
+        assertFalse(shouldRestartRealityForConfig(applied, applied.copy(publicKey = ""), sidecarAlive = true))
     }
+
+    private fun policyRealityConfig(uuid: String): RealityUiConfig =
+        RealityUiConfig(
+            transport = "REALITY",
+            address = "worker.example",
+            port = 443,
+            uuid = uuid,
+            email = "device-a",
+            flow = "",
+            security = "reality",
+            network = "tcp",
+            serverName = "sni.example",
+            publicKey = "pk",
+            shortId = "sid",
+            fingerprint = "chrome",
+            spiderX = "/",
+        )
 
     @Test
     fun realityUuid8ExtractsFirstEightHexCharacters() {

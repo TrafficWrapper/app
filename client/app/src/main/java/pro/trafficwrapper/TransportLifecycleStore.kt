@@ -29,6 +29,7 @@ object TransportLifecycleStore {
     private const val KEY_VPN_ALLOWED_APPS = "vpn_allowed_apps"
     private const val KEY_VPN_KILL_SWITCH = "vpn_kill_switch"
     private const val KEY_VPN_LAST_UDP_ROUTE = "vpn_last_udp_route"
+    private const val KEY_LAST_GOOD_VARIANT_PREFIX = "last_good_variant_"
 
     fun rememberActiveTransport(context: Context, mode: TransportChoice) {
         prefs(context).edit()
@@ -36,6 +37,19 @@ object TransportLifecycleStore {
             .putString(KEY_MODE, mode.name)
             .apply()
     }
+
+    /** Key of the last variant (profile/network/family/flow) that worked for a route slot. */
+    fun lastGoodVariant(context: Context, slot: String): String? =
+        prefs(context).getString(lastGoodVariantKey(slot), null)?.takeIf { it.isNotBlank() }
+
+    fun rememberLastGoodVariant(context: Context, slot: String, variantKey: String) {
+        prefs(context).edit()
+            .putString(lastGoodVariantKey(slot), variantKey)
+            .apply()
+    }
+
+    internal fun lastGoodVariantKey(slot: String): String =
+        KEY_LAST_GOOD_VARIANT_PREFIX + slot.trim().uppercase()
 
     fun rememberStopped(context: Context) {
         prefs(context).edit()

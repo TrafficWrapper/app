@@ -31,6 +31,18 @@ const (
 	maxHeaderSpan         = uint32(32 * 1024 * 1024)
 )
 
+// Production junk-packet bounds, kept in sync with the worker's
+// core/awg/dialect. The worker's legacy generator stays inside the narrower
+// Jc 4..12, Jmin 8, Jmax 40..80 so older clients keep accepting it; newer
+// workers may emit the wider ranges below, which this client must accept.
+const (
+	minJc         = 3
+	maxJc         = 16
+	minJmin       = 8
+	maxJmin       = 64
+	maxJunkSpread = 200
+)
+
 type Dialect struct {
 	Jc   int    `json:"jc"`
 	Jmin int    `json:"jmin"`
@@ -155,14 +167,14 @@ func ValidateProduction(d Dialect, mtu int) error {
 	if mtu <= 0 {
 		return errors.New("mtu must be positive")
 	}
-	if d.Jc < 4 || d.Jc > 12 {
-		return fmt.Errorf("jc must be in [4,12], got %d", d.Jc)
+	if d.Jc < minJc || d.Jc > maxJc {
+		return fmt.Errorf("jc must be in [%d,%d], got %d", minJc, maxJc, d.Jc)
 	}
-	if d.Jmin != 8 {
-		return fmt.Errorf("jmin must be 8, got %d", d.Jmin)
+	if d.Jmin < minJmin || d.Jmin > maxJmin {
+		return fmt.Errorf("jmin must be in [%d,%d], got %d", minJmin, maxJmin, d.Jmin)
 	}
-	if d.Jmax < 40 || d.Jmax > 80 || d.Jmax >= mtu {
-		return fmt.Errorf("jmax must be in [40,80] and < mtu(%d), got %d", mtu, d.Jmax)
+	if d.Jmax < 40 || d.Jmax > maxJmin+maxJunkSpread || d.Jmax >= mtu {
+		return fmt.Errorf("jmax must be in [40,%d] and < mtu(%d), got %d", maxJmin+maxJunkSpread, mtu, d.Jmax)
 	}
 	if d.Jmin >= d.Jmax {
 		return fmt.Errorf("jmin must be < jmax, got jmin=%d jmax=%d", d.Jmin, d.Jmax)

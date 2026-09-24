@@ -81,13 +81,15 @@ func TestProxyPairActivityInOneDirectionKeepsBothAlive(t *testing.T) {
 	if _, err := io.ReadFull(leftClient, reply); err != nil || string(reply) != "reply" {
 		t.Fatalf("reply read: %q %v", reply, err)
 	}
-	if up.Load() != 4096*50 || down.Load() != 5 {
-		t.Fatalf("byte counters up=%d down=%d", up.Load(), down.Load())
-	}
 	select {
 	case <-done:
 	case <-time.After(5 * idle):
 		t.Fatal("idle pair was not closed")
+	}
+	// Counters are bumped after each write returns, so the peer can observe
+	// the bytes first; they are only settled once proxyPair has returned.
+	if up.Load() != 4096*50 || down.Load() != 5 {
+		t.Fatalf("byte counters up=%d down=%d", up.Load(), down.Load())
 	}
 	// Idle expiry closes the connection instead of half-closing it as EOF.
 	_ = leftClient.SetReadDeadline(time.Now().Add(time.Second))

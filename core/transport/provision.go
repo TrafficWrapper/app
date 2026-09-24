@@ -21,6 +21,24 @@ var pendingProvision struct {
 	sync.Mutex
 	configJSON      string
 	awgRUConfigJSON string
+	// configMeta / awgRUConfigMeta describe how the stored configs were
+	// built, so rendezvous discovery (which only publishes the base AWG
+	// endpoint over IPv4) does not overwrite a profile or IPv6 config.
+	configMeta      provisionedConfigMeta
+	awgRUConfigMeta provisionedConfigMeta
+}
+
+// provisionedConfigMeta records the worker AWG profile ("" / "awg" for the
+// base inbound) and whether the endpoint is IPv6.
+type provisionedConfigMeta struct {
+	profile string
+	v6      bool
+}
+
+// acceptsDiscoveryMerge reports whether a rendezvous base-AWG endpoint may
+// replace the stored endpoint/key/preset.
+func (m provisionedConfigMeta) acceptsDiscoveryMerge() bool {
+	return isBaseAWGProfile(m.profile) && !m.v6
 }
 
 type identityAPIResult struct {
@@ -243,7 +261,9 @@ func deviceEnroll(req deviceEnrollAPIRequest) (provisionAPIResult, error) {
 	}
 	pendingProvision.Lock()
 	pendingProvision.configJSON = configJSON
+	pendingProvision.configMeta = provisionedConfigMeta{}
 	pendingProvision.awgRUConfigJSON = ""
+	pendingProvision.awgRUConfigMeta = provisionedConfigMeta{}
 	pendingProvision.Unlock()
 	result.ConfigStored = true
 	result.WorkingKeysInGoRAM = true
@@ -268,6 +288,7 @@ func deviceEnroll(req deviceEnrollAPIRequest) (provisionAPIResult, error) {
 		}
 		pendingProvision.Lock()
 		pendingProvision.awgRUConfigJSON = configJSON
+		pendingProvision.awgRUConfigMeta = provisionedConfigMeta{}
 		pendingProvision.Unlock()
 		result.AWGRUConfigStored = true
 	}

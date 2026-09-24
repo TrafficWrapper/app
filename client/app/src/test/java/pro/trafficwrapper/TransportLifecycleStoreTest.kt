@@ -127,6 +127,19 @@ class TransportLifecycleStoreTest {
         TransportLifecycleStore.setLastVpnUdpRoute(context, " netstack:default ")
         assertEquals("netstack:default", TransportLifecycleStore.lastVpnUdpRoute(context))
     }
+
+    @Test
+    fun lastGoodVariantIsRememberedPerSlot() {
+        val context = FakeContext()
+
+        assertEquals(null, TransportLifecycleStore.lastGoodVariant(context, "REALITY"))
+        TransportLifecycleStore.rememberLastGoodVariant(context, "REALITY", "w|xhttp|xhttp|v4|")
+        TransportLifecycleStore.rememberLastGoodVariant(context, "AWG_RU", "w|awg-v2|awg|v6|")
+        assertEquals("w|xhttp|xhttp|v4|", TransportLifecycleStore.lastGoodVariant(context, "REALITY"))
+        assertEquals("w|awg-v2|awg|v6|", TransportLifecycleStore.lastGoodVariant(context, "awg_ru"))
+        assertEquals(null, TransportLifecycleStore.lastGoodVariant(context, "REALITY2"))
+        assertEquals("last_good_variant_REALITY2", TransportLifecycleStore.lastGoodVariantKey("reality2"))
+    }
 }
 
 private class FakeContext : ContextWrapper(null) {

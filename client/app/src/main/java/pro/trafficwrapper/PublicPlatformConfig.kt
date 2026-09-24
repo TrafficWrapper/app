@@ -85,7 +85,167 @@ data class PublicPlatformCredentials(
     val serverAWGPublic: String,
     val awgPrivateKey: String,
     val awgPublicKey: String,
+    /** reality_flow from the enroll response; only meaningful when [realityFlowKnown]. */
+    val realityFlow: String = "",
+    /** True when the enroll response carried reality_flow (even an empty one). */
+    val realityFlowKnown: Boolean = false,
 )
+
+internal fun StoredPublicPlatformState.toPublicPlatformCredentials(): PublicPlatformCredentials =
+    PublicPlatformCredentials(
+        deviceID = deviceID,
+        realityUUID = realityUUID,
+        internalIP = internalIP,
+        psk2 = psk2,
+        serverAWGPublic = serverAWGPublic,
+        awgPrivateKey = awgPrivateKey,
+        awgPublicKey = awgPublicKey,
+        realityFlow = realityFlow,
+        realityFlowKnown = realityFlowKnown,
+    )
+
+/**
+ * Capabilities announced in the enroll request (client_capabilities). The orchestrator stores
+ * them per device and derives the device's REALITY flow from "reality_vision".
+ */
+val PUBLIC_CLIENT_CAPABILITIES: List<String> = listOf(
+    "reality_vision",
+    "reality_profiles",
+    "reality_short_id",
+    "awg_dialect_wide",
+    "ipv6_endpoints",
+    "tunnel_dns",
+)
+
+const val REALITY_FLOW_VISION = "xtls-rprx-vision"
+
+/**
+ * Flow for a REALITY outbound. XHTTP never carries a flow. When the enroll response told us the
+ * device's flow (reality_flow), it is applied only where the inbound accepts Vision: routes marked
+ * "vision": true, or - for bundles without the mark - TCP routes. Without a known device flow the
+ * route's own params.flow is used exactly as before.
+ */
+internal fun resolveRealityFlow(
+    network: String,
+    deviceFlow: String,
+    deviceFlowKnown: Boolean,
+    paramsFlow: String,
+    routeVision: Boolean? = null,
+): String {
+    val net = network.trim().lowercase()
+    if (net == "xhttp") return ""
+    if (!deviceFlowKnown) return paramsFlow.trim()
+    if (deviceFlow.trim() != REALITY_FLOW_VISION) return ""
+    val acceptsVision = routeVision ?: (net.isEmpty() || net == "tcp")
+    return if (acceptsVision) REALITY_FLOW_VISION else ""
+}
+
+/** The route's "vision" mark (true/false), or null when the bundle predates it. */
+internal fun realityRouteVision(params: JSONObject): Boolean? {
+    if (!params.has("vision")) return null
+    return when (val value = params.opt("vision")) {
+        is Boolean -> value
+        is String -> value.trim().equals("true", ignoreCase = true)
+        is Number -> value.toInt() != 0
+        else -> null
+    }
+}
+
+/** Cohort slot of a device: uint32be(sha256(utf8(device_id))[0:4]) % size. */
+internal fun realityCohortIndex(deviceId: String, size: Int): Int {
+    if (size <= 0) return -1
+    val hash = MessageDigest.getInstance("SHA-256").digest(deviceId.toByteArray(Charsets.UTF_8))
+    val value = ((hash[0].toLong() and 0xff) shl 24) or
+        ((hash[1].toLong() and 0xff) shl 16) or
+        ((hash[2].toLong() and 0xff) shl 8) or
+        (hash[3].toLong() and 0xff)
+    return (value % size.toLong()).toInt()
+}
+
+/**
+ * REALITY short id: the device's slot in params.cohort_short_ids (revoked slots are ""), falling
+ * back to the route's short_id when the list is absent/empty, the device id is unknown or the
+ * slot is blank.
+ */
+internal fun resolveRealityShortId(params: JSONObject, deviceId: String): String {
+    val base = params.optString("shortId").ifBlank { params.optString("short_id") }
+    val cohorts = params.optJSONArray("cohort_short_ids") ?: return base
+    if (cohorts.length() == 0 || deviceId.isBlank()) return base
+    val index = realityCohortIndex(deviceId, cohorts.length())
+    val value = cohorts.opt(index)
+    val cohort = if (value is String) value.trim() else ""
+    return cohort.ifBlank { base }
+}
+
+/** A primary REALITY route has no profile (or the worker's base profile "reality"). */
+internal fun isPrimaryRealityRoute(route: PublicRouteConfig): Boolean {
+    val profile = route.params.optString("profile").trim()
+    return profile.isEmpty() || profile.equals(REALITY_BASE_PROFILE, ignoreCase = true)
+}
+
+internal const val REALITY_BASE_PROFILE = "reality"
+
+/** Process-wide AWG address family chosen per slot ("" = default v4, the pre-IPv6 request). */
+object PublicAwgFamilyState {
+    @Volatile
+    var awgRu: String = ""
+
+    @Volatile
+    var awg: String = ""
+}
+
+/**
+ * The single builder of Transport.applyPublicPlatformConfig requests (activity, service and
+ * discovery). awg_profiles is sent only when the enroll response carried it.
+ */
+internal fun publicCoreApplyRequest(
+    stored: StoredPublicPlatformState,
+    config: PublicClientConfig,
+    slots: PublicPlatformRouteSlots,
+    socksListen: String,
+    awgRuSocksListen: String,
+    mtu: Int = PUBLIC_DEFAULT_MTU,
+    rendezvousPublicKey: String? = null,
+    awgRuFamily: String = PublicAwgFamilyState.awgRu,
+    awgFamily: String = PublicAwgFamilyState.awg,
+): JSONObject {
+    val request = JSONObject()
+        .put("awg_private_key", stored.awgPrivateKey)
+        .put("internal_ip", stored.internalIP)
+        .put("psk2", stored.psk2)
+        .put("server_awg_public", stored.serverAWGPublic)
+        .put("socks_listen", socksListen)
+        .put("awg_ru_socks_listen", awgRuSocksListen)
+        .put("mtu", mtu)
+        .put("dns_servers", JSONArray(config.dnsServers))
+    if (rendezvousPublicKey != null) {
+        // The core only verifies discovery bundles against a key pinned here from the
+        // verified client config, never against the key sent with the bundle request.
+        request.put("rendezvous_public_key", rendezvousPublicKey)
+    }
+    val awgProfiles = stored.awgProfilesJson.trim()
+        .takeIf { it.isNotEmpty() }
+        ?.let { runCatching { JSONObject(it) }.getOrNull() }
+    if (awgProfiles != null && awgProfiles.length() > 0) {
+        request.put("awg_profiles", awgProfiles)
+    }
+    slots.awgRu?.let { request.put("awg_ru", publicAwgRouteRequest(it, awgRuFamily)) }
+    slots.awg?.let { request.put("awg", publicAwgRouteRequest(it, awgFamily)) }
+    return request
+}
+
+private fun publicAwgRouteRequest(route: PublicRouteConfig, family: String): JSONObject {
+    val json = PublicPlatformConfigParser.awgRouteJson(route)
+    val normalized = family.trim().lowercase()
+    if (normalized == IpFamily.V6.wire && route.params.optString("endpoint_v6").isNotBlank()) {
+        json.put("ip_family", IpFamily.V6.wire)
+    } else if (normalized == IpFamily.V4.wire) {
+        json.put("ip_family", IpFamily.V4.wire)
+    }
+    return json
+}
+
+internal const val PUBLIC_DEFAULT_MTU = 1420
 
 data class PublicResolvedRoute(
     val worker: PublicWorkerConfig,
@@ -104,6 +264,12 @@ data class PublicPlatformRouteSlots(
     val orderedRoutes: List<PublicResolvedRoute> = emptyList(),
     val routePriorities: Map<String, Int> = emptyMap(),
     val routeRegions: Map<String, String> = emptyMap(),
+    /** Ordered alternatives of the REALITY slot; the first one is [reality]. */
+    val realityVariants: List<RealityRouteVariant> = listOfNotNull(reality?.let { RealityRouteVariant.single(it) }),
+    val reality2Variants: List<RealityRouteVariant> = listOfNotNull(reality2?.let { RealityRouteVariant.single(it) }),
+    /** Address families of the AWG_RU/AWG slots; the first one is the plain (v4) route. */
+    val awgRuVariants: List<AwgRouteVariant> = listOfNotNull(awgRu?.let { AwgRouteVariant.single(it) }),
+    val awgVariants: List<AwgRouteVariant> = listOfNotNull(awg?.let { AwgRouteVariant.single(it) }),
 ) {
     fun hasUsableRoute(): Boolean =
         awgRu != null || awg != null || reality2?.isComplete() == true || reality?.isComplete() == true
@@ -211,21 +377,40 @@ object PublicPlatformConfigParser {
         credentials: PublicPlatformCredentials,
     ): PublicPlatformRouteSlots {
         val ordered = deterministicRouteOrder(config, deviceId)
-        val awgRoutes = ordered
-            .map(PublicResolvedRoute::route)
-            .filter { it.type in AWG_ROUTE_TYPES && it.address.isNotBlank() && it.port > 0 }
-        val realityRoutes = ordered
-            .map(PublicResolvedRoute::route)
-            .filter { it.type in REALITY_ROUTE_TYPES && it.address.isNotBlank() && it.port > 0 }
-        val primaryAwg = awgRoutes.getOrNull(0)
-        val secondaryAwg = awgRoutes.getOrNull(1)
-        val primaryReality = realityRoutes.getOrNull(0)
-        val secondaryReality = realityRoutes.getOrNull(1)
+        val awgResolved = ordered
+            .filter { it.route.type in AWG_ROUTE_TYPES && it.route.address.isNotBlank() && it.route.port > 0 }
+        val realityCandidates = ordered
+            .filter { it.route.type in REALITY_ROUTE_TYPES && it.route.address.isNotBlank() && it.route.port > 0 }
+        // Fallback profiles (xhttp, another port) never take a slot of their own: they only
+        // extend the variants of their worker's primary route.
+        val realityResolved = realityCandidates.filter { isPrimaryRealityRoute(it.route) }
+        val primaryAwgResolved = awgResolved.getOrNull(0)
+        val secondaryAwgResolved = awgResolved.getOrNull(1)
+        val primaryRealityResolved = realityResolved.getOrNull(0)
+        val secondaryRealityResolved = realityResolved.getOrNull(1)
+        val primaryAwg = primaryAwgResolved?.route
+        val secondaryAwg = secondaryAwgResolved?.route
+        val primaryReality = primaryRealityResolved?.route
+        val secondaryReality = secondaryRealityResolved?.route
+        fun fallbacksOf(resolved: PublicResolvedRoute?): List<PublicRouteConfig> =
+            if (resolved == null) {
+                emptyList()
+            } else {
+                realityCandidates
+                    .filter { it.worker.workerId == resolved.worker.workerId && !isPrimaryRealityRoute(it.route) }
+                    .map(PublicResolvedRoute::route)
+            }
+        val realityVariants = primaryRealityResolved?.let {
+            RouteVariants.expandRealityVariants(it, fallbacksOf(it), credentials)
+        }.orEmpty()
+        val reality2Variants = secondaryRealityResolved?.let {
+            RouteVariants.expandRealityVariants(it, fallbacksOf(it), credentials)
+        }.orEmpty()
         return PublicPlatformRouteSlots(
             awgRu = primaryAwg,
             awg = secondaryAwg,
-            reality = primaryReality?.toRealityUiConfig(credentials),
-            reality2 = secondaryReality?.toRealityUiConfig(credentials),
+            reality = realityVariants.firstOrNull()?.config,
+            reality2 = reality2Variants.firstOrNull()?.config,
             awgRuExpectedEgressIp = primaryAwg?.expectedEgressIp.orEmpty(),
             awgExpectedEgressIp = secondaryAwg?.expectedEgressIp.orEmpty(),
             realityExpectedEgressIp = primaryReality?.expectedEgressIp.orEmpty(),
@@ -244,6 +429,10 @@ object PublicPlatformConfigParser {
                 reality = primaryReality,
                 reality2 = secondaryReality,
             ),
+            realityVariants = realityVariants,
+            reality2Variants = reality2Variants,
+            awgRuVariants = primaryAwgResolved?.let { RouteVariants.expandAwgVariants(it) }.orEmpty(),
+            awgVariants = secondaryAwgResolved?.let { RouteVariants.expandAwgVariants(it) }.orEmpty(),
         )
     }
 
@@ -393,7 +582,13 @@ object PublicPlatformConfigParser {
         )
     }
 
-    private fun PublicRouteConfig.toRealityUiConfig(credentials: PublicPlatformCredentials): RealityUiConfig {
+    /** REALITY outbound config for [address]:[port] described by route [params]. */
+    internal fun realityUiConfig(
+        address: String,
+        port: Int,
+        params: JSONObject,
+        credentials: PublicPlatformCredentials,
+    ): RealityUiConfig {
         val network = params.optString(JSON_REALITY_NETWORK, "tcp")
         return RealityUiConfig(
             transport = params.optString(JSON_REALITY_TRANSPORT, "REALITY"),
@@ -402,7 +597,13 @@ object PublicPlatformConfigParser {
             port = port,
             uuid = credentials.realityUUID,
             email = credentials.deviceID,
-            flow = realityConfigFlow(network, params.optString(JSON_REALITY_FLOW)),
+            flow = resolveRealityFlow(
+                network = network,
+                deviceFlow = credentials.realityFlow,
+                deviceFlowKnown = credentials.realityFlowKnown,
+                paramsFlow = params.optString(JSON_REALITY_FLOW),
+                routeVision = realityRouteVision(params),
+            ),
             security = params.optString(JSON_REALITY_SECURITY, "reality"),
             network = network,
             serverName = params.optString(JSON_REALITY_SERVER_NAME).ifBlank {
@@ -411,9 +612,7 @@ object PublicPlatformConfigParser {
             publicKey = params.optString(JSON_REALITY_PUBLIC_KEY).ifBlank {
                 params.optString(JSON_REALITY_PUBLIC_KEY_SNAKE)
             },
-            shortId = params.optString(JSON_REALITY_SHORT_ID).ifBlank {
-                params.optString(JSON_REALITY_SHORT_ID_SNAKE)
-            },
+            shortId = resolveRealityShortId(params, credentials.deviceID),
             fingerprint = clampRealityFingerprint(params.optString(JSON_REALITY_FINGERPRINT, "chrome")),
             spiderX = params.optString(JSON_REALITY_SPIDER_X, "/"),
             dest = params.optString(JSON_REALITY_DEST),
@@ -423,9 +622,6 @@ object PublicPlatformConfigParser {
             xhttpExtraJson = params.xhttpObjectString(JSON_REALITY_XHTTP_EXTRA, JSON_REALITY_XHTTP_EXTRA_SNAKE),
         )
     }
-
-    private fun realityConfigFlow(network: String, flow: String): String =
-        if (network.equals("xhttp", ignoreCase = true)) "" else flow.trim()
 
     private fun JSONObject.xhttpString(camelKey: String, snakeKey: String): String {
         val xhttp = optJSONObject(JSON_REALITY_XHTTP)

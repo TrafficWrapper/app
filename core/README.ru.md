@@ -46,6 +46,26 @@ Imported packages `conn`, `tun`, `ipc`, `ratelimiter`, `tai64n` и `rwcancel`
   число одновременных SOCKS-соединений (по умолчанию 1024). AWG `h1`..`h4` и
   поля конфига, попадающие в UAPI, не допускают пробельных/управляющих
   символов и переводов строк.
+- `PublicDeviceEnroll` передаёт оркестратору необязательные
+  `client_capabilities` (массив строк) и `client_version_code` (целое). В
+  результат без изменений попадают `awg_profiles` (карта имя AWG-профиля →
+  `{awg_public_key, internal_ip, psk2}`) и `reality_flow` (присутствует, в том
+  числе как `""`, только если его прислал оркестратор).
+- `ApplyPublicPlatformConfig` принимает `awg_profiles` в том же формате.
+  Маршрут `awg` / `awg_ru` может содержать `awg_profile` (иначе берётся
+  `profile`), `endpoint_v6` (`"[addr]:port"`), `ip_family` (`"v4"` по
+  умолчанию или `"v6"`) и `dns` (список IP). Если профиль маршрута не
+  `""`/`"awg"` и есть в `awg_profiles`, используются его `internal_ip`/`psk2`
+  (и его `endpoint_v6`, если задан), иначе — общие. `"v6"` берёт IPv6-endpoint,
+  если он известен, иначе IPv4. Непустой `dns` маршрута заменяет `dns_servers`
+  для этого конфига; значение, не являющееся IP, — ошибка apply.
+- AWG-диалекты принимают расширенные диапазоны воркера: `jc` 3..16, `jmin`
+  8..64, `jmax` 40..264 (и `< mtu`), `jmin < jmax`; старые диалекты остаются
+  валидными.
+- Rendezvous описывает только базовый IPv4 AWG-endpoint, поэтому discovery не
+  сливается в сохранённый конфиг другого AWG-профиля или с IPv6-endpoint (с
+  `base_config_json` — с IPv6-endpoint). Такой результат `ok` с неизменным
+  `config_json` и `awg_merge_skipped: true`.
 - Ошибки, пришедшие вне Noise-канала, получают префикс
   `unauthenticated server response:`, очищаются от управляющих символов и
   обрезаются примерно до 200 символов.

@@ -112,7 +112,7 @@ func TestPublicAWGConfigJSONWritesDNSServers(t *testing.T) {
 		ServerAWGPublic: testKey(2),
 		MTU:             1420,
 	}
-	raw, err := publicAWGConfigJSON(route, req, "127.0.0.1:18080")
+	raw, _, err := publicAWGConfigJSON(route, req, "127.0.0.1:18080")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestPublicAWGConfigJSONWritesDNSServers(t *testing.T) {
 	}
 
 	req.DNSServers = []string{"9.9.9.9", "149.112.112.112"}
-	raw, err = publicAWGConfigJSON(route, req, "127.0.0.1:18080")
+	raw, _, err = publicAWGConfigJSON(route, req, "127.0.0.1:18080")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestPublicAWGConfigJSONPinsHostnameEndpointWithExpectedEgressIP(t *testing.
 		ServerAWGPublic: testKey(2),
 		MTU:             1420,
 	}
-	raw, err := publicAWGConfigJSON(&route, req, "127.0.0.1:18080")
+	raw, _, err := publicAWGConfigJSON(&route, req, "127.0.0.1:18080")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestPublicAWGConfigJSONRejectsHostnameEndpointWithoutPinnedIP(t *testing.T)
 		ServerAWGPublic: testKey(2),
 		MTU:             1420,
 	}
-	if _, err := publicAWGConfigJSON(route, req, "127.0.0.1:18080"); err == nil {
+	if _, _, err := publicAWGConfigJSON(route, req, "127.0.0.1:18080"); err == nil {
 		t.Fatal("hostname endpoint without egress_ip was accepted")
 	}
 }

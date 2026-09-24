@@ -446,6 +446,7 @@ object Telemetry {
             reality2Uuid8 = fields.stringValue("rl2_uid8").ifBlank {
                 realityUuid8(TransportRuntime.appliedReality2Uuid)
             },
+            routeVariant = fields.stringValue("rl_var"),
             errorWhere = fields.stringValue("err_where"),
             errorKind = fields.stringValue("err_kind"),
             errorMessage = fields.stringValue("err_msg"),
@@ -519,6 +520,7 @@ object Telemetry {
             .putLongIfNotNull("rl2_rx", snapshot.reality2RxBytes)
             .putLongIfNotNull("rl2_tx", snapshot.reality2TxBytes)
             .putStringIfNotBlank("rl2_uid8", snapshot.reality2Uuid8)
+            .putStringIfNotBlank("rl_var", snapshot.routeVariant)
             .putStringIfNotBlank("err_where", snapshot.errorWhere)
             .putStringIfNotBlank("err_kind", snapshot.errorKind)
             .putStringIfNotBlank("err_msg", snapshot.errorMessage)
@@ -828,7 +830,7 @@ object Telemetry {
                 "err_msg", "awg_start_err", "awgru_start_err", "rl_tcp_err", "rl2_err" -> sanitizeErrorText(rawValue?.toString().orEmpty())
                 "err_kind" -> rawValue?.toString()?.takeIf { it.isNotBlank() }?.let { normalizeErrorKind(it) }
                 "rsn", "enr", "mode", "route", "active_route", "rl_egress", "err_where",
-                "rl2_uid8", "action", "mfr", "oem" -> sanitizeToken(rawValue?.toString().orEmpty(), MAX_VALUE_CHARS)
+                "rl2_uid8", "rl_var", "action", "mfr", "oem" -> sanitizeToken(rawValue?.toString().orEmpty(), MAX_VALUE_CHARS)
                 "skew_s", "last_exch_s", "backoff_ms", "awg_rx", "awg_tx", "awg_fail",
                 "awg_demote", "awg_retry_s", "awgru_rx", "awgru_tx", "awgru_fail",
                 "awgru_demote", "awgru_retry_s", "awgru_udp_dead_backoff_ms",
@@ -1044,6 +1046,8 @@ object Telemetry {
         val reality2RxBytes: Long?,
         val reality2TxBytes: Long?,
         val reality2Uuid8: String,
+        /** Route variant (profile/network/family/flow) of a REALITY/AWG slot, see route_variant. */
+        val routeVariant: String = "",
         val errorWhere: String,
         val errorKind: String,
         val errorMessage: String,
@@ -1160,6 +1164,7 @@ object Telemetry {
         "rl2_rx",
         "rl2_tx",
         "rl2_uid8",
+        "rl_var",
         "err_where",
         "err_kind",
         "err_msg",

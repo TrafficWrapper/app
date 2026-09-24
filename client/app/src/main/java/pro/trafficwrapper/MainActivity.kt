@@ -125,6 +125,9 @@ class MainActivity : ComponentActivity() {
                 val bootstrapRaw = runCatching { publicBootstrapRaw(appContext) }.getOrDefault("")
                 MAIN_HANDLER.post {
                     PUBLIC_BOOTSTRAP_IMPORTED = restored || bootstrapRaw.isNotBlank()
+                    if (restored && PUBLIC_REENROLL_NEEDED) {
+                        startPublicDeviceEnrollment(appContext, silent = true)
+                    }
                     if (!restored) {
                         TransportRuntime.auth = AuthUiState(
                             statusTextRes = if (PUBLIC_BOOTSTRAP_IMPORTED) {
@@ -2976,6 +2979,10 @@ private fun restorePublicPlatformState(context: Context): Boolean {
             config = config,
             persist = null,
         )
+        PUBLIC_REENROLL_NEEDED = publicEnrollmentNeedsVersionRefresh(
+            enrollVersionCode = stored.enrollVersionCode,
+            currentVersionCode = BuildConfig.VERSION_CODE.toLong(),
+        )
         true
     }.getOrElse { error ->
         Log.w(TAG, "public platform cached config restore failed", error)
@@ -2983,24 +2990,46 @@ private fun restorePublicPlatformState(context: Context): Boolean {
     }
 }
 
-private fun startPublicDeviceEnrollment(context: Context, bootstrapRawOverride: String? = null) {
-    if (!DeploymentConfig.IS_PUBLIC_PLATFORM) return
-    if (!ENROLLMENT_ACTIVE.compareAndSet(false, true)) return
-    TransportRuntime.auth = TransportRuntime.auth.copy(
-        inProgress = true,
-        authorized = false,
-        enrollmentRetryAllowed = false,
-        statusTextRes = R.string.public_enrollment_status_registering,
-        errorTextRes = null,
-    )
-    PUBLIC_BOOTSTRAP_ERROR = null
+/**
+ * Enrolls this device with the public platform. [silent] is the re-enrollment of an already
+ * enrolled device after an app update (see [publicEnrollmentNeedsVersionRefresh]): it keeps the
+ * current authorized UI state, accepts the stored (possibly expired) bootstrap - the orchestrator
+ * does not consume the token of a known device - and only logs failures. [onFinished] runs on the
+ * main thread after the attempt. Returns false when another enrollment is already running.
+ */
+private fun startPublicDeviceEnrollment(
+    context: Context,
+    bootstrapRawOverride: String? = null,
+    silent: Boolean = false,
+    onFinished: (() -> Unit)? = null,
+): Boolean {
+    if (!DeploymentConfig.IS_PUBLIC_PLATFORM) return false
+    if (!ENROLLMENT_ACTIVE.compareAndSet(false, true)) return false
+    if (!silent) {
+        TransportRuntime.auth = TransportRuntime.auth.copy(
+            inProgress = true,
+            authorized = false,
+            enrollmentRetryAllowed = false,
+            statusTextRes = R.string.public_enrollment_status_registering,
+            errorTextRes = null,
+        )
+        PUBLIC_BOOTSTRAP_ERROR = null
+    }
     ENROLLMENT_EXECUTOR.execute {
         val mainHandler = Handler(Looper.getMainLooper())
         try {
             // Resolved here (background) rather than as a default argument on the caller's thread.
             val bootstrapRaw = bootstrapRawOverride ?: publicBootstrapRaw(context)
-            val parsed = PublicPlatformConfigParser.parseBootstrap(bootstrapRaw)
+            val parsed = if (silent) {
+                PublicPlatformConfigParser.parseBootstrap(bootstrapRaw, nowMs = 0L)
+            } else {
+                PublicPlatformConfigParser.parseBootstrap(bootstrapRaw)
+            }
             val androidID = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+            if (androidID.isBlank() && silent) {
+                Log.w(TAG, "public re-enrollment skipped: no android id")
+                return@execute
+            }
             if (androidID.isBlank()) {
                 postPublicEnrollmentFailure(
                     mainHandler,
@@ -3033,6 +3062,8 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRawOverride: 
                 .put(JSON_IDENTITY_KEY_TYPE, deviceIdentity.keyType)
                 .put(JSON_ENROLLMENT_NONCE, nonce)
                 .put(JSON_CLIENT_VERSION, BuildConfig.VERSION_NAME)
+                .put(JSON_CLIENT_VERSION_CODE, BuildConfig.VERSION_CODE)
+                .put(JSON_CLIENT_CAPABILITIES, JSONArray(PUBLIC_CLIENT_CAPABILITIES))
                 .put(JSON_PUBLIC_AWG_PRIVATE_KEY, awgKeyPair.privateKey)
                 .put(JSON_PUBLIC_AWG_PUBLIC_KEY, awgKeyPair.publicKey)
                 .put(JSON_TIMEOUT_SECONDS, PUBLIC_ENROLL_TIMEOUT_SECONDS)
@@ -3068,6 +3099,10 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRawOverride: 
                 awgPrivateKey = response.optString(JSON_PUBLIC_AWG_PRIVATE_KEY).ifBlank { awgKeyPair.privateKey },
                 awgPublicKey = response.optString(JSON_PUBLIC_AWG_PUBLIC_KEY).ifBlank { awgKeyPair.publicKey },
                 limitsJson = (config.limits ?: parsed.limits)?.toString().orEmpty(),
+                awgProfilesJson = response.optJSONObject(JSON_PUBLIC_AWG_PROFILES)?.toString().orEmpty(),
+                realityFlow = response.optString(JSON_PUBLIC_REALITY_FLOW).trim(),
+                realityFlowKnown = response.has(JSON_PUBLIC_REALITY_FLOW),
+                enrollVersionCode = BuildConfig.VERSION_CODE.toLong(),
             )
             applyPublicPlatformState(
                 context = context.applicationContext,
@@ -3089,18 +3124,69 @@ private fun startPublicDeviceEnrollment(context: Context, bootstrapRawOverride: 
                 },
             )
             savePublicBootstrap(context, bootstrapRaw)
+            PUBLIC_REENROLL_NEEDED = false
         } catch (error: Throwable) {
-            Log.w(TAG, "public device enrollment failed", error)
-            val policy = publicEnrollmentFailurePolicy(error)
-            mainHandler.post {
-                PUBLIC_BOOTSTRAP_ERROR = Telemetry.safeErrorMessage(error)
+            if (silent) {
+                PUBLIC_REENROLL_FAILED_AT_MS = SystemClock.elapsedRealtime()
+                Log.w(TAG, "public re-enrollment after app update failed; keeping cached state", error)
+            } else {
+                Log.w(TAG, "public device enrollment failed", error)
+                val policy = publicEnrollmentFailurePolicy(error)
+                mainHandler.post {
+                    PUBLIC_BOOTSTRAP_ERROR = Telemetry.safeErrorMessage(error)
+                }
+                postPublicEnrollmentFailure(mainHandler, policy)
             }
-            postPublicEnrollmentFailure(mainHandler, policy)
         } finally {
             ENROLLMENT_ACTIVE.set(false)
+            if (onFinished != null) {
+                mainHandler.post(onFinished)
+            }
         }
     }
+    return true
 }
+
+/**
+ * Runs [action] (on main) once this device's enrollment matches the running app version: the
+ * orchestrator derives the device's REALITY flow from the capabilities sent at enrollment and Xray
+ * rejects a flow mismatch, so an updated (or rolled back) app re-enrolls before it connects. A
+ * failed re-enrollment does not block connecting with the cached state.
+ */
+private fun runAfterPublicVersionReEnroll(context: Context, action: () -> Unit) {
+    if (
+        !shouldWaitForPublicVersionReEnroll(
+            needed = PUBLIC_REENROLL_NEEDED,
+            lastFailureAtMs = PUBLIC_REENROLL_FAILED_AT_MS,
+            nowMs = SystemClock.elapsedRealtime(),
+        )
+    ) {
+        action()
+        return
+    }
+    val started = startPublicDeviceEnrollment(
+        context.applicationContext,
+        silent = true,
+        onFinished = action,
+    )
+    if (!started) {
+        // Another enrollment (usually the startup re-enrollment) is running on the single-thread
+        // enrollment executor: queue behind it so the connect still waits for its result.
+        ENROLLMENT_EXECUTOR.execute { MAIN_HANDLER.post(action) }
+    }
+}
+
+internal fun publicEnrollmentNeedsVersionRefresh(enrollVersionCode: Long, currentVersionCode: Long): Boolean =
+    enrollVersionCode != currentVersionCode
+
+/**
+ * A connect waits for the version re-enrollment unless one just failed (orchestrator unreachable):
+ * then it connects with the cached state at once instead of waiting for another timeout.
+ */
+internal fun shouldWaitForPublicVersionReEnroll(needed: Boolean, lastFailureAtMs: Long, nowMs: Long): Boolean =
+    needed && (lastFailureAtMs <= 0L || nowMs - lastFailureAtMs !in 0 until PUBLIC_REENROLL_RETRY_AFTER_MS)
+
+internal const val PUBLIC_REENROLL_RETRY_AFTER_MS = 10 * 60_000L
 
 private fun postPublicEnrollmentFailure(
     mainHandler: Handler,
@@ -3124,30 +3210,19 @@ private fun applyPublicPlatformState(
     // null means "restore only" (nothing is written).
     persist: ((StoredPublicPlatformState) -> StoredPublicPlatformState)?,
 ) {
-    val credentials = PublicPlatformCredentials(
-        deviceID = stored.deviceID,
-        realityUUID = stored.realityUUID,
-        internalIP = stored.internalIP,
-        psk2 = stored.psk2,
-        serverAWGPublic = stored.serverAWGPublic,
-        awgPrivateKey = stored.awgPrivateKey,
-        awgPublicKey = stored.awgPublicKey,
-    )
+    val credentials = stored.toPublicPlatformCredentials()
     val slots = PublicPlatformConfigParser.routeSlots(config, stored.deviceID, credentials)
     if (!slots.hasUsableRoute()) {
         throw IllegalStateException("public client config has no usable route")
     }
-    val applyRequest = JSONObject()
-        .put(JSON_PUBLIC_AWG_PRIVATE_KEY, stored.awgPrivateKey)
-        .put(JSON_INTERNAL_IP, stored.internalIP)
-        .put(JSON_PUBLIC_PSK2, stored.psk2)
-        .put(JSON_PUBLIC_SERVER_AWG_PUBLIC, stored.serverAWGPublic)
-        .put(JSON_SOCKS_LISTEN, DEFAULT_AWG_INTERNAL_SOCKS_LISTEN)
-        .put(JSON_AWG_RU_SOCKS_LISTEN, DEFAULT_AWG_RU_INTERNAL_SOCKS_LISTEN)
-        .put(JSON_MTU, DEFAULT_MTU)
-        .put(JSON_DNS_SERVERS, JSONArray(config.dnsServers))
-    slots.awgRu?.let { applyRequest.put(JSON_AWG_RU, PublicPlatformConfigParser.awgRouteJson(it)) }
-    slots.awg?.let { applyRequest.put(JSON_AWG, PublicPlatformConfigParser.awgRouteJson(it)) }
+    val applyRequest = publicCoreApplyRequest(
+        stored = stored,
+        config = config,
+        slots = slots,
+        socksListen = DEFAULT_AWG_INTERNAL_SOCKS_LISTEN,
+        awgRuSocksListen = DEFAULT_AWG_RU_INTERNAL_SOCKS_LISTEN,
+        mtu = DEFAULT_MTU,
+    )
     val applyResponse = JSONObject(Transport.applyPublicPlatformConfig(applyRequest.toString()))
     if (!applyResponse.optBoolean(JSON_OK, false)) {
         throw IllegalStateException(applyResponse.optString(JSON_ERROR))
@@ -3475,7 +3550,7 @@ fun requestFreshDeviceKeys(context: Context, userInitiated: Boolean = true) {
                     TRANSPORT_KEEP_ALIVE.set(true)
                     TransportLifecycleStore.rememberActiveTransport(appContext, TransportRuntime.selectedTransport)
                 }
-                startSelectedTransport(appContext)
+                runAfterPublicVersionReEnroll(appContext) { startSelectedTransport(appContext) }
             } else {
                 startPublicDeviceEnrollment(appContext)
             }
@@ -3534,11 +3609,11 @@ private fun connectSelectedTransport(context: Context) {
     if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
         val appContext = context.applicationContext
         if (TransportRuntime.auth.authorized) {
-            startSelectedTransport(appContext)
+            runAfterPublicVersionReEnroll(appContext) { startSelectedTransport(appContext) }
         } else {
             restorePublicPlatformStateAsync(appContext) { restored ->
                 if (restored) {
-                    startSelectedTransport(appContext)
+                    runAfterPublicVersionReEnroll(appContext) { startSelectedTransport(appContext) }
                 } else {
                     startPublicDeviceEnrollment(appContext)
                 }
@@ -4193,6 +4268,13 @@ private val PUBLIC_STATE_EXECUTOR = Executors.newSingleThreadExecutor()
 // Lazy: MainActivityKt is loaded by JVM unit tests, where android.os.Looper is only a stub.
 private val MAIN_HANDLER by lazy { Handler(Looper.getMainLooper()) }
 private val ENROLLMENT_ACTIVE = AtomicBoolean(false)
+
+/** Set when the cached enrollment was made by another app version (see runAfterPublicVersionReEnroll). */
+@Volatile
+private var PUBLIC_REENROLL_NEEDED = false
+
+@Volatile
+private var PUBLIC_REENROLL_FAILED_AT_MS = 0L
 private val FORCE_KEY_REQUEST = AtomicBoolean(false)
 private val TRANSPORT_KEEP_ALIVE = AtomicBoolean(false)
 private val STARTUP_AUTOCONNECT_REQUESTED = AtomicBoolean(false)
@@ -4282,16 +4364,18 @@ private const val JSON_ENROLLMENT_SECRET = "enrollment_secret"
 private const val JSON_ENROLLMENT_SIGNATURE = "enrollment_signature"
 private const val JSON_ENROLLMENT_NONCE = "enrollment_nonce"
 private const val JSON_CLIENT_VERSION = "client_version"
+private const val JSON_CLIENT_VERSION_CODE = "client_version_code"
+private const val JSON_CLIENT_CAPABILITIES = "client_capabilities"
+private const val JSON_PUBLIC_AWG_PROFILES = "awg_profiles"
+private const val JSON_PUBLIC_REALITY_FLOW = "reality_flow"
 private const val JSON_REQUEST_KEYS = "request_keys"
 private const val JSON_SOCKS_LISTEN = "socks_listen"
 private const val JSON_AWG_RU_SOCKS_LISTEN = "awg_ru_socks_listen"
 private const val JSON_MTU = "mtu"
-private const val JSON_DNS_SERVERS = "dns_servers"
 private const val JSON_INTERNAL_IP = "internal_ip"
 private const val JSON_ENDPOINT = "endpoint"
 private const val JSON_SERVER_PUBLIC_KEY = "server_public_key"
 private const val JSON_AWG_RU = "awg_ru"
-private const val JSON_AWG = "awg"
 private const val JSON_REALITY = "reality"
 private const val JSON_REALITY2 = "reality2"
 private const val JSON_PREFERRED_TRANSPORT = "preferred_transport"
