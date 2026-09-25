@@ -668,7 +668,10 @@ object Telemetry {
             val header = readPublicHttpHeader(input)
             val statusLine = header.lineSequence().firstOrNull().orEmpty()
             val code = statusLine.split(' ').firstOrNull { it.toIntOrNull() != null }?.toIntOrNull() ?: 0
-            val responseText = input.readBytes().toString(Charsets.UTF_8).take(MAX_RESPONSE_CHARS)
+            // Bounded read (APP-L24): a relay that streams forever cannot exhaust memory.
+            val responseText = readAtMostBytes(input, MAX_RESPONSE_CHARS * MAX_UTF8_BYTES_PER_CHAR)
+                .toString(Charsets.UTF_8)
+                .take(MAX_RESPONSE_CHARS)
             val serverTime = header.lineSequence()
                 .firstOrNull { it.substringBefore(':').trim().equals("X-TW-Server-Time", ignoreCase = true) }
                 ?.substringAfter(':', "")
@@ -1207,6 +1210,7 @@ object Telemetry {
     private const val PUBLIC_ROUTER_PORT = 18080
     private const val NONCE_BYTES = 16
     private const val MAX_RESPONSE_CHARS = 4096
+    private const val MAX_UTF8_BYTES_PER_CHAR = 4
     private const val MAX_KIND_CHARS = 48
     private const val MAX_VALUE_CHARS = 80
     private const val MAX_ERROR_CHARS = 160

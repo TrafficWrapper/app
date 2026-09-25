@@ -13,6 +13,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
@@ -165,6 +166,8 @@ internal class TrackedSocket(val createdAtMs: Long) {
     var upstreamGeneration: Long = 0
     @Volatile
     var isHealthProbe: Boolean = false
+    @Volatile
+    var destination: String = ""
     val upBytes = AtomicLong(0)
     val downBytes = AtomicLong(0)
     val lastUplinkProgressAtMs = AtomicLong(0)
@@ -567,10 +570,11 @@ internal fun shouldSkipNonDestructiveForegroundResync(
     stableSinceElapsedRealtimeMs: Long?,
     snapshotAgeMs: Long,
     trafficAgeMs: Long,
+    plannedSleepMs: Long = 0L,
 ): Boolean =
     routeHealthy &&
         stableSinceElapsedRealtimeMs != null &&
-        snapshotAgeMs in 0..STABLE_TRAFFIC_MAX_AGE_MS
+        snapshotAgeMs in 0..routeSnapshotMaxAgeMs(plannedSleepMs)
 
 internal fun tcpRouteFlapDemotionMs(
     recentHealthLostCount: Int,
@@ -638,8 +642,17 @@ internal const val SOCKS5_REP_ADDRESS_TYPE_NOT_SUPPORTED = 8
 class AutoTransportService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    /** Network part of the public config poll, off the route-selection thread (APP-M10). */
+    private val publicConfigPollExecutor: ExecutorService = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "tw-config-poll").apply { isDaemon = true }
+    }
+    private val publicConfigFetch = AtomicReference<java.util.concurrent.Future<PublicConfigFetch>?>(null)
+
+    /** Generation of the worker running on the current thread (null elsewhere), see publishState. */
+    private val workerGenerationOfThread = ThreadLocal<Long?>()
     private val upstreamRef = AtomicReference(AWG_RU_UPSTREAM)
-    private val networkEvent = AtomicReference<NetworkEvent?>(null)
+    private val pendingNetworkEvents = PendingLifecycleEvents<NetworkEvent> { it.marksTunnelDisruption }
     private val defaultNetwork = AtomicReference<Network?>(null)
     private val realityRxBytes = AtomicLong(0)
     private val realityTxBytes = AtomicLong(0)
@@ -805,6 +818,7 @@ class AutoTransportService : Service() {
         activeService.compareAndSet(this, null)
         stopAuto(cancelBackstop = !TransportLifecycleStore.shouldKeepAlive(this))
         executor.shutdownNow()
+        publicConfigPollExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -847,6 +861,13 @@ class AutoTransportService : Service() {
             var lastReality2Rx = 0L
             var lastReality2Tx = 0L
             var lastTrafficAtMs: Long? = null
+            // Own probes/polls (APP-L6): RX they cause is not user activity for the probe cadence.
+            var lastSelfTrafficAtMs = 0L
+            var lastIdleSignalRxAtMs = 0L
+            var previousCycleStartMs = 0L
+            // Non-disruptive resync: sessions older than this are closed only if the route
+            // turns out unhealthy in the same cycle (APP-L7).
+            var pendingResyncSessionCloseBeforeMs = 0L
             var lastOutboundProbeAtMs = 0L
             var lastAwgRuProbeAtMs = 0L
             var lastAwgProbeAtMs = 0L
@@ -901,6 +922,7 @@ class AutoTransportService : Service() {
             val routeCooldownLevel = mutableMapOf<Route, Int>()
             val routeCooldownUntilMs = mutableMapOf<Route, Long>()
             val routeHealthySinceMs = mutableMapOf<Route, Long>()
+            val tcpConsecutiveOkProbes = mutableMapOf<Route, Int>()
             val routeUnhealthySinceMs = mutableMapOf<Route, Long>()
             val routeLastHealthyAtMs = mutableMapOf<Route, Long>()
             val tcpRouteHealthLostEvents = mutableMapOf<Route, ArrayDeque<Long>>()
@@ -1031,6 +1053,14 @@ class AutoTransportService : Service() {
             }
             fun routeDwelled(route: Route, atMs: Long): Boolean {
                 val sinceMs = routeHealthySinceMs[route] ?: 0L
+                if (isTcpRoute(route)) {
+                    return tcpRouteDwelled(
+                        healthySinceMs = sinceMs,
+                        consecutiveOkProbes = tcpConsecutiveOkProbes[route] ?: 0,
+                        nowMs = atMs,
+                        dwellMs = ROUTE_DWELL_MS,
+                    )
+                }
                 return sinceMs > 0L && atMs - sinceMs >= ROUTE_DWELL_MS
             }
             fun resetRecoveredInactiveRouteCooldown(route: Route, healthy: Boolean, atMs: Long) {
@@ -1106,17 +1136,26 @@ class AutoTransportService : Service() {
                 val lastProgressAt = tcpLastTxProgressAtMs[route] ?: 0L
                 return if (lastProgressAt > 0L) atMs - lastProgressAt else Long.MAX_VALUE
             }
-            fun tcpUserSessionStalled(route: Route, atMs: Long): Boolean {
-                val upstreamPort = routePort(route)
-                return router?.hasStalledUserSession(
-                    upstreamPort = upstreamPort,
+            fun tcpStalledUserDestinations(route: Route, atMs: Long): Int =
+                router?.stalledUserSessionDestinations(
+                    upstreamPort = routePort(route),
                     nowMs = atMs,
                     minUpBytes = REALITY_RX_STALL_MIN_TX_BYTES,
                     stallMs = REALITY_RX_STALL_MS,
                     txIdleThresholdMs = REALITY_RX_STALL_TX_IDLE_MS,
                     connectGraceMs = REALITY_CONNECT_GRACE_MS,
+                ) ?: 0
+            fun tcpRecentUserDownlink(route: Route, atMs: Long): Boolean =
+                router?.hasRecentUserDownlinkProgress(
+                    upstreamPort = routePort(route),
+                    nowMs = atMs,
+                    maxAgeMs = REALITY_RX_STALL_MS,
                 ) == true
-            }
+            fun tcpUserSessionStalled(route: Route, atMs: Long): Boolean =
+                tcpUserSessionsIndicateStall(
+                    stalledDestinations = tcpStalledUserDestinations(route, atMs),
+                    hasRecentUserDownlinkProgress = tcpRecentUserDownlink(route, atMs),
+                )
             fun tcpRxStalled(route: Route, currentTx: Long, atMs: Long): Boolean {
                 val upstreamPort = routePort(route)
                 val stalledUserSession = tcpUserSessionStalled(route, atMs)
@@ -1156,13 +1195,15 @@ class AutoTransportService : Service() {
                 )
                 routeHealthySinceMs[route] = 0L
                 routeUnhealthySinceMs[route] = atMs
+                tcpConsecutiveOkProbes[route] = 0
             }
             fun isTcpRouteForcedUnhealthy(route: Route, atMs: Long): Boolean =
                 isTcpRoute(route) && (tcpForcedUnhealthyUntilMs[route] ?: 0L) > atMs
             fun requestAutoFailoverAfterWatchdog(route: Route) {
                 if (requestedMode != TransportChoice.AUTO) {
+                    // For this run only: a watchdog decision is not the user's choice, so the
+                    // stored mode is left as the user set it.
                     requestedMode = TransportChoice.AUTO
-                    TransportLifecycleStore.rememberActiveTransport(applicationContext, TransportChoice.AUTO)
                 }
                 Log.w(LOG_TAG, "route_state rsn=watchdog_auto_failover from=${routeLabel(route)}")
                 telemetryEvent(
@@ -1184,6 +1225,19 @@ class AutoTransportService : Service() {
                 if (!isTcpRoute(route) || cfg?.isComplete() != true || xrayProcess(route)?.isAlive != true) return null
                 val nextAllowedAt = tcpWatchdogRestartAfterMs[route] ?: 0L
                 if (atMs < nextAllowedAt) return null
+                if (route == currentActiveRoute &&
+                    !shouldDemoteActiveTcpRouteAfterStallGuarded(
+                        rxStalled = true,
+                        routeIsActive = true,
+                        hasRecentUserDownlinkProgress = tcpRecentUserDownlink(route, atMs),
+                        stalledDestinations = tcpStalledUserDestinations(route, atMs),
+                    )
+                ) {
+                    // Other sessions of the active route still receive data: one silent
+                    // destination does not make the route stalled.
+                    clearTcpPending(route, currentTx)
+                    return null
+                }
                 if (shouldDemoteActiveTcpRouteAfterStall(rxStalled = true, routeIsActive = route == currentActiveRoute)) {
                     val pendingBytes = tcpPendingBytes(route, currentTx)
                     val pendingAgeMs = tcpPendingAgeMs(route, atMs)
@@ -1263,6 +1317,7 @@ class AutoTransportService : Service() {
             fun isCurrentWorker(): Boolean =
                 workerActive.get() && currentWorkerGeneration.get() == generation
             val workerThread = Thread.currentThread()
+            workerGenerationOfThread.set(generation)
             val clock = checkClock()
             try {
                 if (!isCurrentWorker()) return@execute
@@ -1464,18 +1519,34 @@ class AutoTransportService : Service() {
                     if (xray2Process?.isAlive != true && appliedReality2Uuid.isNotBlank()) {
                         setAppliedReality2Uuid("")
                     }
-                    val pendingNetworkEvent = networkEvent.getAndSet(null)
+                    val pendingNetworkEvent = pendingNetworkEvents.drain()
                     if (pendingNetworkEvent != null) {
+                        val pendingLogText = pendingNetworkEvent.events.joinToString(", ") { it.logText }
                         // A network/lifecycle event opens a new recovery window for the wake lock.
                         unstableSinceMs = 0L
                         if (pendingNetworkEvent.marksTunnelDisruption) {
-                            markTunnelDisruption(nowMs, pendingNetworkEvent.logText)
+                            markTunnelDisruption(nowMs, pendingLogText)
                         } else {
-                            router?.closeSessionsCreatedBefore(nowMs - RESYNC_SESSION_GRACE_MS)
+                            // Sessions are closed only if this cycle confirms the route is
+                            // unhealthy (APP-L7), not on every screen-on/backstop.
+                            pendingResyncSessionCloseBeforeMs = nowMs - RESYNC_SESSION_GRACE_MS
                             lastTrafficAtMs = null
                             stableSinceElapsedRealtimeMs = null
                             lastHealthyRouteAtMs = null
-                            Log.i(LOG_TAG, "${pendingNetworkEvent.logText}, sessions closed")
+                            Log.i(LOG_TAG, "$pendingLogText, revalidating")
+                        }
+                        if (
+                            !pendingNetworkEvent.marksTunnelDisruption &&
+                            NetworkEvent.DEFAULT_AVAILABLE in pendingNetworkEvent.events
+                        ) {
+                            // A (new) default network: re-read its address families (APP-M9).
+                            resetVariantCursorsForNetwork()
+                            if (latestAuth.reality?.isComplete() == true) {
+                                realityConfig = resolveRealityVariantConfig(Route.REALITY, latestAuth.reality)
+                            }
+                            if (latestAuth.reality2?.isComplete() == true) {
+                                reality2Config = resolveRealityVariantConfig(Route.REALITY2, latestAuth.reality2)
+                            }
                         }
                         outboundIp = ""
                         lastOutboundProbeAtMs = 0L
@@ -1485,6 +1556,7 @@ class AutoTransportService : Service() {
                         lastReality2ProbeAtMs = 0L
                         cachedRealityProbe = RealityProbeResult(false)
                         cachedReality2Probe = RealityProbeResult(false)
+                        tcpConsecutiveOkProbes.clear()
                         lastAwgRuEndToEndFailureAtMs = 0L
                         lastAwgEndToEndFailureAtMs = 0L
                         if (pendingNetworkEvent.marksTunnelDisruption) {
@@ -1524,7 +1596,7 @@ class AutoTransportService : Service() {
                             }
                         }
                         telemetryEvent("network_event",
-                            "rsn" to pendingNetworkEvent.logText,
+                            "rsn" to pendingLogText,
                             "route" to routeLabel(activeRoute),
                         )
                     }
@@ -1766,6 +1838,7 @@ class AutoTransportService : Service() {
                     )
                     var awgRuProbe = if (shouldProbeAwgRu) {
                         lastAwgRuProbeAtMs = nowMs
+                        lastSelfTrafficAtMs = nowMs
                         probeAWG(Route.AWG_RU)
                     } else {
                         cachedAwgRuProbe
@@ -1839,6 +1912,7 @@ class AutoTransportService : Service() {
                     )
                     var awgProbe = if (shouldProbeAwg) {
                         lastAwgProbeAtMs = nowMs
+                        lastSelfTrafficAtMs = nowMs
                         probeAWG(Route.AWG)
                     } else {
                         cachedAwgProbe
@@ -1939,12 +2013,14 @@ class AutoTransportService : Service() {
                         lastReality2Rx = currentReality2Rx
                         lastReality2Tx = currentReality2Tx
                     }
-                    if (xrayStarted && shouldProbeReality(
+                    // Inactive TCP routes are kept warm (APP-H2): probed often while the active route
+                    // is unhealthy, so they stay healthy long enough to complete their dwell.
+                    val activeRouteHealthyForStandby = routeHealthObserved && lastRouteHealthy
+                    if (xrayStarted && shouldProbeTcpRoute(
                             nowMs = nowMs,
                             lastProbeAtMs = lastRealityProbeAtMs,
-                            activeRoute = activeRoute,
-                            route = Route.REALITY,
-                            localRxFresh = isRecent(nowMs, lastRealityRxProgressAtMs, REALITY_LOCAL_RX_FRESH_MS),
+                            routeIsActive = activeRoute == Route.REALITY,
+                            activeRouteHealthy = activeRouteHealthyForStandby,
                         )
                     ) {
                         cachedRealityProbe = prepareXrayRoute(
@@ -1953,24 +2029,27 @@ class AutoTransportService : Service() {
                             atMs = nowMs,
                         )
                         lastRealityProbeAtMs = nowMs
+                        lastSelfTrafficAtMs = nowMs
+                        val realityProbeOk = cachedRealityProbe.healthy &&
+                            routeReadyForTraffic(Route.REALITY, XRAY_READY_PROBE_MAX_AGE_MS, nowMs)
+                        tcpConsecutiveOkProbes[Route.REALITY] =
+                            if (realityProbeOk) (tcpConsecutiveOkProbes[Route.REALITY] ?: 0) + 1 else 0
                         // A moved cursor changes the desired config; the next iteration restarts
                         // the sidecar through shouldRestartRealityForConfig.
                         onRealityVariantProbe(
                             route = Route.REALITY,
-                            healthy = cachedRealityProbe.healthy &&
-                                routeReadyForTraffic(Route.REALITY, XRAY_READY_PROBE_MAX_AGE_MS, nowMs),
+                            healthy = realityProbeOk,
                             atMs = nowMs,
                             reason = "probe_failed",
                         )
                     }
                     val realityProbe = if (xrayStarted) cachedRealityProbe else RealityProbeResult(false)
                     val realityRxStalled = tcpRxStalled(Route.REALITY, currentRealityTx, nowMs)
-                    if (xray2Started && shouldProbeReality(
+                    if (xray2Started && shouldProbeTcpRoute(
                             nowMs = nowMs,
                             lastProbeAtMs = lastReality2ProbeAtMs,
-                            activeRoute = activeRoute,
-                            route = Route.REALITY2,
-                            localRxFresh = isRecent(nowMs, lastReality2RxProgressAtMs, REALITY_LOCAL_RX_FRESH_MS),
+                            routeIsActive = activeRoute == Route.REALITY2,
+                            activeRouteHealthy = activeRouteHealthyForStandby,
                         )
                     ) {
                         cachedReality2Probe = prepareXrayRoute(
@@ -1979,10 +2058,14 @@ class AutoTransportService : Service() {
                             atMs = nowMs,
                         )
                         lastReality2ProbeAtMs = nowMs
+                        lastSelfTrafficAtMs = nowMs
+                        val reality2ProbeOk = cachedReality2Probe.healthy &&
+                            routeReadyForTraffic(Route.REALITY2, XRAY_READY_PROBE_MAX_AGE_MS, nowMs)
+                        tcpConsecutiveOkProbes[Route.REALITY2] =
+                            if (reality2ProbeOk) (tcpConsecutiveOkProbes[Route.REALITY2] ?: 0) + 1 else 0
                         onRealityVariantProbe(
                             route = Route.REALITY2,
-                            healthy = cachedReality2Probe.healthy &&
-                                routeReadyForTraffic(Route.REALITY2, XRAY_READY_PROBE_MAX_AGE_MS, nowMs),
+                            healthy = reality2ProbeOk,
                             atMs = nowMs,
                             reason = "probe_failed",
                         )
@@ -2123,6 +2206,7 @@ class AutoTransportService : Service() {
                             )
                     ) {
                         lastOutboundProbeAtMs = nowMs
+                        lastSelfTrafficAtMs = nowMs
                         val outboundTimeoutMs = if (activeAwgRxStalled) {
                             ACTIVE_AWG_STALL_OUTBOUND_TIMEOUT_MS
                         } else {
@@ -2512,6 +2596,13 @@ class AutoTransportService : Service() {
                         reality2Healthy = reality2Healthy,
                         outboundIp = outboundIp,
                     )
+                    if (pendingResyncSessionCloseBeforeMs > 0L) {
+                        if (!activeRouteHealthyNow) {
+                            val closed = router?.closeSessionsCreatedBefore(pendingResyncSessionCloseBeforeMs) ?: 0
+                            Log.i(LOG_TAG, "resync confirmed unhealthy route, sessions closed=$closed")
+                        }
+                        pendingResyncSessionCloseBeforeMs = 0L
+                    }
                     var activeRouteDemoted = false
                     if (routeHealthObserved && lastRouteHealthy && !activeRouteHealthyNow) {
                         recordTcpRouteHealthLost(activeRoute, nowMs)
@@ -2893,12 +2984,11 @@ class AutoTransportService : Service() {
                         )
                         nextTelemetryHeartbeatAtMs = nowMs + telemetryHeartbeatDelay(stable)
                     }
-                    if (
-                        DeploymentConfig.IS_PUBLIC_PLATFORM &&
-                        stable &&
-                        nowMs >= nextPublicConfigPollAtMs
-                    ) {
-                        val pollResult = pollPublicPlatformConfig()
+                    // The network part of the poll runs on its own thread (APP-M10); only the
+                    // verified result is applied here.
+                    val fetchedConfig = takeFinishedPublicConfigFetch()
+                    if (fetchedConfig != null) {
+                        val pollResult = applyFetchedPublicConfig(fetchedConfig)
                         if (pollResult.applied) {
                             telemetryEvent("public_config_update",
                                 "seq" to pollResult.seq,
@@ -2909,14 +2999,32 @@ class AutoTransportService : Service() {
                         } else if (pollResult.error.isNotBlank()) {
                             Log.w(LOG_TAG, "public config poll failed: ${pollResult.error}")
                         }
+                    }
+                    if (
+                        DeploymentConfig.IS_PUBLIC_PLATFORM &&
+                        stable &&
+                        nowMs >= nextPublicConfigPollAtMs &&
+                        startPublicConfigFetch()
+                    ) {
+                        lastSelfTrafficAtMs = nowMs
                         nextPublicConfigPollAtMs = nowMs + PUBLIC_CONFIG_POLL_INTERVAL_MS
                     }
-                    val lastTunnelRxProgressAtMs = maxOf(
+                    val lastRawTunnelRxProgressAtMs = maxOf(
                         lastAwgRuRxProgressAtMs,
                         lastAwgRxProgressAtMs,
                         lastRealityRxProgressAtMs,
                         lastReality2RxProgressAtMs,
                     )
+                    lastIdleSignalRxAtMs = idleSignalRxAtMs(
+                        previousMs = lastIdleSignalRxAtMs,
+                        nowMs = nowMs,
+                        rxAdvanced = lastRawTunnelRxProgressAtMs == nowMs,
+                        // Probes of the previous cycle (REALITY) show up in this cycle's counters.
+                        selfTrafficInCycle = lastSelfTrafficAtMs > 0L && lastSelfTrafficAtMs >= previousCycleStartMs,
+                        userTrafficAtMs = router?.lastUserTrafficAtMs() ?: 0L,
+                    )
+                    previousCycleStartMs = nowMs
+                    val lastTunnelRxProgressAtMs = lastIdleSignalRxAtMs
                     val interactive = screenInteractive
                     screenOffStableCycles = if (stable && !interactive) screenOffStableCycles else 0
                     val sleepMs = probeLoopSleepMs(
@@ -2928,6 +3036,7 @@ class AutoTransportService : Service() {
                         screenOffStableCycles = screenOffStableCycles,
                     )
                     if (stable && !interactive) screenOffStableCycles++
+                    routeHealthSnapshot.getAndUpdate { it?.copy(plannedSleepMs = sleepMs) }
                     reconnectBackoffMs = if (stable) {
                         RECONNECT_MIN_BACKOFF_MS
                     } else {
@@ -3019,6 +3128,11 @@ class AutoTransportService : Service() {
                     }
                 }
                 runningWorkerThread.compareAndSet(workerThread, null)
+                workerGenerationOfThread.remove()
+                if (latestWorker) {
+                    // A stopped worker must not leave a "carrying" state behind (APP-L9).
+                    latestCarryingState.set(null)
+                }
                 if (rekeyAfterStop) {
                     recoverStoredTransportKeys(applicationContext)
                 }
@@ -3026,7 +3140,7 @@ class AutoTransportService : Service() {
                     releaseWakeLock()
                     if (TransportLifecycleStore.shouldKeepAlive(applicationContext)) {
                         scheduleBackstop()
-                        if (networkEvent.get() != null) {
+                        if (pendingNetworkEvents.isPending()) {
                             reviveWorkerAfterNetworkAvailable("pending lifecycle event")
                         }
                     }
@@ -3223,6 +3337,16 @@ class AutoTransportService : Service() {
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
                 // Signal/validation churn is not a transport break; keep sessions alive.
             }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                // Address families of the default network are known only once its link
+                // properties arrive (often after onAvailable): re-sort variants when they change.
+                if (defaultNetwork.get() != network) return
+                val families = networkIpFamiliesOf(linkProperties)
+                if (families != networkIpFamilies && workerActive.get()) {
+                    requestLifecycleResync(NetworkEvent.DEFAULT_AVAILABLE)
+                }
+            }
         }
         runCatching {
             val connectivity = getSystemService(ConnectivityManager::class.java)
@@ -3240,7 +3364,7 @@ class AutoTransportService : Service() {
             getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(callback)
         }
         defaultNetwork.set(null)
-        networkEvent.set(null)
+        pendingNetworkEvents.clear()
         networkCallback = null
     }
 
@@ -3288,6 +3412,13 @@ class AutoTransportService : Service() {
             Telemetry.flush(applicationContext)
         }
         telemetryEvent("network_event", "rsn" to event.logText)
+        if (!workerActive.get() && TransportLifecycleStore.shouldKeepAlive(applicationContext)) {
+            // The worker died (APP-M7): any lifecycle event revives it instead of only moving
+            // the backstop alarm.
+            scheduleBackstop()
+            reviveWorkerAfterNetworkAvailable("lifecycle ${event.logText}")
+            return
+        }
         if (
             (event == NetworkEvent.FOREGROUND_RESYNC ||
                 event == NetworkEvent.SCREEN_ON ||
@@ -3301,9 +3432,8 @@ class AutoTransportService : Service() {
             scheduleBackstop()
             return
         }
-        networkEvent.set(event)
+        pendingNetworkEvents.add(event)
         if (!event.marksTunnelDisruption) {
-            router?.closeSessionsCreatedBefore(nowMs - RESYNC_SESSION_GRACE_MS)
             mainHandler.post {
                 val current = TransportRuntime.state
                 if (current.socksListen == ROUTER_SOCKS) {
@@ -3357,7 +3487,7 @@ class AutoTransportService : Service() {
     }
 
     private fun shouldKeepForegroundResyncNonDestructive(nowMs: Long): Boolean {
-        if (!workerActive.get() || router == null || networkEvent.get() != null) return false
+        if (!workerActive.get() || router == null || pendingNetworkEvents.isPending()) return false
         val snapshot = routeHealthSnapshot.get() ?: return false
         val snapshotAgeMs = nowMs - snapshot.observedAtMs
         val trafficAgeMs = snapshot.lastTrafficAtMs?.let { nowMs - it } ?: Long.MAX_VALUE
@@ -3366,6 +3496,7 @@ class AutoTransportService : Service() {
             stableSinceElapsedRealtimeMs = snapshot.stableSinceElapsedRealtimeMs,
             snapshotAgeMs = snapshotAgeMs,
             trafficAgeMs = trafficAgeMs,
+            plannedSleepMs = snapshot.plannedSleepMs,
         )
     }
 
@@ -3448,8 +3579,11 @@ class AutoTransportService : Service() {
     private fun restorePublicPlatformRuntimeForService() {
         if (!DeploymentConfig.IS_PUBLIC_PLATFORM) return
         if (TransportRuntime.publicPlatformRouteSlots.routePriorities.isNotEmpty()) return
-        val store = SecureIdentityStore(applicationContext)
-        val stored = store.readPublicPlatformState()
+        // A transient Keystore failure must not kill the worker (APP-M7).
+        val stored = readPublicPlatformStateWithRetry() ?: run {
+            Log.w(LOG_TAG, "public platform runtime restore skipped: state unavailable")
+            return
+        }
         if (
             stored.clientBundleJson.isBlank() ||
             stored.configPubkeyPin.isBlank() ||
@@ -3516,15 +3650,45 @@ class AutoTransportService : Service() {
         val error: String = "",
     )
 
-    private fun pollPublicPlatformConfig(): PublicConfigPollResult {
-        val store = SecureIdentityStore(applicationContext)
-        val stored = store.readPublicPlatformState()
+    /** Result of the network part of a config poll (computed off the worker thread). */
+    private data class PublicConfigFetch(
+        val stored: StoredPublicPlatformState? = null,
+        val config: PublicClientConfig? = null,
+        val configJson: String = "",
+        val bundleJson: String = "",
+        val result: PublicConfigPollResult = PublicConfigPollResult(),
+    )
+
+    /** Starts a poll unless one is in flight; returns true when a poll was started. */
+    private fun startPublicConfigFetch(): Boolean {
+        val running = publicConfigFetch.get()
+        if (running != null && !running.isDone) return false
+        return try {
+            publicConfigFetch.set(publicConfigPollExecutor.submit(java.util.concurrent.Callable { fetchPublicPlatformConfig() }))
+            true
+        } catch (_: RejectedExecutionException) {
+            false
+        }
+    }
+
+    /** The finished poll, if any (never blocks). */
+    private fun takeFinishedPublicConfigFetch(): PublicConfigFetch? {
+        val future = publicConfigFetch.get() ?: return null
+        if (!future.isDone || !publicConfigFetch.compareAndSet(future, null)) return null
+        return runCatching { future.get() }.getOrElse { error ->
+            PublicConfigFetch(result = PublicConfigPollResult(error = Telemetry.safeErrorMessage(error)))
+        }
+    }
+
+    private fun fetchPublicPlatformConfig(): PublicConfigFetch {
+        val stored = readPublicPlatformStateWithRetry()
+            ?: return PublicConfigFetch(result = PublicConfigPollResult(error = "public state is unavailable"))
         if (stored.configPubkeyPin.isBlank() || stored.deviceID.isBlank()) {
-            return PublicConfigPollResult(error = "public state is incomplete")
+            return PublicConfigFetch(result = PublicConfigPollResult(error = "public state is incomplete"))
         }
         val urls = publicConfigBaseUrls()
         if (urls.isEmpty()) {
-            return PublicConfigPollResult(error = "no public config urls")
+            return PublicConfigFetch(result = PublicConfigPollResult(error = "no public config urls"))
         }
         var lastError = ""
         for (baseUrl in urls) {
@@ -3541,34 +3705,72 @@ class AutoTransportService : Service() {
                     maxSeenSeq = stored.maxSeenConfigSeq,
                 )
                 if (config.seq <= stored.maxSeenConfigSeq) {
-                    return PublicConfigPollResult(applied = false, seq = config.seq)
+                    return PublicConfigFetch(result = PublicConfigPollResult(applied = false, seq = config.seq))
                 }
-                val bundleJson = envelope.toString()
-                fun withConfig(base: StoredPublicPlatformState): StoredPublicPlatformState =
-                    base.copy(
-                        maxSeenConfigSeq = config.seq,
-                        updatePubkeyPin = config.updatePubkey.ifBlank { base.updatePubkeyPin },
-                        clientConfigJson = configJson,
-                        clientBundleJson = bundleJson,
-                    )
-                applyPublicPlatformRuntime(withConfig(stored), config)
-                // Atomic read-modify-write: enrollment/re-auth may have updated other fields of the
-                // state while the config was being fetched; never overwrite them with the stale copy.
-                store.updatePublicPlatformState { current ->
-                    if (config.seq <= current.maxSeenConfigSeq) current else withConfig(current)
-                }
-                Log.i(LOG_TAG, "public config hot-applied seq=${config.seq}")
-                return PublicConfigPollResult(applied = true, seq = config.seq)
+                return PublicConfigFetch(
+                    stored = stored,
+                    config = config,
+                    configJson = configJson,
+                    bundleJson = envelope.toString(),
+                )
             } catch (error: Throwable) {
                 val message = Telemetry.safeErrorMessage(error)
                 if (isDeviceNotApprovedMessage(message)) {
                     markPublicDeviceReauthRequired(applicationContext, "config-poll")
-                    return PublicConfigPollResult(error = message)
+                    return PublicConfigFetch(result = PublicConfigPollResult(error = message))
                 }
                 lastError = "${baseUrl}: $message"
             }
         }
-        return PublicConfigPollResult(error = lastError)
+        return PublicConfigFetch(result = PublicConfigPollResult(error = lastError))
+    }
+
+    /** Applies a verified config on the worker thread. */
+    private fun applyFetchedPublicConfig(fetch: PublicConfigFetch): PublicConfigPollResult {
+        val stored = fetch.stored ?: return fetch.result
+        val config = fetch.config ?: return fetch.result
+        return try {
+            fun withConfig(base: StoredPublicPlatformState): StoredPublicPlatformState =
+                base.copy(
+                    maxSeenConfigSeq = config.seq,
+                    updatePubkeyPin = config.updatePubkey.ifBlank { base.updatePubkeyPin },
+                    clientConfigJson = fetch.configJson,
+                    clientBundleJson = fetch.bundleJson,
+                )
+            applyPublicPlatformRuntime(withConfig(stored), config)
+            // Atomic read-modify-write: enrollment/re-auth may have updated other fields of the
+            // state while the config was being fetched; never overwrite them with the stale copy.
+            SecureIdentityStore(applicationContext).updatePublicPlatformState { current ->
+                if (config.seq <= current.maxSeenConfigSeq) current else withConfig(current)
+            }
+            Log.i(LOG_TAG, "public config hot-applied seq=${config.seq}")
+            PublicConfigPollResult(applied = true, seq = config.seq)
+        } catch (error: Throwable) {
+            PublicConfigPollResult(error = Telemetry.safeErrorMessage(error))
+        }
+    }
+
+    /** Keystore-backed read with a short retry; null when the state stays unavailable. */
+    private fun readPublicPlatformStateWithRetry(): StoredPublicPlatformState? {
+        repeat(KEYSTORE_READ_ATTEMPTS) { attempt ->
+            try {
+                return SecureIdentityStore(applicationContext).readPublicPlatformState()
+            } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            } catch (error: Exception) {
+                Log.w(LOG_TAG, "public platform state read failed (attempt ${attempt + 1}): ${error.javaClass.simpleName}")
+                if (attempt + 1 < KEYSTORE_READ_ATTEMPTS) {
+                    try {
+                        Thread.sleep(KEYSTORE_READ_RETRY_DELAY_MS * (attempt + 1))
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return null
+                    }
+                }
+            }
+        }
+        return null
     }
 
     private fun publicConfigBaseUrls(): List<String> {
@@ -3590,8 +3792,16 @@ class AutoTransportService : Service() {
         val port = if (uri.port > 0) uri.port else 80
         val rawPath = uri.rawPath?.ifBlank { "/" } ?: "/"
         val query = uri.rawQuery?.let { "?$it" }.orEmpty()
+        selfTrafficDestinations += "$host:$port"
         openRouterSocks5Socket(host, port, PUBLIC_CONFIG_POLL_TIMEOUT_MS.toInt()).use { socket ->
             socket.soTimeout = PUBLIC_CONFIG_POLL_TIMEOUT_MS.toInt()
+            // One deadline for the whole exchange: a peer that drips bytes cannot hold the poll.
+            val killer = pollDeadlineScheduler.schedule(
+                { runCatching { socket.close() } },
+                PUBLIC_CONFIG_FETCH_DEADLINE_MS,
+                TimeUnit.MILLISECONDS,
+            )
+            try {
             val request = buildString {
                 append("GET ")
                 append(rawPath)
@@ -3606,11 +3816,14 @@ class AutoTransportService : Service() {
             val input = java.io.BufferedInputStream(socket.getInputStream(), INTERNAL_HTTP_READ_BUFFER_BYTES)
             val header = readInternalHttpHeader(input)
             val status = header.lineSequence().firstOrNull().orEmpty()
-            val body = input.readBytes().toString(Charsets.UTF_8)
+            val body = readBodyWithLimit(input, PUBLIC_CONFIG_MAX_BODY_BYTES).toString(Charsets.UTF_8)
             if (!status.contains(" 200 ")) {
                 error("config http status: $status ${body.take(PUBLIC_CONFIG_ERROR_BODY_CHARS)}")
             }
             return body
+            } finally {
+                killer.cancel(false)
+            }
         }
     }
 
@@ -3671,27 +3884,26 @@ class AutoTransportService : Service() {
             val connectivity = getSystemService(ConnectivityManager::class.java)
             val network = defaultNetwork.get() ?: connectivity.activeNetwork
             val props = network?.let { connectivity.getLinkProperties(it) }
-            if (props == null) {
-                NetworkIpFamilies.DEFAULT
-            } else {
-                networkIpFamiliesOf(
-                    linkAddresses = props.linkAddresses.map { it.address },
-                    defaultRouteFamilies = props.routes
-                        .filter { it.isDefaultRoute }
-                        .mapNotNull { route ->
-                            when (route.destination?.address) {
-                                is java.net.Inet6Address -> IpFamily.V6
-                                is java.net.Inet4Address -> IpFamily.V4
-                                else -> null
-                            }
-                        }
-                        .toSet(),
-                )
-            }
+            if (props == null) NetworkIpFamilies.DEFAULT else networkIpFamiliesOf(props)
         }.getOrDefault(NetworkIpFamilies.DEFAULT)
         networkIpFamilies = families
         return families
     }
+
+    private fun networkIpFamiliesOf(props: LinkProperties): NetworkIpFamilies =
+        networkIpFamiliesOf(
+            linkAddresses = props.linkAddresses.map { it.address },
+            defaultRouteFamilies = props.routes
+                .filter { it.isDefaultRoute }
+                .mapNotNull { route ->
+                    when (route.destination?.address) {
+                        is java.net.Inet6Address -> IpFamily.V6
+                        is java.net.Inet4Address -> IpFamily.V4
+                        else -> null
+                    }
+                }
+                .toSet(),
+        )
 
     private fun realityVariantsFor(route: Route): List<RealityRouteVariant> {
         val slots = TransportRuntime.publicPlatformRouteSlots
@@ -3900,6 +4112,7 @@ class AutoTransportService : Service() {
             } else {
                 generation = beginRouteStart(route, forceRestart)
             }
+            refreshActiveUpstreamGeneration(route, generation)
             val xray = File(applicationInfo.nativeLibraryDir, XRAY_LIB_NAME)
             if (!xray.canExecute()) {
                 markRouteProcessStarted(route, generation, started = false, failure = "xray_not_executable")
@@ -4010,6 +4223,25 @@ class AutoTransportService : Service() {
 
     private fun routeGeneration(route: Route): Long =
         routeRuntime(route).generation
+
+    /**
+     * New sessions of a restarted active sidecar carry its new generation, so a later route
+     * switch closes the sessions of the old process too (APP-L11).
+     */
+    private fun refreshActiveUpstreamGeneration(route: Route, generation: Long) {
+        if (!route.isTcpSidecarRoute()) return
+        val port = routePort(route)
+        upstreamRef.updateAndGet { current ->
+            current.withGeneration(
+                activeUpstreamGenerationAfterRestart(
+                    activePort = current.port,
+                    activeGeneration = current.generation,
+                    restartedPort = port,
+                    restartedGeneration = generation,
+                ),
+            )
+        }
+    }
 
     private fun beginRouteStart(route: Route, forceRestart: Boolean): Long {
         if (!route.isTcpSidecarRoute()) return 0L
@@ -4574,33 +4806,30 @@ class AutoTransportService : Service() {
             return
         }
         val appContext = applicationContext
+        // The whole check-start-install sequence runs under resourceLock (APP-L10): two callers
+        // can no longer both bind, and a failure never clears a proxy another caller installed.
+        var started: LocalHttpProxy? = null
         runCatching {
-            LocalHttpProxy(
-                host = LOCAL_HTTP_PROXY_HOST,
-                port = LOCAL_HTTP_PROXY_PORT,
-                socksHost = ROUTER_HOST,
-                socksPort = ROUTER_PORT,
-                authPolicy = { LocalSocksAuth.proxyAuthPolicy(appContext) },
-                upstreamCredentials = { LocalSocksAuth.internal },
-            ).also { proxy ->
+            synchronized(resourceLock) {
+                if (httpProxy?.isRunning == true || !workerActive.get()) return@synchronized
+                val proxy = LocalHttpProxy(
+                    host = LOCAL_HTTP_PROXY_HOST,
+                    port = LOCAL_HTTP_PROXY_PORT,
+                    socksHost = ROUTER_HOST,
+                    socksPort = ROUTER_PORT,
+                    authPolicy = { LocalSocksAuth.proxyAuthPolicy(appContext) },
+                    upstreamCredentials = { LocalSocksAuth.internal },
+                )
+                started = proxy
                 proxy.start()
-                val accepted = synchronized(resourceLock) {
-                    if (workerActive.get() && httpProxy == null) {
-                        httpProxy = proxy
-                        true
-                    } else {
-                        false
-                    }
-                }
-                if (!accepted) {
-                    proxy.closeListener()
-                    runLifecycleTask("http_proxy_discard") { proxy.stop() }
-                }
+                httpProxy = proxy
             }
         }.onSuccess {
-            Log.i(LOG_TAG, "local HTTP proxy listening on $LOCAL_HTTP_PROXY_LISTEN")
+            if (started != null) Log.i(LOG_TAG, "local HTTP proxy listening on $LOCAL_HTTP_PROXY_LISTEN")
         }.onFailure { error ->
-            httpProxy = null
+            synchronized(resourceLock) {
+                if (httpProxy === started) httpProxy = null
+            }
             Log.w(LOG_TAG, "local HTTP proxy start failed: ${error.message}")
             telemetryEvent(
                 "http_proxy",
@@ -4673,23 +4902,6 @@ class AutoTransportService : Service() {
             interval = (interval * 2).coerceAtMost(AWG_RETRY_MAX_INTERVAL_MS)
         }
         return interval
-    }
-
-    private fun shouldProbeReality(
-        nowMs: Long,
-        lastProbeAtMs: Long,
-        activeRoute: Route,
-        route: Route,
-        localRxFresh: Boolean,
-    ): Boolean {
-        if (lastProbeAtMs == 0L) return true
-        val interval = if (activeRoute == route) {
-            PROBE_INTERVAL_MS
-        } else {
-            REALITY_INACTIVE_PROBE_INTERVAL_MS
-        }
-        if (activeRoute != route && !localRxFresh) return false
-        return nowMs - lastProbeAtMs >= interval
     }
 
     private fun routePriority(route: Route): Int {
@@ -5100,13 +5312,21 @@ class AutoTransportService : Service() {
         }
 
     private fun publishState(state: TransportUiState, updateVpnRoute: Boolean = true) {
+        // States computed by a worker are dropped once that worker is no longer current (stopAuto
+        // may already have published "idle"); states from other threads always apply.
+        val publishGeneration = workerGenerationOfThread.get()
+        fun stillCurrent(): Boolean =
+            shouldPublishWorkerState(publishGeneration, currentWorkerGeneration.get(), workerActive.get())
+        if (!stillCurrent()) return
         val enriched = withVpnState(withHttpProxyState(state))
         if (updateVpnRoute) {
             setVpnBridgeUdpRoute(routeForVpnUdp(enriched))
         }
         latestCarryingState.set(enriched.takeIf { it.carryingTransport.isNotBlank() || it.handshakeEstablished })
         mainHandler.post {
-            TransportRuntime.state = enriched
+            if (stillCurrent()) {
+                TransportRuntime.state = enriched
+            }
         }
     }
 
@@ -5460,6 +5680,8 @@ class AutoTransportService : Service() {
         val routeHealthy: Boolean,
         val lastTrafficAtMs: Long?,
         val stableSinceElapsedRealtimeMs: Long?,
+        /** Sleep the worker planned after this snapshot: a longer sleep does not make it stale. */
+        val plannedSleepMs: Long = 0L,
     )
 
     private class SocksRouter(
@@ -5608,6 +5830,36 @@ class AutoTransportService : Service() {
                 !tracked.isHealthProbe && lastRx > 0L && nowMs - lastRx in 0..maxAgeMs
             }
 
+        /** Number of distinct destinations with a stalled user session on [upstreamPort]. */
+        fun stalledUserSessionDestinations(
+            upstreamPort: Int,
+            nowMs: Long,
+            minUpBytes: Long,
+            stallMs: Long,
+            txIdleThresholdMs: Long,
+            connectGraceMs: Long,
+        ): Int =
+            trackedSessionsFor(upstreamPort)
+                .filter { tracked ->
+                    shouldTreatTcpUserSessionAsStalled(
+                        createdAtMs = tracked.createdAtMs,
+                        upBytes = tracked.upBytes.get(),
+                        downBytes = tracked.downBytes.get(),
+                        lastUplinkProgressAtMs = tracked.lastUplinkProgressAtMs.get(),
+                        nowMs = nowMs,
+                        isHealthProbe = tracked.isHealthProbe,
+                        minUpBytes = minUpBytes,
+                        stallMs = stallMs,
+                        txIdleThresholdMs = txIdleThresholdMs,
+                        connectGraceMs = connectGraceMs,
+                    )
+                }
+                .map { it.destination }
+                .toSet()
+                .size
+
+        fun lastUserTrafficAtMs(): Long = lastUserTrafficAtMs.get()
+
         fun hasStalledUserSession(
             upstreamPort: Int,
             nowMs: Long,
@@ -5689,7 +5941,9 @@ class AutoTransportService : Service() {
                     val selected = upstreamProvider()
                     tracked.upstreamPort = selected.port
                     tracked.upstreamGeneration = selected.generation
-                    tracked.isHealthProbe = isHealthProbeDestination(request.destination, OUTBOUND_URL)
+                    tracked.destination = request.destination
+                    tracked.isHealthProbe = isHealthProbeDestination(request.destination, OUTBOUND_URL) ||
+                        isSelfTrafficDestination(request.destination)
                     val counters = countersFor(selected, request.destination)
                     if (BuildConfig.DEBUG) {
                         Log.d(
@@ -6050,13 +6304,26 @@ class AutoTransportService : Service() {
         private val EXPECTED_REALITY2_IP: String get() = DEFAULT_REALITY2_EGRESS_IP
         private val OUTBOUND_URL: String get() = DeploymentConfig.OUTBOUND_URL.ifBlank { "https://api.ipify.org" }
 
-        private const val REALITY_INACTIVE_PROBE_INTERVAL_MS = 75_000L
-        private const val REALITY_LOCAL_RX_FRESH_MS = 30_000L
         private const val LOCAL_TCP_PROBE_TIMEOUT_MS = 300
         private const val PUBLIC_CONFIG_POLL_INITIAL_DELAY_MS = 5_000L
         private const val PUBLIC_CONFIG_POLL_INTERVAL_MS = 20_000L
         private const val PUBLIC_CONFIG_POLL_TIMEOUT_MS = 7_000L
         private const val PUBLIC_CONFIG_ERROR_BODY_CHARS = 256
+        private const val PUBLIC_CONFIG_MAX_BODY_BYTES = 256 * 1024
+        private const val PUBLIC_CONFIG_FETCH_DEADLINE_MS = 20_000L
+        private const val KEYSTORE_READ_ATTEMPTS = 3
+        private const val KEYSTORE_READ_RETRY_DELAY_MS = 200L
+        private val pollDeadlineScheduler = Executors.newSingleThreadScheduledExecutor { task ->
+            Thread(task, "tw-config-deadline").apply { isDaemon = true }
+        }
+        private val backstopScheduledAtMs = AtomicLong(0L)
+
+        /** host:port the service itself polls through the router: not user traffic (APP-L6). */
+        private val selfTrafficDestinations: MutableSet<String> =
+            java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+        private fun isSelfTrafficDestination(destination: String): Boolean =
+            destination in selfTrafficDestinations
         private const val PUBLIC_HTTP_HEADER_LIMIT_BYTES = 64 * 1024
         private const val PUBLIC_CONFIG_DEFAULT_BASE_URL = "http://awg-gw:8080/tw"
         // Android deep Doze throttles exact allow-while-idle alarms to roughly
@@ -6159,7 +6426,11 @@ class AutoTransportService : Service() {
         fun scheduleBackstopAlarm(context: Context) {
             val appContext = context.applicationContext
             if (!TransportLifecycleStore.shouldKeepAlive(appContext)) return
-            val triggerAt = SystemClock.elapsedRealtime() + BACKSTOP_INTERVAL_MS
+            val nowMs = SystemClock.elapsedRealtime()
+            // Resyncs and screen-on events must not keep moving a pending alarm forward (APP-M7).
+            if (shouldKeepScheduledBackstop(backstopScheduledAtMs.get(), nowMs, BACKSTOP_INTERVAL_MS)) return
+            val triggerAt = nowMs + BACKSTOP_INTERVAL_MS
+            backstopScheduledAtMs.set(triggerAt)
             val alarmManager = appContext.getSystemService(AlarmManager::class.java) ?: return
             val pendingIntent = backstopPendingIntent(appContext)
             // SCHEDULE_EXACT_ALARM is user-revocable (and denied by default on Android 14+):
@@ -6202,6 +6473,7 @@ class AutoTransportService : Service() {
 
         fun cancelBackstopAlarm(context: Context) {
             val appContext = context.applicationContext
+            backstopScheduledAtMs.set(0L)
             appContext.getSystemService(AlarmManager::class.java)
                 .cancel(backstopPendingIntent(appContext))
         }
