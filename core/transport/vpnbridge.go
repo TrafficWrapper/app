@@ -41,7 +41,11 @@ const (
 	vpnBridgeTCPIdleTO       = 3 * time.Minute
 	vpnBridgeUDPIdleTO       = 3 * time.Minute
 	vpnBridgeDNSQueryTO      = 5 * time.Second
-	vpnBridgeDNSIdleTO       = 10 * time.Second
+	vpnBridgeDNSIdleTO       = 1 * time.Second
+	vpnBridgeDNSDoHHeadStart = 1 * time.Second
+	vpnBridgeMaxDNSFlows     = 64
+	vpnBridgeDNSQueryBufLen  = 4096
+	vpnBridgeDNSMaxPending   = 4096
 	vpnBridgeDNSCacheMaxTTL  = 30 * time.Minute
 	vpnBridgeDNSStaleTTL     = 5 * time.Minute
 	vpnBridgeDNSStaleServe   = 30 // seconds advertised for stale answers
@@ -54,7 +58,10 @@ const (
 	vpnBridgeTCPForwarderWnd = 1 << 20
 	vpnBridgeMaxInFlight     = 1024
 	vpnBridgeMaxUDPSessions  = 128
-	vpnBridgeUDPBufLen       = 64 * 1024
+
+	vpnBridgeDNSBreakerThreshold = 3
+	vpnBridgeDNSBreakerCooldown  = 30 * time.Second
+	vpnBridgeUDPBufLen           = 64 * 1024
 
 	vpnBridgeSOCKSVersion      = byte(0x05)
 	vpnBridgeSOCKSConnect      = byte(0x01)
@@ -82,6 +89,9 @@ type vpnBridgeInstance struct {
 	linkEP   stack.LinkEndpoint
 	tunFile  *os.File
 	tunDupFD int
+	// dnsAddr is the IPv4 resolver ("ip:53") queried through the tunnel UDP
+	// route (SetVpnBridgeUDPRoute). It is not used when no UDP route is
+	// set: DNS then goes to DoH through the SOCKS router.
 	dnsAddr  string
 	mtu      int
 	started  time.Time
@@ -92,11 +102,15 @@ type vpnBridgeInstance struct {
 	dnsCache vpnBridgeDNSCache
 	dnsSem   chan struct{}
 	dnsMux   vpnBridgeDNSMux
-	doh      *http.Client
-	udpMu    sync.Mutex
-	udpSess  map[*vpnBridgeUDPSession]struct{}
-	wg       sync.WaitGroup
-	stats    vpnBridgeStats
+	// dnsBreaker skips a UDP DNS route that keeps failing.
+	dnsBreaker vpnBridgeDNSBreaker
+	dnsFlowMu  sync.Mutex
+	dnsFlows   map[*vpnBridgeDNSFlow]struct{}
+	doh        *http.Client
+	udpMu      sync.Mutex
+	udpSess    map[*vpnBridgeUDPSession]struct{}
+	wg         sync.WaitGroup
+	stats      vpnBridgeStats
 }
 
 var vpnBridgeUDPBuffers = sync.Pool{
@@ -115,6 +129,12 @@ type vpnBridgeStats struct {
 	dnsFailures    atomic.Uint64
 	dnsBytesUp     atomic.Uint64
 	dnsBytesDown   atomic.Uint64
+	dnsDropped     atomic.Uint64
+	dnsEvicted     atomic.Uint64
+	dnsStaleServed atomic.Uint64
+	dnsDoHFallback atomic.Uint64
+	dnsBreakerTrip atomic.Uint64
+	dnsMismatched  atomic.Uint64
 	udpSessions    atomic.Uint64
 	udpFailures    atomic.Uint64
 	udpBytesUp     atomic.Uint64
@@ -132,6 +152,8 @@ type vpnBridgeResult struct {
 
 // StartVpnBridge starts the system-TUN bridge used by the optional Android VPN
 // mode. TCP and DNS are proxied through the existing front SOCKS router.
+// dnsAddr ("ipv4:port", default 1.1.1.1:53) is the resolver used over the
+// tunnel UDP route; without a UDP route DNS uses DoH and dnsAddr is unused.
 func StartVpnBridge(tunFd int, mtu int, dnsAddr string) string {
 	vpnBridgeMu.Lock()
 	defer vpnBridgeMu.Unlock()
@@ -373,6 +395,7 @@ func (b *vpnBridgeInstance) startWorker(fn func()) bool {
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
+		defer recoverGoroutine("vpn bridge worker")
 		fn()
 	}()
 	return true
@@ -469,7 +492,7 @@ func (b *vpnBridgeInstance) proxyTCP(req *tcp.ForwarderRequest, id stack.Transpo
 		// be closed immediately.
 		req.Complete(true)
 		b.stats.tcpFailures.Add(1)
-		log.Printf("transport: vpn bridge tcp socks connect %s failed: %v", target, err)
+		debugLogf("transport: vpn bridge tcp socks connect %s failed: %v", target, err)
 		return
 	}
 	defer upstream.Close()
@@ -564,13 +587,13 @@ func (b *vpnBridgeInstance) proxyUDP(client *gonet.UDPConn, id stack.TransportEn
 	if err != nil {
 		b.stats.udpFailures.Add(1)
 		b.stats.udpDropped.Add(1)
-		log.Printf("transport: vpn bridge udp %s dropped: %v", target, err)
+		debugLogf("transport: vpn bridge udp %s dropped: %v", target, err)
 		return
 	}
 	defer upstream.Close()
 	defer untrackUpstream()
 	b.stats.udpSessions.Add(1)
-	log.Printf("transport: vpn bridge udp route=%s target=%s", route, target)
+	debugLogf("transport: vpn bridge udp route=%s target=%s", route, target)
 
 	sess := &vpnBridgeUDPSession{tracker: newConnIdleTracker(client, upstream, vpnBridgeUDPIdleTO)}
 	unregister := b.registerUDPSession(sess)
@@ -578,7 +601,10 @@ func (b *vpnBridgeInstance) proxyUDP(client *gonet.UDPConn, id stack.TransportEn
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- vpnBridgeCopyUDP(client, upstream, sess.tracker, &b.stats.udpBytesDown)
+		err := errRecoveredPanic
+		defer func() { errCh <- err }()
+		defer recoverGoroutine("vpn bridge udp copy")
+		err = vpnBridgeCopyUDP(client, upstream, sess.tracker, &b.stats.udpBytesDown)
 	}()
 	firstErr := vpnBridgeCopyUDP(upstream, client, sess.tracker, &b.stats.udpBytesUp)
 	sess.tracker.closeAll()
@@ -587,7 +613,7 @@ func (b *vpnBridgeInstance) proxyUDP(client *gonet.UDPConn, id stack.TransportEn
 	}
 	if firstErr != nil && !errors.Is(firstErr, errProxyIdleTimeout) && b.ctx.Err() == nil &&
 		!errors.Is(firstErr, net.ErrClosed) && !sess.tracker.expired.Load() {
-		log.Printf("transport: vpn bridge udp %s closed: %v", target, firstErr)
+		debugLogf("transport: vpn bridge udp %s closed: %v", target, firstErr)
 	}
 }
 
@@ -596,10 +622,12 @@ func (b *vpnBridgeInstance) dialUDP(target netip.AddrPort) (net.Conn, func(), st
 	if route == "" {
 		return nil, nil, "", errors.New("udp route disabled")
 	}
-	return b.dialUDPRoute(route, target)
+	ctx, cancel := context.WithTimeout(b.ctx, vpnBridgeTCPConnectTO)
+	defer cancel()
+	return b.dialUDPRoute(ctx, route, target)
 }
 
-func (b *vpnBridgeInstance) dialUDPRoute(route string, target netip.AddrPort) (net.Conn, func(), string, error) {
+func (b *vpnBridgeInstance) dialUDPRoute(ctx context.Context, route string, target netip.AddrPort) (net.Conn, func(), string, error) {
 	if route == vpnBridgeAutoUDPRoute {
 		selected := vpnBridgeSelectAutoUDPRoute()
 		if selected == "" {
@@ -608,7 +636,7 @@ func (b *vpnBridgeInstance) dialUDPRoute(route string, target netip.AddrPort) (n
 		route = selected
 	}
 	if label, proxyAddr, ok := vpnBridgeXrayUDPRoute(route); ok {
-		upstream, err := vpnBridgeSOCKS5UDPAssociate(b.ctx, proxyAddr, target)
+		upstream, err := vpnBridgeSOCKS5UDPAssociate(ctx, proxyAddr, target)
 		if err != nil {
 			return nil, nil, label, err
 		}
@@ -627,30 +655,6 @@ func (b *vpnBridgeInstance) dialUDPRoute(route string, target netip.AddrPort) (n
 	}
 	untrack := b.trackConn(upstream)
 	return upstream, untrack, route, nil
-}
-
-func (b *vpnBridgeInstance) resolveDNSOverTCP(query []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(b.ctx, vpnBridgeDNSQueryTO)
-	defer cancel()
-	upstream, untrackUpstream, err := vpnBridgeSOCKS5Connect(ctx, vpnBridgeSOCKSAddr, b.dnsAddr, b.trackConn)
-	if err != nil {
-		return nil, fmt.Errorf("socks connect: %w", err)
-	}
-	defer upstream.Close()
-	defer untrackUpstream()
-	_ = upstream.SetDeadline(time.Now().Add(vpnBridgeDNSQueryTO))
-	frame, err := vpnBridgeDNSOverTCPFrame(query)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := upstream.Write(frame); err != nil {
-		return nil, err
-	}
-	response, err := vpnBridgeReadDNSOverTCPFrame(upstream, vpnBridgeMaxDNSOverTCP)
-	if err != nil {
-		return nil, err
-	}
-	return response, nil
 }
 
 func vpnBridgeCopyBoth(left, right net.Conn, leftBytes, rightBytes *atomic.Uint64) {
@@ -845,8 +849,9 @@ func (c *vpnBridgeSOCKS5UDPConn) Read(p []byte) (int, error) {
 		if from.Port() != c.relayAP.Port() || from.Addr().Unmap() != c.relayAP.Addr() {
 			continue
 		}
-		payload, err := vpnBridgeParseSOCKS5UDPDatagram(buf[:n])
-		if err != nil {
+		source, payload, err := vpnBridgeParseSOCKS5UDPDatagramFrom(buf[:n])
+		if err != nil || source != c.target {
+			// Only the associated target may answer on this flow.
 			continue
 		}
 		return copy(p, payload), nil
@@ -964,6 +969,26 @@ func vpnBridgeBuildSOCKS5UDPDatagram(target netip.AddrPort, payload []byte) ([]b
 	return frame, nil
 }
 
+// vpnBridgeParseSOCKS5UDPDatagramFrom parses a relayed datagram and returns
+// its source address. Domain sources are reported as the zero AddrPort.
+func vpnBridgeParseSOCKS5UDPDatagramFrom(frame []byte) (netip.AddrPort, []byte, error) {
+	payload, err := vpnBridgeParseSOCKS5UDPDatagram(frame)
+	if err != nil {
+		return netip.AddrPort{}, nil, err
+	}
+	var addr netip.Addr
+	switch frame[3] {
+	case vpnBridgeSOCKSIPv4:
+		addr = netip.AddrFrom4([4]byte(frame[4:8]))
+	case vpnBridgeSOCKSIPv6:
+		addr = netip.AddrFrom16([16]byte(frame[4:20])).Unmap()
+	default:
+		return netip.AddrPort{}, payload, nil
+	}
+	portOff := len(frame) - len(payload) - 2
+	return netip.AddrPortFrom(addr, binary.BigEndian.Uint16(frame[portOff:portOff+2])), payload, nil
+}
+
 func vpnBridgeParseSOCKS5UDPDatagram(frame []byte) ([]byte, error) {
 	if len(frame) < 4 {
 		return nil, errors.New("short socks udp datagram")
@@ -1056,6 +1081,9 @@ func vpnBridgeReadSOCKS5ConnectResponse(r io.Reader) error {
 	return nil
 }
 
+// vpnBridgeDNSOverTCPFrame and vpnBridgeReadDNSOverTCPFrame are the RFC 1035
+// 4.2.2 TCP framing helpers. The bridge currently resolves over the UDP
+// route or DoH only; they are kept (with tests) for a TCP fallback.
 func vpnBridgeDNSOverTCPFrame(query []byte) ([]byte, error) {
 	if len(query) == 0 {
 		return nil, errors.New("empty dns query")
@@ -1345,6 +1373,14 @@ func (b *vpnBridgeInstance) snapshotLocked() map[string]interface{} {
 		"dns_failures":    b.stats.dnsFailures.Load(),
 		"dns_bytes_up":    b.stats.dnsBytesUp.Load(),
 		"dns_bytes_down":  b.stats.dnsBytesDown.Load(),
+		"dns_dropped":     b.stats.dnsDropped.Load(),
+		"dns_evicted":     b.stats.dnsEvicted.Load(),
+		"dns_stale":       b.stats.dnsStaleServed.Load(),
+		"dns_doh_used":    b.stats.dnsDoHFallback.Load(),
+		"dns_mismatched":  b.stats.dnsMismatched.Load(),
+		"dns_udp_breaker": b.stats.dnsBreakerTrip.Load(),
+		"dns_udp_skipped": b.dnsBreaker.isOpen(time.Now()),
+		"panics":          recoveredPanics.Load(),
 		"udp_route":       vpnBridgeCurrentUDPRoute(),
 		"udp_sessions":    b.stats.udpSessions.Load(),
 		"udp_failures":    b.stats.udpFailures.Load(),

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -24,30 +26,88 @@ const (
 	vpnBridgeDNSTypeOPT   = 41
 )
 
+// vpnBridgeDNSFlow is one app-side DNS 5-tuple being served.
+type vpnBridgeDNSFlow struct {
+	conn         io.Closer
+	lastActivity atomic.Int64
+	evicted      atomic.Bool
+}
+
+func (f *vpnBridgeDNSFlow) touch() {
+	f.lastActivity.Store(time.Now().UnixNano())
+}
+
+// registerDNSFlow adds a flow, evicting the least recently active one when
+// the bridge already serves vpnBridgeMaxDNSFlows.
+func (b *vpnBridgeInstance) registerDNSFlow(flow *vpnBridgeDNSFlow) func() {
+	b.dnsFlowMu.Lock()
+	if b.dnsFlows == nil {
+		b.dnsFlows = make(map[*vpnBridgeDNSFlow]struct{})
+	}
+	var victim *vpnBridgeDNSFlow
+	if len(b.dnsFlows) >= vpnBridgeMaxDNSFlows {
+		for candidate := range b.dnsFlows {
+			if victim == nil || candidate.lastActivity.Load() < victim.lastActivity.Load() {
+				victim = candidate
+			}
+		}
+		delete(b.dnsFlows, victim)
+	}
+	b.dnsFlows[flow] = struct{}{}
+	b.dnsFlowMu.Unlock()
+	if victim != nil {
+		b.stats.dnsEvicted.Add(1)
+		victim.evicted.Store(true)
+		_ = victim.conn.Close()
+	}
+	return func() {
+		b.dnsFlowMu.Lock()
+		delete(b.dnsFlows, flow)
+		b.dnsFlowMu.Unlock()
+	}
+}
+
 // handleDNS serves one app-side DNS 5-tuple. Queries are answered
 // concurrently (bounded by the bridge-wide dnsSem) so a slow upstream answer
-// does not stall later queries from the same socket.
+// does not stall later queries from the same socket. The number of flows is
+// bounded (LRU eviction), each uses a small read buffer, and a flow ends once
+// it has been idle for vpnBridgeDNSIdleTO with no answer outstanding.
 func (b *vpnBridgeInstance) handleDNS(conn *gonet.UDPConn) {
 	defer conn.Close()
 	untrackConn := b.trackConn(conn)
 	defer untrackConn()
+	flow := &vpnBridgeDNSFlow{conn: conn}
+	flow.touch()
+	unregister := b.registerDNSFlow(flow)
+	defer unregister()
 	var inflight sync.WaitGroup
 	defer inflight.Wait()
-	bufPtr := vpnBridgeUDPBuffers.Get().(*[]byte)
-	defer vpnBridgeUDPBuffers.Put(bufPtr)
-	buf := *bufPtr
+	var outstanding atomic.Int32
+	buf := make([]byte, vpnBridgeDNSQueryBufLen)
 	for {
-		if b.ctx.Err() != nil {
+		if b.ctx.Err() != nil || flow.evicted.Load() {
 			return
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(vpnBridgeDNSIdleTO))
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
-			if vpnBridgeIsTimeout(err) || b.ctx.Err() != nil {
+			if b.ctx.Err() != nil || flow.evicted.Load() {
+				return
+			}
+			if vpnBridgeIsTimeout(err) {
+				if outstanding.Load() > 0 {
+					continue // keep the socket until pending answers are sent
+				}
 				return
 			}
 			b.stats.dnsFailures.Add(1)
 			return
+		}
+		flow.touch()
+		if n < vpnBridgeDNSHeaderLen {
+			// Not a DNS message; never forward it upstream.
+			b.stats.dnsDropped.Add(1)
+			continue
 		}
 		query := append([]byte(nil), buf[:n]...)
 		b.stats.dnsQueries.Add(1)
@@ -58,11 +118,14 @@ func (b *vpnBridgeInstance) handleDNS(conn *gonet.UDPConn) {
 			return
 		}
 		inflight.Add(1)
+		outstanding.Add(1)
 		if !b.startWorker(func() {
 			defer inflight.Done()
+			defer outstanding.Add(-1)
 			defer func() { <-b.dnsSem }()
 			b.answerDNS(conn, query)
 		}) {
+			outstanding.Add(-1)
 			inflight.Done()
 			<-b.dnsSem
 			return
@@ -74,7 +137,7 @@ func (b *vpnBridgeInstance) answerDNS(conn *gonet.UDPConn, query []byte) {
 	response, err := b.resolveDNS(query)
 	if err != nil {
 		b.stats.dnsFailures.Add(1)
-		log.Printf("transport: vpn bridge dns query failed: %v", err)
+		debugLogf("transport: vpn bridge dns query failed: %v", err)
 		return
 	}
 	response = vpnBridgeDNSFitUDP(query, response)
@@ -85,34 +148,170 @@ func (b *vpnBridgeInstance) answerDNS(conn *gonet.UDPConn, query []byte) {
 	}
 }
 
+// resolveDNS answers query from the cache, the tunnel UDP route (dnsAddr)
+// or DoH. The UDP route gets a short head start before DoH is raced against
+// it, and a circuit breaker skips a UDP route that keeps failing.
 func (b *vpnBridgeInstance) resolveDNS(query []byte) ([]byte, error) {
+	if len(query) < vpnBridgeDNSHeaderLen {
+		return nil, errors.New("short dns query")
+	}
 	if cached, ok := b.dnsCache.get(query, time.Now(), false); ok {
 		return cached, nil
 	}
 	route := vpnBridgeCurrentUDPRoute()
-	routeLabel := vpnBridgeRouteLabel(route)
-	if route != "" {
-		response, err := b.resolveDNSOverUDPRoute(query, route)
-		if err == nil {
-			b.dnsCache.put(query, response, time.Now())
-			return response, nil
-		}
-		log.Printf("transport: vpn bridge tunnel dns failed route=%s: %v", routeLabel, err)
+	var (
+		response []byte
+		err      error
+	)
+	if route != "" && b.dnsBreaker.allow(time.Now()) {
+		response, err = b.resolveDNSRace(query, route)
+	} else {
+		ctx, cancel := context.WithTimeout(b.ctx, vpnBridgeDNSQueryTO)
+		response, err = b.resolveDNSOverHTTPS(ctx, query)
+		cancel()
 	}
-	response, err := b.resolveDNSOverHTTPS(query)
 	if err == nil {
-		log.Printf("transport: vpn bridge dns_fallback_used=doh route=%s", routeLabel)
 		b.dnsCache.put(query, response, time.Now())
 		return response, nil
 	}
 	if cached, ok := b.dnsCache.get(query, time.Now(), true); ok {
-		log.Printf("transport: vpn bridge dns_fallback_used=cache route=%s", routeLabel)
+		b.stats.dnsStaleServed.Add(1)
 		return cached, nil
 	}
 	return nil, err
 }
 
-func (b *vpnBridgeInstance) resolveDNSOverUDPRoute(query []byte, route string) ([]byte, error) {
+type vpnBridgeDNSResult struct {
+	response []byte
+	err      error
+	doh      bool
+}
+
+// resolveDNSRace queries the UDP route and, if it has not answered within
+// vpnBridgeDNSDoHHeadStart (or failed earlier), DoH in parallel; the first
+// good answer wins. The UDP route's outcome feeds the circuit breaker.
+func (b *vpnBridgeInstance) resolveDNSRace(query []byte, route string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(b.ctx, vpnBridgeDNSQueryTO+vpnBridgeDNSDoHHeadStart)
+	defer cancel()
+	results := make(chan vpnBridgeDNSResult, 2)
+	running := 0
+	if b.startWorker(func() {
+		response, err := b.resolveDNSOverUDPRoute(ctx, query, route)
+		results <- vpnBridgeDNSResult{response: response, err: err}
+	}) {
+		running++
+	} else {
+		return nil, errors.New("vpn bridge stopped")
+	}
+	dohStarted := false
+	startDoH := func() {
+		if dohStarted {
+			return
+		}
+		dohStarted = true
+		if b.startWorker(func() {
+			response, err := b.resolveDNSOverHTTPS(ctx, query)
+			results <- vpnBridgeDNSResult{response: response, err: err, doh: true}
+		}) {
+			running++
+		}
+	}
+	headStart := time.NewTimer(vpnBridgeDNSDoHHeadStart)
+	defer headStart.Stop()
+	udpDone := false
+	var lastErr error
+	for running > 0 {
+		select {
+		case r := <-results:
+			running--
+			if !r.doh {
+				udpDone = true
+				if r.err == nil {
+					b.dnsBreaker.success()
+				} else {
+					b.recordDNSRouteFailure(route)
+					debugLogf("transport: vpn bridge tunnel dns failed route=%s: %v", vpnBridgeRouteLabel(route), r.err)
+				}
+			}
+			if r.err == nil {
+				if r.doh {
+					b.stats.dnsDoHFallback.Add(1)
+					if !udpDone {
+						// DoH beat the UDP route's head start: count it as
+						// a route failure so a dead leg trips the breaker.
+						b.recordDNSRouteFailure(route)
+					}
+				}
+				return r.response, nil
+			}
+			lastErr = r.err
+			if !r.doh {
+				startDoH()
+			}
+		case <-headStart.C:
+			startDoH()
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("dns resolution failed")
+	}
+	return nil, lastErr
+}
+
+func (b *vpnBridgeInstance) recordDNSRouteFailure(route string) {
+	if b.dnsBreaker.failure(time.Now()) {
+		b.stats.dnsBreakerTrip.Add(1)
+		log.Printf("transport: vpn bridge tunnel dns route=%s failing; using doh for %s", vpnBridgeRouteLabel(route), vpnBridgeDNSBreakerCooldown)
+	}
+}
+
+// vpnBridgeDNSBreaker remembers a failing UDP DNS route so each uncached
+// query does not pay the head start again. After
+// vpnBridgeDNSBreakerThreshold consecutive failures the route is skipped for
+// vpnBridgeDNSBreakerCooldown; afterwards a single failure re-opens it and a
+// success closes it.
+type vpnBridgeDNSBreaker struct {
+	mu        sync.Mutex
+	failures  int
+	openUntil time.Time
+}
+
+func (c *vpnBridgeDNSBreaker) allow(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !now.Before(c.openUntil)
+}
+
+func (c *vpnBridgeDNSBreaker) success() {
+	c.mu.Lock()
+	c.failures = 0
+	c.openUntil = time.Time{}
+	c.mu.Unlock()
+}
+
+// failure records one failure and reports whether the breaker just opened.
+func (c *vpnBridgeDNSBreaker) failure(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if now.Before(c.openUntil) {
+		return false
+	}
+	c.failures++
+	if c.failures < vpnBridgeDNSBreakerThreshold {
+		return false
+	}
+	c.openUntil = now.Add(vpnBridgeDNSBreakerCooldown)
+	c.failures = vpnBridgeDNSBreakerThreshold - 1
+	return true
+}
+
+func (c *vpnBridgeDNSBreaker) isOpen(now time.Time) bool {
+	return !c.allow(now)
+}
+
+// resolveDNSOverUDPRoute sends query to dnsAddr over the tunnel UDP route.
+// dnsAddr is only used here: with the UDP route disabled, DNS goes to DoH.
+func (b *vpnBridgeInstance) resolveDNSOverUDPRoute(ctx context.Context, query []byte, route string) ([]byte, error) {
 	if route == "" {
 		return nil, errors.New("udp route disabled")
 	}
@@ -120,8 +319,6 @@ func (b *vpnBridgeInstance) resolveDNSOverUDPRoute(query []byte, route string) (
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(b.ctx, vpnBridgeDNSQueryTO)
-	defer cancel()
 	return b.dnsMux.exchange(ctx, route, target, query)
 }
 
@@ -164,12 +361,13 @@ func (c *vpnBridgeTrackedConn) Close() error {
 	return err
 }
 
-func (b *vpnBridgeInstance) resolveDNSOverHTTPS(query []byte) ([]byte, error) {
+func (b *vpnBridgeInstance) resolveDNSOverHTTPS(ctx context.Context, query []byte) ([]byte, error) {
 	if b.doh == nil {
 		return nil, errors.New("doh client unavailable")
 	}
-	ctx, cancel := context.WithTimeout(b.ctx, vpnBridgeDNSQueryTO)
-	defer cancel()
+	if len(query) < vpnBridgeDNSHeaderLen {
+		return nil, errors.New("short dns query")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+vpnBridgeDoHHost+vpnBridgeDoHPath, bytes.NewReader(query))
 	if err != nil {
 		return nil, err
@@ -189,8 +387,8 @@ func (b *vpnBridgeInstance) resolveDNSOverHTTPS(query []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(body) < 2 {
-		return nil, errors.New("empty doh response")
+	if len(body) < vpnBridgeDNSHeaderLen {
+		return nil, errors.New("short doh response")
 	}
 	if len(body) > vpnBridgeMaxDNSUDP {
 		return nil, fmt.Errorf("doh response too large: %d", len(body))
@@ -201,15 +399,20 @@ func (b *vpnBridgeInstance) resolveDNSOverHTTPS(query []byte) ([]byte, error) {
 
 // vpnBridgeDNSMux multiplexes DNS queries over one long-lived UDP flow per
 // route instead of a fresh UDP ASSOCIATE (or netstack socket) per query.
-// Upstream transaction IDs are rewritten so queries from different apps
-// cannot collide.
+// Upstream transaction IDs are rewritten to random, unused values so queries
+// from different apps cannot collide and answers cannot be guessed; an answer
+// is only accepted when its question matches the query.
 type vpnBridgeDNSMux struct {
 	b       *vpnBridgeInstance
 	mu      sync.Mutex
 	cur     *vpnBridgeDNSMuxConn
 	dialing *vpnBridgeDNSMuxDial
-	nextID  uint16
 	closed  bool
+}
+
+type vpnBridgeDNSPending struct {
+	ch       chan []byte
+	question string // vpnBridgeDNSQuestionKey of the query, "" if unparsable
 }
 
 type vpnBridgeDNSMuxDial struct {
@@ -223,7 +426,7 @@ type vpnBridgeDNSMuxConn struct {
 	route     string
 	conn      net.Conn
 	untrack   func()
-	pending   map[uint16]chan []byte
+	pending   map[uint16]*vpnBridgeDNSPending
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -242,29 +445,31 @@ func (m *vpnBridgeDNSMux) exchange(ctx context.Context, route string, target net
 	if len(query) < vpnBridgeDNSHeaderLen {
 		return nil, errors.New("short dns query")
 	}
-	c, err := m.conn(route, target)
+	c, err := m.conn(ctx, route, target)
 	if err != nil {
 		return nil, err
 	}
+	question, _ := vpnBridgeDNSQuestionKey(query)
 	m.mu.Lock()
-	if len(c.pending) >= 0xffff {
+	if len(c.pending) >= vpnBridgeDNSMaxPending {
 		m.mu.Unlock()
 		return nil, errors.New("too many pending dns queries")
 	}
-	id := m.nextID
+	id := vpnBridgeRandomDNSID()
 	for {
-		id++
 		if _, busy := c.pending[id]; !busy {
 			break
 		}
+		id = vpnBridgeRandomDNSID()
 	}
-	m.nextID = id
-	ch := make(chan []byte, 1)
-	c.pending[id] = ch
+	p := &vpnBridgeDNSPending{ch: make(chan []byte, 1), question: question}
+	c.pending[id] = p
 	m.mu.Unlock()
 	defer func() {
 		m.mu.Lock()
-		delete(c.pending, id)
+		if c.pending[id] == p {
+			delete(c.pending, id)
+		}
 		m.mu.Unlock()
 	}()
 
@@ -275,7 +480,7 @@ func (m *vpnBridgeDNSMux) exchange(ctx context.Context, route string, target net
 		return nil, err
 	}
 	select {
-	case resp := <-ch:
+	case resp := <-p.ch:
 		copy(resp[:2], query[:2])
 		return resp, nil
 	case <-c.done:
@@ -285,7 +490,31 @@ func (m *vpnBridgeDNSMux) exchange(ctx context.Context, route string, target net
 	}
 }
 
-func (m *vpnBridgeDNSMux) conn(route string, target netip.AddrPort) (*vpnBridgeDNSMuxConn, error) {
+// vpnBridgeRandomDNSID returns an unpredictable transaction ID.
+func vpnBridgeRandomDNSID() uint16 {
+	var raw [2]byte
+	_, _ = rand.Read(raw[:])
+	return binary.BigEndian.Uint16(raw[:])
+}
+
+// vpnBridgeDNSAnswerMatches reports whether response answers the query whose
+// question key is question. Error responses without a question section are
+// accepted, as some servers omit it.
+func vpnBridgeDNSAnswerMatches(question string, response []byte) bool {
+	if len(response) < vpnBridgeDNSHeaderLen || binary.BigEndian.Uint16(response[2:4])&0x8000 == 0 {
+		return false
+	}
+	if question == "" {
+		return true
+	}
+	if binary.BigEndian.Uint16(response[4:6]) == 0 {
+		return binary.BigEndian.Uint16(response[2:4])&0x000f != 0
+	}
+	got, ok := vpnBridgeDNSQuestionKey(response)
+	return ok && got == question
+}
+
+func (m *vpnBridgeDNSMux) conn(ctx context.Context, route string, target netip.AddrPort) (*vpnBridgeDNSMuxConn, error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -301,20 +530,28 @@ func (m *vpnBridgeDNSMux) conn(route string, target netip.AddrPort) (*vpnBridgeD
 	if d := m.dialing; d != nil && d.route == route {
 		// Concurrent cold-start queries share one dial.
 		m.mu.Unlock()
-		<-d.done
-		return d.conn, d.err
+		select {
+		case <-d.done:
+			return d.conn, d.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	d := &vpnBridgeDNSMuxDial{route: route, done: make(chan struct{})}
 	m.dialing = d
 	m.mu.Unlock()
 	defer close(d.done)
 
-	d.conn, d.err = m.dial(d, route, target)
+	// The dial is shared with other waiters, so it is bounded by its own
+	// timeout rather than by the first caller's context.
+	dialCtx, cancel := context.WithTimeout(m.b.ctx, vpnBridgeDNSQueryTO)
+	defer cancel()
+	d.conn, d.err = m.dial(dialCtx, d, route, target)
 	return d.conn, d.err
 }
 
-func (m *vpnBridgeDNSMux) dial(d *vpnBridgeDNSMuxDial, route string, target netip.AddrPort) (*vpnBridgeDNSMuxConn, error) {
-	upstream, untrack, label, err := m.b.dialUDPRoute(route, target)
+func (m *vpnBridgeDNSMux) dial(ctx context.Context, d *vpnBridgeDNSMuxDial, route string, target netip.AddrPort) (*vpnBridgeDNSMuxConn, error) {
+	upstream, untrack, label, err := m.b.dialUDPRoute(ctx, route, target)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.dialing == d {
@@ -327,7 +564,7 @@ func (m *vpnBridgeDNSMux) dial(d *vpnBridgeDNSMuxDial, route string, target neti
 		route:   route,
 		conn:    upstream,
 		untrack: untrack,
-		pending: make(map[uint16]chan []byte),
+		pending: make(map[uint16]*vpnBridgeDNSPending),
 		done:    make(chan struct{}),
 	}
 	if m.closed {
@@ -367,11 +604,19 @@ func (m *vpnBridgeDNSMux) readLoop(c *vpnBridgeDNSMuxConn) {
 		}
 		id := binary.BigEndian.Uint16(buf[:2])
 		m.mu.Lock()
-		ch := c.pending[id]
-		delete(c.pending, id)
+		p := c.pending[id]
+		if p != nil && !vpnBridgeDNSAnswerMatches(p.question, buf[:n]) {
+			// Wrong or forged answer for this ID: keep waiting for the
+			// real one.
+			p = nil
+			m.b.stats.dnsMismatched.Add(1)
+		}
+		if p != nil {
+			delete(c.pending, id)
+		}
 		m.mu.Unlock()
-		if ch != nil {
-			ch <- append([]byte(nil), buf[:n]...)
+		if p != nil {
+			p.ch <- append([]byte(nil), buf[:n]...)
 		}
 	}
 }
@@ -489,7 +734,7 @@ func (c *vpnBridgeDNSCache) get(query []byte, now time.Time, allowStale bool) ([
 	}
 	c.ll.MoveToFront(el)
 	response := append([]byte(nil), entry.response...)
-	copy(response[:2], query[:2])
+	vpnBridgeDNSAdoptQuery(response, query)
 	elapsed := uint32(now.Sub(entry.storedAt) / time.Second)
 	for i, off := range entry.ttlOffsets {
 		ttl := uint32(vpnBridgeDNSStaleServe)
@@ -502,6 +747,25 @@ func (c *vpnBridgeDNSCache) get(query []byte, now time.Time, allowStale bool) ([
 		binary.BigEndian.PutUint32(response[off:off+4], ttl)
 	}
 	return response, true
+}
+
+// vpnBridgeDNSAdoptQuery rewrites a cached response for the current query:
+// its transaction ID, its question section as sent (0x20 case randomization)
+// and its RD and CD flags. Both messages share the same question key, so the
+// question sections have the same length.
+func vpnBridgeDNSAdoptQuery(response, query []byte) {
+	if len(response) < vpnBridgeDNSHeaderLen || len(query) < vpnBridgeDNSHeaderLen {
+		return
+	}
+	copy(response[:2], query[:2])
+	const rdCD = 0x0100 | 0x0010
+	flags := binary.BigEndian.Uint16(response[2:4])&^rdCD | binary.BigEndian.Uint16(query[2:4])&rdCD
+	binary.BigEndian.PutUint16(response[2:4], flags)
+	qEnd, okQ := vpnBridgeDNSQuestionEnd(query)
+	rEnd, okR := vpnBridgeDNSQuestionEnd(response)
+	if okQ && okR && qEnd == rEnd {
+		copy(response[vpnBridgeDNSHeaderLen:qEnd], query[vpnBridgeDNSHeaderLen:qEnd])
+	}
 }
 
 func (c *vpnBridgeDNSCache) len() int {
