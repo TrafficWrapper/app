@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="public_bootstrap_import_another">Import another bootstrap</string>
+    <string name="public_bootstrap_enrollment_busy">Registration is in progress. The new bootstrap will be applied as soon as it finishes.</string>
+    <string name="public_bootstrap_external_changes_title">Trusted fields that will change:</string>
+    <string name="public_bootstrap_external_change_row">%1$s: %2$s → %3$s</string>
+    <string name="public_bootstrap_external_keys_warning">Platform keys or pins change: the device will trust other configuration and update keys. Continue only if your operator issued this bootstrap.</string>
+    <string name="public_bootstrap_external_keys_title">Confirm the key change</string>
+    <string name="public_bootstrap_external_keys_confirm">Change keys</string>
+    <string name="public_bootstrap_external_continue">Next</string>
+    <string name="local_proxy_auth_apps_hint_settings">The proxy is password-protected: username %1$s. The password is in Settings, section “Local proxy password”.</string>
+    <string name="local_proxy_auth_password_show">Show</string>
+    <string name="local_proxy_auth_password_hide">Hide</string>
+    <string name="local_proxy_auth_password_hidden">••••••••</string>
+</resources>

@@ -20,7 +20,9 @@ internal fun mainActivityLaunchPendingIntent(context: Context): PendingIntent {
 }
 
 internal fun batteryHintPendingIntent(context: Context): PendingIntent {
-    val intent = Intent(context, MainActivity::class.java)
+    // Through the non-exported alias: MainActivity honours the hint only from there (APP-L17).
+    val intent = Intent()
+        .setClassName(context.packageName, BATTERY_HINT_ALIAS_CLASS)
         .setAction(ACTION_OPEN_BATTERY_HINT)
         .addFlags(
             Intent.FLAG_ACTIVITY_NEW_TASK or

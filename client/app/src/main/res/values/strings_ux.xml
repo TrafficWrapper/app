@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="public_bootstrap_import_another">Импортировать другой bootstrap</string>
+    <string name="public_bootstrap_enrollment_busy">Идёт регистрация. Новый bootstrap будет применён сразу после её завершения.</string>
+    <string name="public_bootstrap_external_changes_title">Изменятся доверенные поля:</string>
+    <string name="public_bootstrap_external_change_row">%1$s: %2$s → %3$s</string>
+    <string name="public_bootstrap_external_keys_warning">Меняются ключи или пины платформы: устройство будет доверять другим ключам конфигурации и обновлений. Продолжайте, только если этот bootstrap выдал ваш оператор.</string>
+    <string name="public_bootstrap_external_keys_title">Подтвердите смену ключей</string>
+    <string name="public_bootstrap_external_keys_confirm">Сменить ключи</string>
+    <string name="public_bootstrap_external_continue">Далее</string>
+    <string name="local_proxy_auth_apps_hint_settings">Прокси защищён паролем: логин %1$s. Пароль — в настройках, раздел «Пароль локального прокси».</string>
+    <string name="local_proxy_auth_password_show">Показать</string>
+    <string name="local_proxy_auth_password_hide">Скрыть</string>
+    <string name="local_proxy_auth_password_hidden">••••••••</string>
+</resources>
