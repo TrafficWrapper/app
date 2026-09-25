@@ -47,7 +47,7 @@ repository.
 
 ## Requirements
 
-- Docker, or local Go 1.24+, Android SDK, JDK 17, and gomobile.
+- Docker, or local Go 1.27+, Android SDK, JDK 17, and gomobile.
 - Your own Android release keystore.
 - Your own update minisign key for update manifests.
 - For running orchestrator/worker only, 1 CPU and 1 GB RAM with swap can be
@@ -135,8 +135,8 @@ These variables are read by Gradle or the scripts in `build/`:
 | Variable | What it is | Required | Where to get it / notes |
 | --- | --- | --- | --- |
 | `TW_APPLICATION_ID` | Android package name. | Optional | Defaults to `org.trafficwrapper.app`. |
-| `TW_VERSION_CODE` | Android integer version code. | Optional | Defaults to `1001`; use monotonic values for releases. |
-| `TW_VERSION_NAME` | Android version name. | Optional | Defaults to `public-1.0.0`; overrides `TW_PUBLIC_VERSION_NAME`. |
+| `TW_VERSION_CODE` | Android integer version code. | Required for `build-release.sh` | Debug builds fall back to the Gradle default; release builds must pass a monotonic value. |
+| `TW_VERSION_NAME` | Android version name. | Required for `build-release.sh` | Debug builds fall back to the Gradle default; overrides `TW_PUBLIC_VERSION_NAME`. |
 | `TW_PUBLIC_VERSION_NAME` | Legacy/public version-name fallback. | Optional | Used only when `TW_VERSION_NAME` is not set. |
 | `TW_ENROLLMENT_SECRET` | Optional BuildConfig enrollment identifier (historically called a "secret"). | Optional | Usually empty for public platform builds. **Not a secret:** it is compiled into `BuildConfig` and anyone can extract it from the APK; never rely on it for authentication or authorization. |
 | `TW_VPN_ENABLED` | Compile the optional Android `VpnService` mode and UI. | Optional | Defaults to `false`; default public APK remains SOCKS-only. |

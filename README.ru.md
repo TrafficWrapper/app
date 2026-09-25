@@ -46,7 +46,7 @@ APK update signature/certificate pins.
 
 ## Требования
 
-- Docker или локальные Go 1.24+, Android SDK, JDK 17 и gomobile.
+- Docker или локальные Go 1.27+, Android SDK, JDK 17 и gomobile.
 - Собственный Android release keystore.
 - Собственный update minisign key для update manifests.
 - Только для runtime orchestrator/worker может хватить 1 CPU и 1 GB RAM со swap.
@@ -132,8 +132,8 @@ export TW_PUBLIC_SIGNING_CERT_SHA256=<your-release-cert-sha256>
 | Переменная | Что это | Обязательна | Откуда брать / примечания |
 | --- | --- | --- | --- |
 | `TW_APPLICATION_ID` | Android package name. | Опц. | Дефолт `org.trafficwrapper.app`. |
-| `TW_VERSION_CODE` | Android integer version code. | Опц. | Дефолт `1001`; для releases используйте монотонные значения. |
-| `TW_VERSION_NAME` | Android version name. | Опц. | Дефолт `public-1.0.0`; перекрывает `TW_PUBLIC_VERSION_NAME`. |
+| `TW_VERSION_CODE` | Android integer version code. | Обяз. для `build-release.sh` | Debug-сборки берут дефолт Gradle; для release передайте монотонное значение. |
+| `TW_VERSION_NAME` | Android version name. | Обяз. для `build-release.sh` | Debug-сборки берут дефолт Gradle; перекрывает `TW_PUBLIC_VERSION_NAME`. |
 | `TW_PUBLIC_VERSION_NAME` | Legacy/public fallback version name. | Опц. | Используется только если `TW_VERSION_NAME` не задан. |
 | `TW_ENROLLMENT_SECRET` | Optional BuildConfig enrollment-идентификатор (исторически называется «secret»). | Опц. | Обычно empty для public platform builds. **Это не секрет:** значение вкомпилировано в `BuildConfig` и извлекается из APK кем угодно; не используйте его для аутентификации или авторизации. |
 | `TW_VPN_ENABLED` | Включает optional Android `VpnService` mode и UI при сборке. | Опц. | Дефолт `false`; public APK по умолчанию остаётся SOCKS-only. |
