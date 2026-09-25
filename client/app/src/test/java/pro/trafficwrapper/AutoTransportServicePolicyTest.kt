@@ -958,7 +958,8 @@ class AutoTransportServicePolicyTest {
             fail("no-auth must be rejected when the front-end password is enabled")
         } catch (_: SocksAuthRejectedException) {
         }
-        assertArrayEquals(byteArrayOf(0x05, 0xff.toByte()), rejectedOut.toByteArray())
+        // Rejected without a method reply, so the port does not advertise a protected proxy.
+        assertArrayEquals(byteArrayOf(), rejectedOut.toByteArray())
     }
 
     @Test

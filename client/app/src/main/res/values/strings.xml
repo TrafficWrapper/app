@@ -299,7 +299,7 @@
     <string name="oem_background_hint_open">Открыть карточку приложения</string>
     <string name="local_proxy_auth_title">Пароль локального прокси</string>
     <string name="local_proxy_auth_switch">Требовать пароль для локального прокси</string>
-    <string name="local_proxy_auth_description">Другие приложения на устройстве не смогут пользоваться туннелем или обнаружить его без логина и пароля. По умолчанию выключено.</string>
+    <string name="local_proxy_auth_description">Другие приложения на устройстве не смогут пользоваться туннелем через локальный прокси без логина и пароля. Скрыть сам факт работы локального прокси это не помогает.</string>
     <string name="local_proxy_auth_username">Логин</string>
     <string name="local_proxy_auth_password">Пароль</string>
     <string name="local_proxy_auth_regenerate">Сгенерировать новый пароль</string>

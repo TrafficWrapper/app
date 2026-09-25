@@ -169,7 +169,86 @@ internal class TrackedSocket(val createdAtMs: Long) {
     val downBytes = AtomicLong(0)
     val lastUplinkProgressAtMs = AtomicLong(0)
     val lastDownlinkProgressAtMs = AtomicLong(0)
+    /** Authenticated without the internal credentials (another app). */
+    @Volatile
+    var external: Boolean = false
+    /** [LocalProxyAuthPolicy.fingerprint] the session was admitted under. */
+    @Volatile
+    var policyFingerprint: String = ""
 }
+
+/**
+ * Admission control of the front-end router. Handshakes are bounded and, when the queue is full,
+ * the oldest pending handshake is evicted (so slow or stuck clients cannot starve in-process
+ * clients, whose handshake completes in milliseconds). Established sessions of in-process clients
+ * and of other apps have separate budgets, counted only after authentication.
+ */
+internal class RouterAdmission<T : Any>(
+    private val maxPendingHandshakes: Int,
+    private val maxInternalSessions: Int,
+    private val maxExternalSessions: Int,
+) {
+    private val pending = LinkedHashSet<T>()
+    private var internalSessions = 0
+    private var externalSessions = 0
+
+    /** Registers a new handshake; returns the evicted oldest handshake to close, if any. */
+    @Synchronized
+    fun admitHandshake(item: T): T? {
+        var evicted: T? = null
+        if (pending.size >= maxPendingHandshakes) {
+            evicted = pending.first()
+            pending.remove(evicted)
+        }
+        pending.add(item)
+        return evicted
+    }
+
+    @Synchronized
+    fun isPending(item: T): Boolean = item in pending
+
+    /** Ends the handshake of [item]; false when it was evicted or already finished. */
+    @Synchronized
+    fun finishHandshake(item: T): Boolean = pending.remove(item)
+
+    @Synchronized
+    fun tryAcquireSession(internal: Boolean): Boolean =
+        if (internal) {
+            if (internalSessions >= maxInternalSessions) false else { internalSessions++; true }
+        } else {
+            if (externalSessions >= maxExternalSessions) false else { externalSessions++; true }
+        }
+
+    @Synchronized
+    fun releaseSession(internal: Boolean) {
+        if (internal) {
+            internalSessions = (internalSessions - 1).coerceAtLeast(0)
+        } else {
+            externalSessions = (externalSessions - 1).coerceAtLeast(0)
+        }
+    }
+
+    @Synchronized
+    fun pendingCount(): Int = pending.size
+}
+
+/** Backoff between attempts to bind the router port after a failure. */
+internal fun routerBindRetryDelayMs(failures: Int): Long {
+    if (failures <= 0) return 0L
+    var delayMs = ROUTER_BIND_RETRY_BASE_MS
+    repeat((failures - 1).coerceAtMost(ROUTER_BIND_RETRY_MAX_SHIFT)) {
+        delayMs = (delayMs * 2).coerceAtMost(ROUTER_BIND_RETRY_MAX_MS)
+    }
+    return delayMs
+}
+
+internal const val ROUTER_BIND_RETRY_BASE_MS = 1_000L
+internal const val ROUTER_BIND_RETRY_MAX_MS = 30_000L
+internal const val ROUTER_BIND_RETRY_MAX_SHIFT = 5
+internal const val ROUTER_MAX_PENDING_HANDSHAKES = 64
+internal const val ROUTER_MAX_INTERNAL_SESSIONS = 256
+internal const val ROUTER_MAX_EXTERNAL_SESSIONS = 192
+internal const val ROUTER_HANDSHAKE_DEADLINE_MS = 10_000L
 
 internal fun recordTrackedSocketProgress(
     tracked: TrackedSocket,
@@ -418,17 +497,20 @@ internal fun workerCycleWakeLockTimeoutMs(holdDuringSleep: Boolean, sleepMs: Lon
 /**
  * Server side of the SOCKS5 method negotiation for the front-end router (127.0.0.1:18080).
  *
- * In-process clients always authenticate with [internal] credentials. When the user enabled a
- * front-end password ([frontEnd] != null) only user/pass is accepted (internal or front-end
- * credentials). Otherwise unauthenticated clients (for example Telegram configured without a
- * password) may still select no-auth. Returns the matched credentials or null for no-auth; throws
- * after replying with a failure when the client cannot be accepted.
+ * In-process clients prove knowledge of the [internal] credentials with the router proof (or,
+ * for compatibility, present them with user/pass). When the user enabled a front-end password
+ * ([frontEnd] != null) only those two ways and the front-end credentials are accepted. No-auth
+ * (for example Telegram configured without a password) is accepted only when [allowNoAuth].
+ * A client that offers no acceptable method is closed without a reply, so the port does not
+ * advertise itself as a password-protected proxy. Returns the matched credentials ([internal]
+ * for the router proof) or null for no-auth; throws when the client cannot be accepted.
  */
 internal fun negotiateLocalSocksServerAuth(
     input: InputStream,
     output: OutputStream,
     internal: SocksCredentials,
     frontEnd: SocksCredentials?,
+    allowNoAuth: Boolean = frontEnd == null,
 ): SocksCredentials? {
     val version = input.read()
     if (version < 0) throw EOFException()
@@ -443,21 +525,27 @@ internal fun negotiateLocalSocksServerAuth(
         offset += read
     }
     val offered = methods.map { it.toInt() and 0xff }.toSet()
-    if (frontEnd == null && Socks5Auth.METHOD_NO_AUTH in offered) {
+    if (Socks5Auth.METHOD_ROUTER_PROOF in offered) {
+        val proved = try {
+            Socks5Auth.negotiateRouterProofServer(input, output, internal)
+        } catch (error: EOFException) {
+            throw SocksAuthRejectedException(error.message ?: "router proof failed")
+        }
+        if (!proved) throw SocksAuthRejectedException("router proof failed")
+        return internal
+    }
+    if (allowNoAuth && frontEnd == null && Socks5Auth.METHOD_NO_AUTH in offered) {
         output.write(byteArrayOf(SOCKS5_VERSION.toByte(), Socks5Auth.METHOD_NO_AUTH.toByte()))
         output.flush()
         return null
     }
     if (Socks5Auth.METHOD_USER_PASS !in offered) {
-        output.write(byteArrayOf(SOCKS5_VERSION.toByte(), Socks5Auth.METHOD_NO_ACCEPTABLE.toByte()))
-        output.flush()
         throw SocksAuthRejectedException("no acceptable socks auth method")
     }
-    // Re-enter the shared helper with the method list we already consumed.
-    val replay = byteArrayOf(SOCKS5_VERSION.toByte(), 1, Socks5Auth.METHOD_USER_PASS.toByte())
-    val chained = java.io.SequenceInputStream(java.io.ByteArrayInputStream(replay), input)
+    output.write(byteArrayOf(SOCKS5_VERSION.toByte(), Socks5Auth.METHOD_USER_PASS.toByte()))
+    output.flush()
     return try {
-        Socks5Auth.negotiateServer(chained, output, listOfNotNull(internal, frontEnd))
+        Socks5Auth.readUserPass(input, output, listOfNotNull(internal, frontEnd))
     } catch (error: EOFException) {
         throw SocksAuthRejectedException(error.message ?: "socks authentication failed")
     }
@@ -622,6 +710,12 @@ class AutoTransportService : Service() {
     @Volatile
     private var router: SocksRouter? = null
 
+    /** Router bind backoff (written by the worker; reset when a worker starts). */
+    @Volatile
+    private var routerBindFailures = 0
+    @Volatile
+    private var nextRouterBindAttemptAtMs = 0L
+
     private val routeSwitchRequestId = AtomicLong(0)
 
     @Volatile
@@ -663,6 +757,7 @@ class AutoTransportService : Service() {
         if (action == ACTION_HTTP_PROXY_CHANGED) {
             if (workerActive.get()) {
                 applyHttpProxyPreference()
+                enforceLocalProxyAuthPolicy()
                 return START_STICKY
             }
             if (!TransportLifecycleStore.shouldKeepAlive(this)) {
@@ -673,6 +768,7 @@ class AutoTransportService : Service() {
         }
         if (action == ACTION_VPN_CONFIG_CHANGED) {
             applyVpnPreference()
+            enforceLocalProxyAuthPolicy()
             if (!TransportLifecycleStore.shouldKeepAlive(this) && !workerActive.get()) {
                 stopSelf()
                 return START_NOT_STICKY
@@ -716,6 +812,8 @@ class AutoTransportService : Service() {
         if (!workerActive.compareAndSet(false, true)) return false
         val generation = workerGenerationCounter.incrementAndGet()
         currentWorkerGeneration.set(generation)
+        routerBindFailures = 0
+        nextRouterBindAttemptAtMs = 0L
         acquireWakeLock()
         publishState(
             TransportUiState(
@@ -1307,8 +1405,9 @@ class AutoTransportService : Service() {
                     )
                 }
                 if (initialRouteReady) {
-                    installRouter(generation)
-                    startHttpProxyIfEnabled()
+                    if (installRouter(generation)) {
+                        startHttpProxyIfEnabled()
+                    }
                 } else {
                     telemetryEvent("route_guard",
                         "rsn" to ROUTE_REASON_NO_UPSTREAM,
@@ -1649,11 +1748,13 @@ class AutoTransportService : Service() {
                                 routeReady = { route -> routeListenerReadyForTraffic(route) },
                             )
                             markRouteActive(activeRoute, nowMs, probeReady = false)
-                            installRouter(generation)
-                            telemetryEvent("route_guard",
-                                "rsn" to "router_started",
-                                "route" to routeLabel(activeRoute),
-                            )
+                            if (installRouter(generation)) {
+                                telemetryEvent("route_guard",
+                                    "rsn" to "router_started",
+                                    "route" to routeLabel(activeRoute),
+                                )
+                                startHttpProxyIfEnabled()
+                            }
                         }
                     }
                     val shouldProbeAwgRu = awgRuStarted && shouldProbeAWG(
@@ -2964,8 +3065,32 @@ class AutoTransportService : Service() {
         }
     }
 
-    private fun installRouter(generation: Long) {
-        val started = startSocksRouter()
+    /**
+     * Starts and installs the router. A failed bind (the fixed port is held by another process)
+     * is reported as `router_bind_failed` and retried with backoff by the worker loop; it never
+     * ends the worker. Returns true when the router was installed.
+     */
+    private fun installRouter(generation: Long): Boolean {
+        val nowMs = SystemClock.elapsedRealtime()
+        if (nowMs < nextRouterBindAttemptAtMs) return false
+        val started = try {
+            startSocksRouter()
+        } catch (error: Throwable) {
+            routerBindFailures++
+            val delayMs = routerBindRetryDelayMs(routerBindFailures)
+            nextRouterBindAttemptAtMs = nowMs + delayMs
+            Log.w(LOG_TAG, "router bind failed (attempt $routerBindFailures), retry in ${delayMs}ms: ${error.message}")
+            telemetryEvent("router_bind_failed",
+                "err_where" to "router_bind",
+                "err_kind" to Telemetry.errorKind(error),
+                "err_msg" to Telemetry.safeErrorMessage(error),
+                "fail" to routerBindFailures,
+                "backoff_ms" to delayMs,
+            )
+            return false
+        }
+        routerBindFailures = 0
+        nextRouterBindAttemptAtMs = 0L
         var replaced: SocksRouter? = null
         val installed = synchronized(resourceLock) {
             if (workerActive.get() && currentWorkerGeneration.get() == generation) {
@@ -2979,6 +3104,25 @@ class AutoTransportService : Service() {
         replaced?.stop()
         if (!installed) {
             started.stop()
+        }
+        return installed
+    }
+
+    /**
+     * Applies a change of the local proxy auth policy (password enabled, disabled or regenerated,
+     * VPN mode switched): sessions of other apps admitted under the previous policy are closed.
+     */
+    private fun enforceLocalProxyAuthPolicy() {
+        val routerNow = router
+        val proxyNow = httpProxy
+        if (routerNow == null && proxyNow == null) return
+        runLifecycleTask("proxy_auth_policy") {
+            val fingerprint = LocalSocksAuth.proxyAuthPolicy(applicationContext).fingerprint
+            val closedRouter = routerNow?.closeExternalSessionsNotAdmittedUnder(fingerprint) ?: 0
+            val closedProxy = proxyNow?.closeSessionsNotAdmittedUnder(fingerprint) ?: 0
+            if (closedRouter + closedProxy > 0) {
+                Log.i(LOG_TAG, "proxy auth policy changed, closed router=$closedRouter http=$closedProxy")
+            }
         }
     }
 
@@ -4374,7 +4518,7 @@ class AutoTransportService : Service() {
             port = ROUTER_PORT,
             upstreamProvider = { upstreamRef.get() },
             internalCredentials = { LocalSocksAuth.internal },
-            frontEndCredentials = { LocalSocksAuth.requiredFrontEndCredentials(appContext) },
+            authPolicy = { LocalSocksAuth.proxyAuthPolicy(appContext) },
             realityRxCounter = realityRxBytes,
             realityTxCounter = realityTxBytes,
             reality2RxCounter = reality2RxBytes,
@@ -4406,7 +4550,7 @@ class AutoTransportService : Service() {
                 port = LOCAL_HTTP_PROXY_PORT,
                 socksHost = ROUTER_HOST,
                 socksPort = ROUTER_PORT,
-                frontEndCredentials = { LocalSocksAuth.requiredFrontEndCredentials(appContext) },
+                authPolicy = { LocalSocksAuth.proxyAuthPolicy(appContext) },
                 upstreamCredentials = { LocalSocksAuth.internal },
             ).also { proxy ->
                 proxy.start()
@@ -5293,7 +5437,7 @@ class AutoTransportService : Service() {
         private val port: Int,
         private val upstreamProvider: () -> Upstream,
         private val internalCredentials: () -> SocksCredentials,
-        private val frontEndCredentials: () -> SocksCredentials?,
+        private val authPolicy: () -> LocalProxyAuthPolicy,
         private val realityRxCounter: AtomicLong,
         private val realityTxCounter: AtomicLong,
         private val reality2RxCounter: AtomicLong,
@@ -5301,7 +5445,14 @@ class AutoTransportService : Service() {
     ) {
         private val active = AtomicBoolean(false)
         private val ioPool = Executors.newCachedThreadPool()
-        private val activeSessionCount = AtomicLong(0)
+        private val handshakeDeadlines = Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "tw-socks-deadline").apply { isDaemon = true }
+        }
+        private val admission = RouterAdmission<Socket>(
+            maxPendingHandshakes = ROUTER_MAX_PENDING_HANDSHAKES,
+            maxInternalSessions = ROUTER_MAX_INTERNAL_SESSIONS,
+            maxExternalSessions = ROUTER_MAX_EXTERNAL_SESSIONS,
+        )
         private val sessions = Collections.synchronizedMap(mutableMapOf<Socket, TrackedSocket>())
         private val lastUserTrafficAtMs = AtomicLong(0)
         private val nextSessionID = AtomicLong(1)
@@ -5311,32 +5462,38 @@ class AutoTransportService : Service() {
         @Volatile
         private var acceptThread: Thread? = null
 
+        /** Binds the listener; throws (with every resource released) when the port is taken. */
         fun start() {
             if (!active.compareAndSet(false, true)) return
-            val server = ServerSocket().apply {
-                reuseAddress = true
-                bind(InetSocketAddress(InetAddress.getByName(host), port))
+            val server = try {
+                ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(InetAddress.getByName(host), port))
+                }
+            } catch (error: Throwable) {
+                active.set(false)
+                ioPool.shutdownNow()
+                handshakeDeadlines.shutdownNow()
+                throw error
             }
             serverSocket = server
             acceptThread = Thread {
                 while (active.get()) {
                     try {
                         val client = server.accept()
-                        if (activeSessionCount.incrementAndGet() > SOCKS_MAX_SESSIONS) {
-                            activeSessionCount.decrementAndGet()
-                            runCatching { client.close() }
-                            continue
-                        }
+                        admission.admitHandshake(client)?.let { evicted -> runCatching { evicted.close() } }
                         try {
-                            ioPool.execute {
-                                try {
-                                    handleClient(client)
-                                } finally {
-                                    activeSessionCount.decrementAndGet()
-                                }
-                            }
+                            // One deadline for the whole handshake (auth and CONNECT request).
+                            handshakeDeadlines.schedule(
+                                {
+                                    if (admission.finishHandshake(client)) runCatching { client.close() }
+                                },
+                                ROUTER_HANDSHAKE_DEADLINE_MS,
+                                TimeUnit.MILLISECONDS,
+                            )
+                            ioPool.execute { handleClient(client) }
                         } catch (rejected: RejectedExecutionException) {
-                            activeSessionCount.decrementAndGet()
+                            admission.finishHandshake(client)
                             runCatching { client.close() }
                         }
                     } catch (_: Throwable) {
@@ -5358,6 +5515,24 @@ class AutoTransportService : Service() {
         fun closeSessions() {
             val snapshot = synchronized(sessions) { sessions.keys.toList() }
             snapshot.forEach { runCatching { it.close() } }
+        }
+
+        /**
+         * Closes sessions of other apps admitted under an auth policy other than [fingerprint]
+         * (for example after the proxy password was enabled or regenerated). Sessions of
+         * in-process clients are kept.
+         */
+        fun closeExternalSessionsNotAdmittedUnder(fingerprint: String): Int {
+            val snapshot = synchronized(sessions) {
+                sessions
+                    .filterValues { it.external && it.policyFingerprint != fingerprint }
+                    .map { it.key }
+            }
+            var closed = 0
+            snapshot.forEach { socket ->
+                if (runCatching { socket.close() }.isSuccess) closed++
+            }
+            return closed
         }
 
         fun closeSessionsCreatedBefore(cutoffElapsedRealtimeMs: Long): Int {
@@ -5454,6 +5629,7 @@ class AutoTransportService : Service() {
         fun stop() {
             closeListener()
             closeSessions()
+            handshakeDeadlines.shutdownNow()
             ioPool.shutdownNow()
             runCatching { acceptThread?.join(SOCKS_STOP_DRAIN_TIMEOUT_MS) }
             runCatching { ioPool.awaitTermination(SOCKS_STOP_DRAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS) }
@@ -5464,6 +5640,7 @@ class AutoTransportService : Service() {
             val sessionCreatedAtMs = SystemClock.elapsedRealtime()
             var upstream: Socket? = null
             val tracked = TrackedSocket(sessionCreatedAtMs)
+            var sessionBudgetInternal: Boolean? = null
             sessions[client] = tracked
             try {
                 client.use { clientSocket ->
@@ -5471,7 +5648,14 @@ class AutoTransportService : Service() {
                     clientSocket.soTimeout = CLIENT_HANDSHAKE_TIMEOUT_MS
                     val clientIn = clientSocket.getInputStream()
                     val clientOut = clientSocket.getOutputStream()
-                    val request = readClientConnectRequest(clientIn, clientOut)
+                    val request = readClientConnectRequest(clientIn, clientOut, tracked)
+                    // Evicted or timed out while the handshake was running: the socket is closed.
+                    if (!admission.finishHandshake(clientSocket)) throw EOFException("handshake expired")
+                    val internalClient = !tracked.external
+                    if (!admission.tryAcquireSession(internalClient)) {
+                        throw SocksRequestRejectedException("session budget exhausted internal=$internalClient")
+                    }
+                    sessionBudgetInternal = internalClient
                     val selected = upstreamProvider()
                     tracked.upstreamPort = selected.port
                     tracked.upstreamGeneration = selected.generation
@@ -5508,6 +5692,8 @@ class AutoTransportService : Service() {
                     runCatching { sendFailure(client.getOutputStream()) }
                 }
             } finally {
+                admission.finishHandshake(client)
+                sessionBudgetInternal?.let { admission.releaseSession(it) }
                 upstream?.let {
                     sessions.remove(it)
                     runCatching { it.close() }
@@ -5516,13 +5702,22 @@ class AutoTransportService : Service() {
             }
         }
 
-        private fun readClientConnectRequest(input: InputStream, output: OutputStream): SocksConnectRequest {
-            negotiateLocalSocksServerAuth(
+        private fun readClientConnectRequest(
+            input: InputStream,
+            output: OutputStream,
+            tracked: TrackedSocket,
+        ): SocksConnectRequest {
+            val internal = internalCredentials()
+            val auth = authPolicy()
+            val matched = negotiateLocalSocksServerAuth(
                 input = input,
                 output = output,
-                internal = internalCredentials(),
-                frontEnd = frontEndCredentials(),
+                internal = internal,
+                frontEnd = auth.frontEnd,
+                allowNoAuth = auth.allowNoAuth,
             )
+            tracked.external = matched != internal
+            tracked.policyFingerprint = auth.fingerprint
 
             val header = input.readExact(4)
             if (header[0].toInt() and BYTE_MASK != SOCKS_VERSION) throw EOFException()
@@ -5777,7 +5972,6 @@ class AutoTransportService : Service() {
 
         private companion object {
             private const val PROXY_BUFFER_BYTES = 64 * 1024
-            private const val SOCKS_MAX_SESSIONS = 256L
             private const val SOCKS_STOP_DRAIN_TIMEOUT_MS = 2_000L
             private const val ACCEPT_RETRY_DELAY_MS = 100L
             private const val CLIENT_HANDSHAKE_TIMEOUT_MS = 30_000

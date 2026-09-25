@@ -393,6 +393,7 @@ class UpdateDownloader(
                 host = targetHost,
                 port = targetPort,
                 credentials = LocalSocksAuth.internal,
+                peerPort = proxyPort,
             )
             return socket
         } catch (error: Throwable) {
