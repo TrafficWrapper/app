@@ -10,6 +10,17 @@ internal object VpnAutoRestore {
     fun preferenceEnabled(context: Context): Boolean =
         BuildConfig.VPN_ENABLED && TransportLifecycleStore.vpnEnabled(context.applicationContext)
 
+    /**
+     * Restores the VPN only while the transport is meant to run (the VPN bridges into it), as
+     * BootReceiver does. Used from the activity resume and the backstop alarm so that a VPN lost
+     * to a process death comes back without waiting for a reboot. Must run on the main thread.
+     */
+    fun maybeRestoreWithTransport(context: Context, reason: String): Boolean {
+        val appContext = context.applicationContext
+        if (!TransportLifecycleStore.shouldKeepAlive(appContext)) return false
+        return maybeRestore(appContext, reason)
+    }
+
     fun maybeRestore(context: Context, reason: String): Boolean {
         val appContext = context.applicationContext
         val state = TransportRuntime.state
@@ -35,7 +46,15 @@ internal object VpnAutoRestore {
             vpnEnabled = true,
             vpnTransition = VpnTransition.STARTING,
         )
-        startVpnService(appContext)
+        val started = runCatching { startVpnService(appContext) }
+            .onFailure { Log.w(LOG_TAG, "vpn auto-restore start failed reason=$reason: ${it.message}") }
+            .isSuccess
+        if (!started) {
+            // E.g. a background foreground-service start refused by the platform: do not leave
+            // the UI stuck in STARTING; the next resume / backstop / sticky restart retries.
+            TransportRuntime.state = TransportRuntime.state.copy(vpnTransition = VpnTransition.NONE)
+            return false
+        }
         Log.i(LOG_TAG, "vpn auto-restore requested: reason=$reason")
         return true
     }

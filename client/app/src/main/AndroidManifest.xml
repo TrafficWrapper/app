@@ -59,14 +59,6 @@
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
         <service
-            android:name=".TransportService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
-        <service
-            android:name=".RealityService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
-        <service
             android:name=".AutoTransportService"
             android:exported="false"
             android:foregroundServiceType="specialUse">
