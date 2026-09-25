@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,16 +25,27 @@ const (
 	socksConnect                = 0x01
 	socksShutdownGrace          = 2 * time.Second
 	socksClientHandshakeTimeout = 45 * time.Second
-	socksUpstreamDialTimeout    = 30 * time.Second
+	// defaultSOCKSPreAuthConns is the separate, small budget for connections
+	// that have not authenticated yet, so unauthenticated clients cannot
+	// occupy the main connection slots.
+	defaultSOCKSPreAuthConns = 128
+	socksUpstreamDialTimeout = 30 * time.Second
 	// defaultSOCKSMaxConns bounds concurrent client connections (and thus
 	// goroutines, buffers and netstack endpoints) per SOCKS listener.
 	defaultSOCKSMaxConns = 1024
 )
 
 var (
+	// socksPreAuthTimeout bounds the unauthenticated part of a connection
+	// (method negotiation and RFC 1929 credentials).
+	socksPreAuthTimeout   = 5 * time.Second
 	socksAcceptBackoffMin = 50 * time.Millisecond
 	socksAcceptBackoffMax = 200 * time.Millisecond
-	socksProxyIdleTimeout = 3 * time.Minute
+	// socksAcceptFailBackoffMax caps the retry interval after a
+	// non-temporary accept error; the loop keeps retrying and reports the
+	// listener as dead until an accept succeeds again.
+	socksAcceptFailBackoffMax = 2 * time.Second
+	socksProxyIdleTimeout     = 3 * time.Minute
 )
 
 type socksServer struct {
@@ -42,8 +54,14 @@ type socksServer struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
-	// sem limits concurrent connections; nil means unlimited (tests only).
+	// sem limits concurrent authenticated connections; nil means unlimited
+	// (tests only).
 	sem chan struct{}
+	// preAuth limits connections that have not authenticated yet; nil means
+	// unlimited (tests only).
+	preAuth chan struct{}
+	// dead is set while Accept keeps failing with non-temporary errors.
+	dead atomic.Bool
 }
 
 func startSOCKSServer(listen string, maxConns int, tnet *netstacktun.Net) (*socksServer, error) {
@@ -57,6 +75,10 @@ func startSOCKSServer(listen string, maxConns int, tnet *netstacktun.Net) (*sock
 	if maxConns <= 0 {
 		maxConns = defaultSOCKSMaxConns
 	}
+	preAuth := defaultSOCKSPreAuthConns
+	if preAuth > maxConns {
+		preAuth = maxConns
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &socksServer{
 		listener: ln,
@@ -64,6 +86,7 @@ func startSOCKSServer(listen string, maxConns int, tnet *netstacktun.Net) (*sock
 		ctx:      ctx,
 		cancel:   cancel,
 		sem:      make(chan struct{}, maxConns),
+		preAuth:  make(chan struct{}, preAuth),
 	}
 	server.wg.Add(1)
 	go server.serve(ctx)
@@ -99,38 +122,71 @@ func (s *socksServer) serve(ctx context.Context) {
 			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				return
 			}
+			maxBackoff := socksAcceptBackoffMax
 			if isTemporaryAcceptError(err) {
 				log.Printf("transport: socks accept temporary error: %v", err)
-				timer := time.NewTimer(backoff)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
+			} else {
+				// Keep retrying instead of silently stopping while the
+				// instance still reports itself as started; Stat exposes
+				// socks_dead until an accept succeeds again.
+				if !s.dead.Swap(true) {
+					log.Printf("transport: socks accept failing: %v", err)
 				}
-				backoff *= 2
-				if backoff > socksAcceptBackoffMax {
-					backoff = socksAcceptBackoffMax
-				}
-				continue
+				maxBackoff = socksAcceptFailBackoffMax
 			}
-			log.Printf("transport: socks accept stopped after permanent error: %v", err)
-			return
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+		if s.dead.Swap(false) {
+			log.Printf("transport: socks accept recovered")
 		}
 		backoff = socksAcceptBackoffMin
-		if !s.acquire() {
-			// Over the limit: shed the connection instead of queueing it, so
-			// a flood cannot pin unbounded goroutines and netstack state.
+		if !s.acquirePreAuth() {
+			// Over the pre-auth budget: shed the connection instead of
+			// queueing it, so a flood cannot pin goroutines or slots.
 			_ = client.Close()
 			continue
 		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			defer s.release()
+			defer recoverGoroutine("socks connection")
 			_ = s.handle(ctx, client)
 		}()
 	}
+}
+
+func (s *socksServer) acquirePreAuth() bool {
+	if s.preAuth == nil {
+		return true
+	}
+	select {
+	case s.preAuth <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *socksServer) releasePreAuth() {
+	if s.preAuth != nil {
+		<-s.preAuth
+	}
+}
+
+// isDead reports whether the accept loop is currently failing.
+func (s *socksServer) isDead() bool {
+	return s != nil && s.dead.Load()
 }
 
 func (s *socksServer) acquire() bool {
@@ -151,8 +207,16 @@ func (s *socksServer) release() {
 	}
 }
 
+// handle serves one client. The caller has reserved a pre-auth slot; it is
+// exchanged for a main slot once RFC 1929 authentication succeeds.
 func (s *socksServer) handle(ctx context.Context, client net.Conn) error {
 	defer client.Close()
+	preAuthHeld := true
+	defer func() {
+		if preAuthHeld {
+			s.releasePreAuth()
+		}
+	}()
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -164,10 +228,19 @@ func (s *socksServer) handle(ctx context.Context, client net.Conn) error {
 	}()
 	defer close(done)
 	tuneConn(client)
-	if err := client.SetDeadline(time.Now().Add(socksClientHandshakeTimeout)); err != nil {
+	if err := client.SetDeadline(time.Now().Add(socksPreAuthTimeout)); err != nil {
 		return err
 	}
 	if err := socksHandshake(client); err != nil {
+		return err
+	}
+	if !s.acquire() {
+		return errSOCKSBusy
+	}
+	defer s.release()
+	s.releasePreAuth()
+	preAuthHeld = false
+	if err := client.SetDeadline(time.Now().Add(socksClientHandshakeTimeout)); err != nil {
 		return err
 	}
 	target, err := readSOCKSConnect(client)
@@ -180,7 +253,7 @@ func (s *socksServer) handle(ctx context.Context, client net.Conn) error {
 	upstream, err := s.dial(dialCtx, target)
 	if err != nil {
 		if errors.Is(err, errUnsupportedAddrType) {
-			log.Printf("transport: socks refused IPv6/unsupported %q (fail-closed)", target.host)
+			debugLogf("transport: socks refused IPv6/unsupported %q (fail-closed)", target.host)
 			_ = writeSOCKSReply(client, 0x08)
 		} else {
 			_ = writeSOCKSReply(client, 0x05)
@@ -283,7 +356,10 @@ var dialSOCKSTargetTCP = func(ctx context.Context, tnet *netstacktun.Net, addr n
 	return tnet.DialContextTCPAddrPort(ctx, addr)
 }
 
-var errUnsupportedAddrType = errors.New("unsupported address type")
+var (
+	errUnsupportedAddrType = errors.New("unsupported address type")
+	errSOCKSBusy           = errors.New("socks connection limit reached")
+)
 
 func resolveTarget(ctx context.Context, tnet *netstacktun.Net, target socksTarget) (netip.AddrPort, error) {
 	if ip, err := netip.ParseAddr(target.host); err == nil {

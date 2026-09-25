@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="local_proxy_no_auth_warning">Without a password any app on the device can use the tunnel through the local proxy and learn the server address. Turn the password off only for an app that cannot send it.</string>
+    <string name="local_proxy_vpn_internal_only">In VPN mode the local proxy without a password is not available to other apps: their traffic already goes through the VPN. Turn the password on to use the proxy in VPN mode.</string>
+</resources>

@@ -128,7 +128,8 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	var sendBuffer [][]byte
 
-	for _, ipacket := range peer.device.ipackets {
+	params := peer.device.awgParams()
+	for _, ipacket := range params.ipackets {
 		if ipacket != nil {
 			buf := make([]byte, ipacket.ObfuscatedLen(0))
 			ipacket.Obfuscate(buf, nil)
@@ -136,9 +137,9 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		}
 	}
 
-	jc := peer.device.junk.count
-	jmin := peer.device.junk.min
-	jmax := peer.device.junk.max
+	jc := params.junkCount
+	jmin := params.junkMin
+	jmax := params.junkMax
 
 	for i := 0; i < jc; i++ {
 		n := jmin
@@ -163,7 +164,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	if padding := peer.device.paddings.init; padding > 0 {
+	if padding := params.initPadding; padding > 0 {
 		buf := make([]byte, padding+len(packet))
 		rand.Read(buf[:padding])
 		copy(buf[padding:], packet)
@@ -211,7 +212,7 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	if padding := peer.device.paddings.response; padding > 0 {
+	if padding := peer.device.awgParams().responsePadding; padding > 0 {
 		buf := make([]byte, padding+len(packet))
 		rand.Read(buf[:padding])
 		copy(buf[padding:], packet)
@@ -230,7 +231,8 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
 
 	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
-	msgType := device.headers.cookie.Generate()
+	params := device.awgParams()
+	msgType := params.cookieHeader.Generate()
 
 	reply, err := device.cookieChecker.CreateReply(
 		initiatingElem.packet,
@@ -248,7 +250,7 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 	binary.Write(writer, binary.LittleEndian, reply)
 	packet := writer.Bytes()
 
-	if padding := device.paddings.cookie; padding > 0 {
+	if padding := params.cookiePadding; padding > 0 {
 		buf := make([]byte, padding+len(packet))
 		rand.Read(buf[:padding])
 		copy(buf[padding:], packet)
@@ -520,7 +522,7 @@ func (device *Device) RoutineEncryption(id int) {
 			fieldReceiver := header[4:8]
 			fieldNonce := header[8:16]
 
-			msgType := device.headers.transport.Generate()
+			msgType := device.awgParams().transportHeader.Generate()
 
 			binary.LittleEndian.PutUint32(fieldType, msgType)
 			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
@@ -576,11 +578,17 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		}
 		dataSent := false
 		elemsContainer.Lock()
+		params := device.awgParams()
 		for _, elem := range elemsContainer.elems {
 			if len(elem.packet) != MessageKeepaliveSize {
 				dataSent = true
 			}
-			if padding := device.paddings.transport; padding > 0 {
+			if padding := params.transportPadding; padding > 0 {
+				if padding+len(elem.packet) > len(elem.buffer) {
+					// Cannot happen with a validated s4 and the current
+					// MTU; drop instead of writing past the buffer.
+					continue
+				}
 				// elem.packet is stored at the start of elem.buffer
 				// with zero padding
 				for i := len(elem.packet) - 1; i >= 0; i-- {
