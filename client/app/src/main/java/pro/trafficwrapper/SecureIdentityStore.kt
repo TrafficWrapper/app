@@ -41,7 +41,30 @@ data class StoredReleaseState(
     val maxMinSupportedVersion: Long = 0,
     val trustedWallTimeMs: Long = 0,
     val trustedElapsedRealtimeMs: Long = 0,
-)
+    /** Boot the trusted-time anchor belongs to (-1/0 = unknown: the anchor is not reused). */
+    val trustedBootCount: Int = -1,
+    val trustedBootWallMs: Long = 0,
+) {
+    /** Update trusted-time anchor (signed manifest time + monotonic delta), or null if unset. */
+    val trustedAnchor: TrustedTimeAnchor?
+        get() = if (trustedWallTimeMs > 0 && trustedElapsedRealtimeMs > 0) {
+            TrustedTimeAnchor(
+                wallTimeMs = trustedWallTimeMs,
+                elapsedRealtimeMs = trustedElapsedRealtimeMs,
+                boot = BootIdentity(trustedBootCount, trustedBootWallMs),
+            )
+        } else {
+            null
+        }
+
+    fun withTrustedAnchor(anchor: TrustedTimeAnchor): StoredReleaseState =
+        copy(
+            trustedWallTimeMs = anchor.wallTimeMs,
+            trustedElapsedRealtimeMs = anchor.elapsedRealtimeMs,
+            trustedBootCount = anchor.boot.bootCount,
+            trustedBootWallMs = anchor.boot.bootWallMs,
+        )
+}
 
 data class StoredRendezvousState(
     val maxSeenRendezvousSeq: Long = 0,
@@ -49,7 +72,52 @@ data class StoredRendezvousState(
     val trustedElapsedRealtimeMs: Long = 0,
     val lastValidIssuedAtMs: Long = 0,
     val discoverySinks: List<String> = emptyList(),
-)
+    val trustedBootCount: Int = -1,
+    val trustedBootWallMs: Long = 0,
+) {
+    val trustedAnchor: TrustedTimeAnchor?
+        get() = if (trustedWallTimeMs > 0 && trustedElapsedRealtimeMs > 0) {
+            TrustedTimeAnchor(
+                wallTimeMs = trustedWallTimeMs,
+                elapsedRealtimeMs = trustedElapsedRealtimeMs,
+                boot = BootIdentity(trustedBootCount, trustedBootWallMs),
+            )
+        } else {
+            null
+        }
+}
+
+/**
+ * Next persisted rendezvous state after a verified bundle. The trusted-time anchor is advanced
+ * only from the signed issued_at and the same-boot monotonic extrapolation of the previous
+ * anchor; the caller's SNTP-derived wall time is not persisted (APP-M6/M23).
+ */
+internal fun nextRendezvousState(
+    current: StoredRendezvousState,
+    seq: Long,
+    issuedAtMs: Long,
+    elapsedRealtimeMs: Long,
+    boot: BootIdentity,
+    systemNowMs: Long,
+    discoverySinks: List<String>,
+): StoredRendezvousState {
+    val anchor = nextTrustedTimeAnchor(
+        current = current.trustedAnchor,
+        signedIssuedAtMs = issuedAtMs,
+        currentBoot = boot,
+        currentElapsedRealtimeMs = elapsedRealtimeMs,
+        systemNowMs = systemNowMs,
+    )
+    return StoredRendezvousState(
+        maxSeenRendezvousSeq = maxOf(current.maxSeenRendezvousSeq, seq),
+        trustedWallTimeMs = anchor.wallTimeMs,
+        trustedElapsedRealtimeMs = anchor.elapsedRealtimeMs,
+        lastValidIssuedAtMs = maxOf(current.lastValidIssuedAtMs, issuedAtMs),
+        discoverySinks = discoverySinks.ifEmpty { current.discoverySinks },
+        trustedBootCount = anchor.boot.bootCount,
+        trustedBootWallMs = anchor.boot.bootWallMs,
+    )
+}
 
 data class StoredPublicPlatformState(
     val bootstrapRaw: String = "",
@@ -459,6 +527,8 @@ class SecureIdentityStore(context: Context) {
             maxMinSupportedVersion = root.optLong(JSON_MAX_MIN_SUPPORTED_VERSION, 0),
             trustedWallTimeMs = root.optLong(JSON_TRUSTED_WALL_TIME_MS, 0),
             trustedElapsedRealtimeMs = root.optLong(JSON_TRUSTED_ELAPSED_REALTIME_MS, 0),
+            trustedBootCount = root.optInt(JSON_TRUSTED_BOOT_COUNT, -1),
+            trustedBootWallMs = root.optLong(JSON_TRUSTED_BOOT_WALL_MS, 0),
         )
     }
 
@@ -468,6 +538,8 @@ class SecureIdentityStore(context: Context) {
             .put(JSON_MAX_MIN_SUPPORTED_VERSION, state.maxMinSupportedVersion)
             .put(JSON_TRUSTED_WALL_TIME_MS, state.trustedWallTimeMs)
             .put(JSON_TRUSTED_ELAPSED_REALTIME_MS, state.trustedElapsedRealtimeMs)
+            .put(JSON_TRUSTED_BOOT_COUNT, state.trustedBootCount)
+            .put(JSON_TRUSTED_BOOT_WALL_MS, state.trustedBootWallMs)
         if (!prefs.edit().putString(KEY_RELEASE_STATE, seal(root.toString(), key)).commit()) {
             throw IllegalStateException("failed to persist release state")
         }
@@ -494,6 +566,12 @@ class SecureIdentityStore(context: Context) {
         }
     }
 
+    /**
+     * Persists a verified rendezvous. [trustedWallTimeMs] is accepted for source compatibility
+     * but not persisted: it may come from unauthenticated SNTP (APP-M6). The stored anchor is the
+     * signed [issuedAtMs] plus the same-boot monotonic delta, see [nextRendezvousState].
+     */
+    @Suppress("UNUSED_PARAMETER")
     fun recordVerifiedRendezvous(
         seq: Long,
         trustedWallTimeMs: Long,
@@ -507,17 +585,21 @@ class SecureIdentityStore(context: Context) {
             if (current.maxSeenRendezvousSeq > 0 && seq < current.maxSeenRendezvousSeq) {
                 throw IllegalStateException("rendezvous rollback")
             }
-            val next = StoredRendezvousState(
-                maxSeenRendezvousSeq = maxOf(current.maxSeenRendezvousSeq, seq),
-                trustedWallTimeMs = maxOf(current.trustedWallTimeMs, trustedWallTimeMs, issuedAtMs),
-                trustedElapsedRealtimeMs = trustedElapsedRealtimeMs,
-                lastValidIssuedAtMs = maxOf(current.lastValidIssuedAtMs, issuedAtMs),
-                discoverySinks = discoverySinks.ifEmpty { current.discoverySinks },
+            val next = nextRendezvousState(
+                current = current,
+                seq = seq,
+                issuedAtMs = issuedAtMs,
+                elapsedRealtimeMs = trustedElapsedRealtimeMs,
+                boot = ClockDiagnostics.currentBoot(appContext),
+                systemNowMs = System.currentTimeMillis(),
+                discoverySinks = discoverySinks,
             )
             val root = JSONObject()
                 .put(JSON_MAX_SEEN_RENDEZVOUS_SEQ, next.maxSeenRendezvousSeq)
                 .put(JSON_TRUSTED_WALL_TIME_MS, next.trustedWallTimeMs)
                 .put(JSON_TRUSTED_ELAPSED_REALTIME_MS, next.trustedElapsedRealtimeMs)
+                .put(JSON_TRUSTED_BOOT_COUNT, next.trustedBootCount)
+                .put(JSON_TRUSTED_BOOT_WALL_MS, next.trustedBootWallMs)
                 .put(JSON_LAST_VALID_ISSUED_AT_MS, next.lastValidIssuedAtMs)
                 .put(JSON_DISCOVERY_SINKS, JSONArray(next.discoverySinks))
             if (!prefs.edit().putString(KEY_RENDEZVOUS_STATE, seal(root.toString(), keyState.key)).commit()) {
@@ -537,6 +619,8 @@ class SecureIdentityStore(context: Context) {
             trustedElapsedRealtimeMs = root.optLong(JSON_TRUSTED_ELAPSED_REALTIME_MS, 0),
             lastValidIssuedAtMs = root.optLong(JSON_LAST_VALID_ISSUED_AT_MS, 0),
             discoverySinks = root.optJSONArray(JSON_DISCOVERY_SINKS).toStringList(),
+            trustedBootCount = root.optInt(JSON_TRUSTED_BOOT_COUNT, -1),
+            trustedBootWallMs = root.optLong(JSON_TRUSTED_BOOT_WALL_MS, 0),
         )
     }
 
@@ -726,6 +810,8 @@ class SecureIdentityStore(context: Context) {
         private const val JSON_TRUSTED_WALL_TIME_MS = "trusted_wall_time_ms"
         private const val JSON_TRUSTED_ELAPSED_REALTIME_MS = "trusted_elapsed_realtime_ms"
         private const val JSON_LAST_VALID_ISSUED_AT_MS = "last_valid_issued_at_ms"
+        private const val JSON_TRUSTED_BOOT_COUNT = "trusted_boot_count"
+        private const val JSON_TRUSTED_BOOT_WALL_MS = "trusted_boot_wall_ms"
         private const val JSON_AWG_PRIVATE_KEY = "awg_private_key"
         private const val JSON_AWG_PUBLIC_KEY = "awg_public_key"
     }

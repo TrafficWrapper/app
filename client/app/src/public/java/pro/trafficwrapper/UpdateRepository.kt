@@ -12,6 +12,9 @@ class UpdateRepository(private val context: Context) {
         auth: AuthUiState,
         socksListen: String,
     ): UpdateCheckOutcome {
+        // APKs of already installed versions are never needed again (APP-L32).
+        runCatching { pruneUpdateCache(updateCacheDir(), BuildConfig.VERSION_CODE.toLong()) }
+            .onFailure { Log.w(TAG, "public update cache cleanup failed", it) }
         val directEnabled = TransportLifecycleStore.directUpdateFallbackEnabled(context)
         val tunnelViable = auth.authorized && socksListen.isNotBlank()
         if (!tunnelViable && !directEnabled) {
