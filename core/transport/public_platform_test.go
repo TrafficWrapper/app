@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"github.com/TrafficWrapper/app/core/internal/provisionclient"
-
-	awgdialect "github.com/TrafficWrapper/app/core/awg/dialect"
 )
 
 func TestPublicEnrollAWGKeyPairReplaysStoredKeys(t *testing.T) {
@@ -81,7 +79,7 @@ func TestParseConfigInjectsDefaultDNSServers(t *testing.T) {
 		Endpoint:        "203.0.113.10:51821",
 		ServerPublicKey: testKey(2),
 		PSK2:            testKey(3),
-		AWGPreset:       awgdialect.Compat(),
+		AWGPreset:       testBasePreset(),
 		MTU:             1420,
 	}
 	raw, err := json.Marshal(cfg)
@@ -104,6 +102,7 @@ func TestPublicAWGConfigJSONWritesDNSServers(t *testing.T) {
 	route := &publicRouteSpec{
 		Endpoint:  "203.0.113.5:51888",
 		PublicKey: testKey(2),
+		AWGPreset: testBasePresetRaw(),
 	}
 	req := publicApplyAPIRequest{
 		AWGPrivateKey:   testKey(1),
@@ -140,8 +139,8 @@ func TestPublicAWGConfigJSONWritesDNSServers(t *testing.T) {
 func TestPublicAWGConfigJSONPinsHostnameEndpointWithExpectedEgressIP(t *testing.T) {
 	var route publicRouteSpec
 	if err := json.Unmarshal([]byte(fmt.Sprintf(
-		`{"endpoint":"worker.example:51888","egress_ip":"198.51.100.44","public_key":%q}`,
-		testKey(2),
+		`{"endpoint":"worker.example:51888","egress_ip":"198.51.100.44","public_key":%q,"awg_preset":%s}`,
+		testKey(2), testBasePresetRaw(),
 	)), &route); err != nil {
 		t.Fatal(err)
 	}
@@ -169,6 +168,7 @@ func TestPublicAWGConfigJSONRejectsHostnameEndpointWithoutPinnedIP(t *testing.T)
 	route := &publicRouteSpec{
 		Endpoint:  "worker.example:51888",
 		PublicKey: testKey(2),
+		AWGPreset: testBasePresetRaw(),
 	}
 	req := publicApplyAPIRequest{
 		AWGPrivateKey:   testKey(1),
@@ -288,7 +288,7 @@ func TestApplyPublicPlatformConfigKeepsStoredConfigs(t *testing.T) {
 	setPendingProvision(t, "stored-default", "stored-awg-ru")
 	base := testPublicApplyRequest()
 	base.AWG = nil
-	route := &publicRouteSpec{Endpoint: "203.0.113.10:51821"}
+	route := &publicRouteSpec{Endpoint: "203.0.113.10:51821", AWGPreset: testBasePresetRaw()}
 
 	onlyRU := base
 	onlyRU.AWGRU = route
