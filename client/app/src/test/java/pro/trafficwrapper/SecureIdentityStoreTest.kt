@@ -207,4 +207,34 @@ class SecureIdentityStoreTest {
         val owned = state.copy(maxSeenUpdateSeqPin = "other")
         assertEquals("other", publicPlatformStateFromJson(publicPlatformStateToJson(owned)).maxSeenUpdateSeqPin)
     }
+
+    @Test
+    fun onlyAeadTagMismatchCountsAsForeignKey() {
+        assertEquals(SealedOpenFailure.FOREIGN_KEY, classifySealedOpenFailure(javax.crypto.AEADBadTagException("tag")))
+        assertEquals(
+            SealedOpenFailure.FOREIGN_KEY,
+            classifySealedOpenFailure(java.security.ProviderException("wrapped", javax.crypto.AEADBadTagException("tag"))),
+        )
+    }
+
+    @Test
+    fun keystoreHiccupsAreTransientAndNeverResetState() {
+        assertEquals(SealedOpenFailure.TRANSIENT, classifySealedOpenFailure(java.security.ProviderException("keystore busy")))
+        assertEquals(SealedOpenFailure.TRANSIENT, classifySealedOpenFailure(java.security.KeyStoreException("binder died")))
+        assertEquals(SealedOpenFailure.TRANSIENT, classifySealedOpenFailure(java.security.InvalidKeyException("strongbox busy")))
+        assertEquals(SealedOpenFailure.TRANSIENT, classifySealedOpenFailure(IllegalStateException("cipher")))
+    }
+
+    @Test
+    fun malformedEnvelopeIsNotRetried() {
+        assertEquals(SealedOpenFailure.MALFORMED, classifySealedOpenFailure(org.json.JSONException("bad")))
+        assertEquals(SealedOpenFailure.MALFORMED, classifySealedOpenFailure(IllegalArgumentException("bad base64")))
+    }
+
+    @Test
+    fun telemetrySigningIsSerializedOnTheProcessLock() {
+        val source = java.io.File("src/main/java/pro/trafficwrapper/SecureIdentityStore.kt").readText()
+        assertTrue(source.contains("fun signTelemetry(canonical: String): String = synchronized(LOCK)"))
+        assertTrue(source.contains("fun signDeviceEnrollment(canonicalPayload: String): String = synchronized(LOCK)"))
+    }
 }
