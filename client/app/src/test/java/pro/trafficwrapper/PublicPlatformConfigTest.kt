@@ -4,10 +4,12 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.Base64
 
 class PublicPlatformConfigTest {
@@ -721,18 +723,118 @@ class PublicPlatformConfigTest {
             socksListen = "127.0.0.1:18080",
         )
 
+        // Worker-supplied params.discovery_urls are not a sink source (APP-M20).
         assertEquals(
             listOf(
                 "http://awg-gw:8080/tw",
-                "https://worker.example/discovery",
                 "https://orch.dev/discovery",
             ),
             sinks.map { it.baseUrl },
         )
         assertEquals("127.0.0.1:18080", sinks[0].socksListen)
         assertEquals("", sinks[1].socksListen)
-        assertEquals("", sinks[2].socksListen)
         assertTrue(sinks.none { it.baseUrl.contains("netcloud", ignoreCase = true) })
+        assertTrue(sinks.none { it.baseUrl.contains("worker.example", ignoreCase = true) })
+    }
+
+    @Test
+    fun discoverySinksIgnoreWorkerDiscoveryUrlParams() {
+        val configJson = JSONObject(discoveryClientConfig())
+        val params = configJson.getJSONArray("workers").getJSONObject(0)
+            .getJSONArray("routes").getJSONObject(0).getJSONObject("params")
+        params.put("discovery_url", "https://attacker.example/d")
+        params.put("discovery_urls", org.json.JSONArray(listOf("https://attacker2.example/d", "http://attacker3.local/tw")))
+        val parsed = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = JSONObject()
+                .put("config_json", configJson.toString())
+                .put("minisig", "sig")
+                .toString(),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 0,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        val sinks = discoverySinks(
+            stored = StoredPublicPlatformState(
+                bootstrapRaw = bootstrapJson("2035-01-01T00:00:00Z"),
+                configPubkeyPin = PUBLIC_KEY,
+            ),
+            config = parsed,
+            socksListen = "127.0.0.1:18080",
+            nowMs = Instant.parse("2031-01-01T00:00:00Z").toEpochMilli(),
+        )
+
+        assertEquals(listOf("route-config-0", "orchestrator-direct"), sinks.map { it.name })
+        assertTrue(sinks.none { it.baseUrl.contains("attacker") })
+    }
+
+    @Test
+    fun discoveryNextSinksAndRescuePointersExpireWithSignedContainer() {
+        val parsed = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = JSONObject()
+                .put("config_json", discoveryClientConfigWithRescue())
+                .put("minisig", "sig")
+                .toString(),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 0,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        val stored = StoredPublicPlatformState(
+            bootstrapRaw = bootstrapJson("2035-01-01T00:00:00Z"),
+            configPubkeyPin = PUBLIC_KEY,
+        )
+        val feedExpiresAt = Instant.parse("2031-01-01T00:00:00Z").toEpochMilli()
+        val rendezvous = StoredRendezvousState(
+            discoverySinks = listOf("https://next.example/discovery"),
+            discoverySinksSeq = 5,
+            discoverySinksExpiresAtMs = feedExpiresAt,
+        )
+        fun names(nowIso: String, state: StoredRendezvousState = rendezvous) = discoverySinks(
+            stored = stored,
+            config = parsed,
+            socksListen = "127.0.0.1:18080",
+            rendezvousState = state,
+            nowMs = Instant.parse(nowIso).toEpochMilli(),
+        ).map { it.name }
+
+        // Feed and client bundle (expires 2035) both valid.
+        assertTrue(names("2030-06-01T00:00:00Z").containsAll(listOf("signed-next-0", "rescue-pointer-0")))
+        // Feed expired: its next_sinks are gone, the bundle's rescue pointer stays.
+        val afterFeed = names("2031-01-01T00:00:00Z")
+        assertFalse(afterFeed.contains("signed-next-0"))
+        assertTrue(afterFeed.contains("rescue-pointer-0"))
+        // Client bundle expired too: rescue pointer gone; tunnel config_url and orchestrator remain.
+        val afterBundle = names("2035-01-01T00:00:00Z")
+        assertEquals(listOf("route-config-0", "orchestrator-direct"), afterBundle)
+        // Legacy persisted sinks without a recorded expiry stay usable until replaced.
+        assertTrue(
+            names("2034-01-01T00:00:00Z", StoredRendezvousState(discoverySinks = listOf("https://next.example/discovery")))
+                .contains("signed-next-0"),
+        )
+    }
+
+    @Test
+    fun rendezvousSinksFromNewerFeedAreAuthoritative() {
+        val current = StoredRendezvousState(
+            discoverySinks = listOf("https://old.example/discovery"),
+            discoverySinksSeq = 7,
+            discoverySinksExpiresAtMs = 1_000,
+        )
+        // Higher seq replaces, even with an empty list (operator withdrew the sink).
+        assertEquals(Triple(emptyList<String>(), 8L, 2_000L), mergeRendezvousSinks(current, 8, emptyList(), 2_000))
+        assertEquals(
+            Triple(listOf("https://new.example/discovery"), 8L, 2_000L),
+            mergeRendezvousSinks(current, 8, listOf("https://new.example/discovery"), 2_000),
+        )
+        // Same seq (re-fetched feed) keeps the stored list.
+        assertEquals(
+            Triple(listOf("https://old.example/discovery"), 7L, 1_000L),
+            mergeRendezvousSinks(current, 7, emptyList(), 1_500),
+        )
+        // Legacy state without seq/expiry is always replaced by a verified feed.
+        val legacy = StoredRendezvousState(discoverySinks = listOf("https://old.example/discovery"))
+        assertEquals(Triple(emptyList<String>(), 3L, 2_000L), mergeRendezvousSinks(legacy, 3, emptyList(), 2_000))
     }
 
     @Test

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,16 @@ var discoveryTrust struct {
 	publicKey  string
 	maxSeenSeq int64
 }
+
+// Size limits for ApplyDiscoveredEndpoints input. A signed rendezvous feed is a
+// few KiB; the caps bound what an oversized (even validly signed) payload can
+// make the phone allocate while decoding and walking it.
+const (
+	maxDiscoveryRequestBytes    = 1 << 20
+	maxDiscoveryBundleBytes     = 256 << 10
+	maxDiscoveryBaseConfigBytes = 256 << 10
+	maxDiscoveryMinisigBytes    = 16 << 10
+)
 
 // discoveryLocalNow is the device clock; replaceable in tests.
 var discoveryLocalNow = time.Now
@@ -115,6 +126,9 @@ func ApplyDiscoveredEndpoints(requestJSON string) string {
 }
 
 func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error) {
+	if len(requestJSON) > maxDiscoveryRequestBytes {
+		return applyDiscoveredResult{}, fmt.Errorf("discovery request too large: %d bytes", len(requestJSON))
+	}
 	var req applyDiscoveredRequest
 	if err := json.Unmarshal([]byte(requestJSON), &req); err != nil {
 		return applyDiscoveredResult{}, fmt.Errorf("parse request json: %w", err)
@@ -122,9 +136,18 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 	if strings.TrimSpace(req.EndpointsJSON) == "" {
 		return applyDiscoveredResult{}, errors.New("endpoints_json is required")
 	}
+	if len(req.EndpointsJSON) > maxDiscoveryBundleBytes {
+		return applyDiscoveredResult{}, fmt.Errorf("endpoints_json too large: %d bytes", len(req.EndpointsJSON))
+	}
+	if len(req.BaseConfigJSON) > maxDiscoveryBaseConfigBytes {
+		return applyDiscoveredResult{}, fmt.Errorf("base_config_json too large: %d bytes", len(req.BaseConfigJSON))
+	}
 	signature := firstNonEmpty(req.EndpointsJSONMinisig, req.Minisig)
 	if strings.TrimSpace(signature) == "" {
 		return applyDiscoveredResult{}, errors.New("endpoints minisig is required")
+	}
+	if len(signature) > maxDiscoveryMinisigBytes {
+		return applyDiscoveredResult{}, fmt.Errorf("endpoints minisig too large: %d bytes", len(signature))
 	}
 	pubkey, storedMaxSeq, err := discoveryTrustSnapshot(req.PublicKey)
 	if err != nil {
@@ -433,36 +456,48 @@ func rejectForbiddenDiscoveryKeys(raw []byte) error {
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return err
 	}
-	return rejectForbiddenDiscoveryValue(value, "")
+	if path := forbiddenDiscoveryPath(value); path != nil {
+		return fmt.Errorf("forbidden discovery field: %s", formatDiscoveryPath(path))
+	}
+	return nil
 }
 
-func rejectForbiddenDiscoveryValue(value any, path string) error {
+// forbiddenDiscoveryPath returns the path to the first forbidden key, leaf
+// first, or nil. The path is only built while unwinding from a hit, so a clean
+// document costs no per-key allocations regardless of its shape.
+func forbiddenDiscoveryPath(value any) []string {
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, child := range typed {
 			normalized := strings.ToLower(strings.ReplaceAll(key, "-", "_"))
 			if _, forbidden := forbiddenDiscoveryKeys[normalized]; forbidden {
-				if path == "" {
-					return fmt.Errorf("forbidden discovery field: %s", key)
-				}
-				return fmt.Errorf("forbidden discovery field: %s.%s", path, key)
+				return []string{key}
 			}
-			nextPath := key
-			if path != "" {
-				nextPath = path + "." + key
-			}
-			if err := rejectForbiddenDiscoveryValue(child, nextPath); err != nil {
-				return err
+			if path := forbiddenDiscoveryPath(child); path != nil {
+				return append(path, key)
 			}
 		}
 	case []any:
 		for i, child := range typed {
-			if err := rejectForbiddenDiscoveryValue(child, fmt.Sprintf("%s[%d]", path, i)); err != nil {
-				return err
+			if path := forbiddenDiscoveryPath(child); path != nil {
+				return append(path, "["+strconv.Itoa(i)+"]")
 			}
 		}
 	}
 	return nil
+}
+
+// formatDiscoveryPath renders a leaf-first path as root.key[0].leaf.
+func formatDiscoveryPath(leafFirst []string) string {
+	var b strings.Builder
+	for i := len(leafFirst) - 1; i >= 0; i-- {
+		segment := leafFirst[i]
+		if b.Len() > 0 && !strings.HasPrefix(segment, "[") {
+			b.WriteByte('.')
+		}
+		b.WriteString(segment)
+	}
+	return b.String()
 }
 
 func firstNonEmpty(values ...string) string {

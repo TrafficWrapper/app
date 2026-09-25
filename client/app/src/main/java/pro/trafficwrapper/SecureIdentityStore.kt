@@ -49,7 +49,31 @@ data class StoredRendezvousState(
     val trustedElapsedRealtimeMs: Long = 0,
     val lastValidIssuedAtMs: Long = 0,
     val discoverySinks: List<String> = emptyList(),
+    /** seq of the signed rendezvous feed that carried [discoverySinks]; 0 = unknown (legacy state). */
+    val discoverySinksSeq: Long = 0,
+    /** expires_at of that feed; the sinks expire with it. 0 = unknown (legacy state). */
+    val discoverySinksExpiresAtMs: Long = 0,
 )
+
+/**
+ * next_sinks inherit seq and expires_at of the signed feed that carried them (APP-L25). A feed
+ * with a higher seq is authoritative and replaces the stored list even when it is empty, so the
+ * operator can withdraw a sink; re-reading the same seq keeps the stored list. Legacy state (no
+ * recorded seq/expiry) is always replaced by the next verified feed.
+ */
+internal fun mergeRendezvousSinks(
+    current: StoredRendezvousState,
+    feedSeq: Long,
+    feedSinks: List<String>,
+    feedExpiresAtMs: Long,
+): Triple<List<String>, Long, Long> {
+    val legacy = current.discoverySinksExpiresAtMs <= 0L
+    return if (legacy || feedSeq > current.discoverySinksSeq) {
+        Triple(feedSinks, feedSeq, feedExpiresAtMs)
+    } else {
+        Triple(current.discoverySinks, current.discoverySinksSeq, current.discoverySinksExpiresAtMs)
+    }
+}
 
 data class StoredPublicPlatformState(
     val bootstrapRaw: String = "",
@@ -517,6 +541,7 @@ class SecureIdentityStore(context: Context) {
         trustedElapsedRealtimeMs: Long,
         issuedAtMs: Long,
         discoverySinks: List<String> = emptyList(),
+        discoverySinksExpiresAtMs: Long = 0,
     ): StoredRendezvousState {
         return synchronized(LOCK) {
             val keyState = getOrCreateWrappingKey()
@@ -524,12 +549,16 @@ class SecureIdentityStore(context: Context) {
             if (current.maxSeenRendezvousSeq > 0 && seq < current.maxSeenRendezvousSeq) {
                 throw IllegalStateException("rendezvous rollback")
             }
+            val (sinks, sinksSeq, sinksExpiresAtMs) =
+                mergeRendezvousSinks(current, seq, discoverySinks, discoverySinksExpiresAtMs)
             val next = StoredRendezvousState(
                 maxSeenRendezvousSeq = maxOf(current.maxSeenRendezvousSeq, seq),
                 trustedWallTimeMs = maxOf(current.trustedWallTimeMs, trustedWallTimeMs, issuedAtMs),
                 trustedElapsedRealtimeMs = trustedElapsedRealtimeMs,
                 lastValidIssuedAtMs = maxOf(current.lastValidIssuedAtMs, issuedAtMs),
-                discoverySinks = discoverySinks.ifEmpty { current.discoverySinks },
+                discoverySinks = sinks,
+                discoverySinksSeq = sinksSeq,
+                discoverySinksExpiresAtMs = sinksExpiresAtMs,
             )
             val root = JSONObject()
                 .put(JSON_MAX_SEEN_RENDEZVOUS_SEQ, next.maxSeenRendezvousSeq)
@@ -537,6 +566,8 @@ class SecureIdentityStore(context: Context) {
                 .put(JSON_TRUSTED_ELAPSED_REALTIME_MS, next.trustedElapsedRealtimeMs)
                 .put(JSON_LAST_VALID_ISSUED_AT_MS, next.lastValidIssuedAtMs)
                 .put(JSON_DISCOVERY_SINKS, JSONArray(next.discoverySinks))
+                .put(JSON_DISCOVERY_SINKS_SEQ, next.discoverySinksSeq)
+                .put(JSON_DISCOVERY_SINKS_EXPIRES_AT_MS, next.discoverySinksExpiresAtMs)
             if (!prefs.edit().putString(KEY_RENDEZVOUS_STATE, seal(root.toString(), keyState.key)).commit()) {
                 throw IllegalStateException("failed to persist rendezvous state")
             }
@@ -554,6 +585,8 @@ class SecureIdentityStore(context: Context) {
             trustedElapsedRealtimeMs = root.optLong(JSON_TRUSTED_ELAPSED_REALTIME_MS, 0),
             lastValidIssuedAtMs = root.optLong(JSON_LAST_VALID_ISSUED_AT_MS, 0),
             discoverySinks = root.optJSONArray(JSON_DISCOVERY_SINKS).toStringList(),
+            discoverySinksSeq = root.optLong(JSON_DISCOVERY_SINKS_SEQ, 0),
+            discoverySinksExpiresAtMs = root.optLong(JSON_DISCOVERY_SINKS_EXPIRES_AT_MS, 0),
         )
     }
 
@@ -740,6 +773,8 @@ class SecureIdentityStore(context: Context) {
         private const val JSON_MAX_MIN_SUPPORTED_VERSION = "max_min_supported_version"
         private const val JSON_MAX_SEEN_RENDEZVOUS_SEQ = "max_seen_rendezvous_seq"
         private const val JSON_DISCOVERY_SINKS = "discovery_sinks"
+        private const val JSON_DISCOVERY_SINKS_SEQ = "discovery_sinks_seq"
+        private const val JSON_DISCOVERY_SINKS_EXPIRES_AT_MS = "discovery_sinks_expires_at_ms"
         private const val JSON_TRUSTED_WALL_TIME_MS = "trusted_wall_time_ms"
         private const val JSON_TRUSTED_ELAPSED_REALTIME_MS = "trusted_elapsed_realtime_ms"
         private const val JSON_LAST_VALID_ISSUED_AT_MS = "last_valid_issued_at_ms"
