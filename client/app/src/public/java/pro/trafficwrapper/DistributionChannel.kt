@@ -33,13 +33,22 @@ object DistributionChannel {
     private val autoUpdateActive = AtomicBoolean(false)
 
     @Volatile
-    private var lastAutoUpdateCheckAtMs = 0L
+    private var lastAutoUpdateCheckAtMs: Long? = null
 
     @Volatile
-    private var lastAutoUpdateRoute: String? = null
+    private var lastAutoUpdateCheckFailed = false
+
+    /** versionCode for which the "update available" sheet was already offered (APP-M22). */
+    @Volatile
+    private var sheetOfferedVersionCode = 0L
 
     fun schedule(context: Context) = Unit
 
+    /**
+     * Called from the transport probe loop on every stable tick; rate-limits itself (APP-M22):
+     * hours between checks regardless of route changes, nothing while a check, download or
+     * installation runs, and the result is merged into the current state.
+     */
     fun maybeCheckAutomatically(
         context: Context,
         auth: AuthUiState,
@@ -49,46 +58,40 @@ object DistributionChannel {
         mainHandler: Handler,
     ) {
         if (!auth.authorized) return
-        if (TransportRuntime.updates.inProgress) return
-        if (
-            lastAutoUpdateCheckAtMs > 0 &&
-            nowMs - lastAutoUpdateCheckAtMs < AUTO_UPDATE_MIN_INTERVAL_MS &&
-            lastAutoUpdateRoute == activeTransport
-        ) {
-            return
-        }
+        if (autoUpdateCheckBlocked(TransportRuntime.updates)) return
+        if (!autoUpdateCheckDue(nowMs, lastAutoUpdateCheckAtMs, lastAutoUpdateCheckFailed)) return
         if (!autoUpdateActive.compareAndSet(false, true)) return
         lastAutoUpdateCheckAtMs = nowMs
-        lastAutoUpdateRoute = activeTransport
         autoUpdateExecutor.execute {
             try {
-                mainHandler.post {
-                    TransportRuntime.updates = TransportRuntime.updates.copy(
-                        inProgress = true,
-                        downloadInProgress = false,
-                        statusTextRes = R.string.update_checking,
-                        errorTextRes = null,
-                    )
-                }
                 val result = UpdateRepository(context.applicationContext).check(
                     auth = auth,
                     socksListen = socksListen,
                 )
+                lastAutoUpdateCheckFailed = result.status == UpdateCheckStatus.ERROR
                 val checkedAt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
                     .format(Date())
                 mainHandler.post {
-                    TransportRuntime.updates = updateStateFromOutcome(
+                    val availableVersionCode = result.manifest?.versionCode ?: 0L
+                    val offerSheet = result.status == UpdateCheckStatus.AVAILABLE &&
+                        availableVersionCode > BuildConfig.VERSION_CODE.toLong() &&
+                        availableVersionCode != sheetOfferedVersionCode
+                    val merged = mergeAutoUpdateCheckState(
+                        current = TransportRuntime.updates,
                         outcome = result,
                         checkedAt = checkedAt,
-                        showSheet = result.status == UpdateCheckStatus.AVAILABLE,
-                    ).copy(inProgress = false, downloadInProgress = false)
+                        offerSheet = offerSheet,
+                        installedVersionCode = BuildConfig.VERSION_CODE.toLong(),
+                    )
+                    if (offerSheet && merged.showAvailableSheet) {
+                        sheetOfferedVersionCode = availableVersionCode
+                    }
+                    TransportRuntime.updates = merged
                 }
                 Log.i(LOG_TAG, "auto update check completed route=$activeTransport status=${result.status}")
             } catch (error: Throwable) {
+                lastAutoUpdateCheckFailed = true
                 Log.w(LOG_TAG, "auto update check failed: ${error.message}")
-                mainHandler.post {
-                    TransportRuntime.updates = TransportRuntime.updates.copy(inProgress = false)
-                }
             } finally {
                 autoUpdateActive.set(false)
             }
@@ -546,7 +549,6 @@ object DistributionChannel {
     }
 
     private const val LOG_TAG = "TWDistribution"
-    private const val AUTO_UPDATE_MIN_INTERVAL_MS = 20 * 1000L
     private const val UPDATE_SNOOZE_MS = 24 * 60 * 60 * 1000L
     private const val BYTES_IN_MEGABYTE = 1024 * 1024L
 }

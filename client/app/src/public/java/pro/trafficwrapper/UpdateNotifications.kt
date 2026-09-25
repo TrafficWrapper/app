@@ -3,7 +3,9 @@ package pro.trafficwrapper
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import androidx.annotation.StringRes
 
 object UpdateNotifications {
@@ -58,6 +60,30 @@ object UpdateNotifications {
         manager(context).cancel(DOWNLOAD_NOTIFICATION_ID)
     }
 
+    /**
+     * APP-L30: the PackageInstaller confirmation cannot be started from a background receiver
+     * (background activity launch restrictions), so it is offered as a notification whose tap
+     * opens the system confirm intent.
+     */
+    fun showInstallConfirmation(context: Context, confirmIntent: Intent) {
+        val manager = manager(context)
+        ensureChannel(context, manager)
+        val contentIntent = PendingIntent.getActivity(
+            context,
+            CONFIRM_REQUEST_CODE,
+            Intent(confirmIntent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val notification = Notification.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(context.getString(R.string.update_notification_title))
+            .setContentText(context.getString(R.string.update_install_confirm_notification))
+            .setContentIntent(contentIntent)
+            .setAutoCancel(true)
+            .build()
+        manager.notify(STATUS_NOTIFICATION_ID, notification)
+    }
+
     private fun ensureChannel(context: Context, manager: NotificationManager) {
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -74,4 +100,5 @@ object UpdateNotifications {
     private const val DOWNLOAD_NOTIFICATION_ID = 1401
     private const val STATUS_NOTIFICATION_ID = 1402
     private const val PROGRESS_SCALE = 1024L
+    private const val CONFIRM_REQUEST_CODE = 1404
 }

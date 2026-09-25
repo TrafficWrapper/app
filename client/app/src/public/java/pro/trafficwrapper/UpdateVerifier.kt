@@ -1,6 +1,8 @@
 package pro.trafficwrapper
 
 import android.content.Context
+import android.content.pm.PackageInfo
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import com.android.apksig.ApkVerifier
@@ -26,6 +28,132 @@ internal fun selectTrustedUpdateTime(
     return sntp.copy(wallTimeMs = clampedWallTimeMs)
 }
 
+/**
+ * Canonical form of a certificate SHA-256 pin: no colons or whitespace, lower-case hex. Accepts
+ * the keytool form (`AB:CD:...`) so a pin copied from keytool does not break self-update.
+ */
+internal fun normalizeCertSha256(value: String): String =
+    value.filterNot { it == ':' || it.isWhitespace() }.lowercase()
+
+/**
+ * Parses an `apk-update-v1` manifest (snake_case as written by the orchestrator's
+ * buildAPKManifest and make-manifest.sh, camelCase kept for older manifests). A missing or empty
+ * `signing_cert_sha256` means "the certificate pinned into this build" ([pinnedSigningCertSha256]).
+ */
+internal fun parseUpdateManifest(raw: String, pinnedSigningCertSha256: String): UpdateManifest {
+    val root = try {
+        JSONObject(raw)
+    } catch (_: Throwable) {
+        throw UpdateVerificationException(R.string.update_error_manifest)
+    }
+    return try {
+        val versionCode = root.optLong(JSON_VERSION_CODE).takeIf { it > 0 }
+            ?: root.getLong(JSON_VERSION_CODE_CAMEL)
+        val signingCert = if (root.isNull(JSON_SIGNING_CERT_SHA256)) {
+            ""
+        } else {
+            normalizeCertSha256(root.optString(JSON_SIGNING_CERT_SHA256))
+        }
+        UpdateManifest(
+            schema = root.getInt(JSON_SCHEMA),
+            namespace = root.getString(JSON_NS),
+            seq = root.getLong(JSON_SEQ),
+            versionCode = versionCode,
+            versionName = root.optString(JSON_VERSION_NAME).ifBlank {
+                root.getString(JSON_VERSION_NAME_CAMEL)
+            },
+            apkUrl = root.optString(JSON_APK_URL).ifBlank {
+                root.optString(JSON_APK_NAME, "app-public-$versionCode.apk")
+            },
+            apkSize = root.optLong(JSON_APK_SIZE).takeIf { it > 0 }
+                ?: root.getLong(JSON_APK_SIZE_CAMEL),
+            sha256 = root.optString(JSON_APK_SHA256).ifBlank {
+                root.getString(JSON_SHA256)
+            },
+            signingCertSha256 = signingCert.ifBlank { normalizeCertSha256(pinnedSigningCertSha256) },
+            minSupportedVersion = root.optLong(JSON_MIN_VERSION, 0),
+            mandatory = root.optBoolean(JSON_MANDATORY, false),
+            changelogRu = root.optString(JSON_NOTES).ifBlank {
+                root.optJSONObject(JSON_CHANGELOG)?.optString(JSON_RU).orEmpty()
+            },
+            releasedAt = root.optString(JSON_RELEASED_AT).ifBlank {
+                root.optString(JSON_ISSUED_AT)
+            },
+            timestamp = root.optString(JSON_TIMESTAMP).ifBlank {
+                root.optString(JSON_ISSUED_AT)
+            },
+            expiresAt = root.optString(JSON_EXPIRES_AT).ifBlank {
+                root.getString(JSON_EXPIRES_AT_CAMEL)
+            },
+        )
+    } catch (_: Throwable) {
+        throw UpdateVerificationException(R.string.update_error_manifest)
+    }
+}
+
+internal fun parseUpdateInstant(value: String): Long =
+    try {
+        Instant.parse(value).toEpochMilli()
+    } catch (_: Throwable) {
+        throw UpdateVerificationException(R.string.update_error_manifest)
+    }
+
+/**
+ * Policy checks of a signature-verified manifest (everything except minisign). [trustedNowMs] is
+ * the time used for the expiry check; [futureReferenceMs] is the latest clock available (a signed
+ * timestamp is "from the future" only if it is ahead of every clock we have, so a lagging anchor
+ * cannot lock updates out).
+ */
+internal fun evaluateUpdateManifest(
+    manifest: UpdateManifest,
+    pinnedSigningCertSha256: String,
+    trustedNowMs: Long,
+    futureReferenceMs: Long,
+    currentVersionCode: Long,
+    maxSeenUpdateSeq: Long,
+): ManifestDecision {
+    if (manifest.schema != 1 || manifest.namespace != "apk-update-v1") {
+        throw UpdateVerificationException(R.string.update_error_manifest)
+    }
+    if (normalizeCertSha256(manifest.signingCertSha256) != normalizeCertSha256(pinnedSigningCertSha256)) {
+        throw UpdateVerificationException(R.string.update_error_signer)
+    }
+    val manifestTimestampMs = parseUpdateInstant(manifest.timestamp)
+    val expiresAtMs = parseUpdateInstant(manifest.expiresAt)
+    if (manifestTimestampMs > max(trustedNowMs, futureReferenceMs) + UPDATE_MAX_FUTURE_TIMESTAMP_MS) {
+        throw UpdateVerificationException(R.string.update_error_time_untrusted)
+    }
+    if (expiresAtMs <= trustedNowMs) {
+        throw UpdateVerificationException(R.string.update_error_expired)
+    }
+    if (manifest.versionCode < currentVersionCode) {
+        throw UpdateVerificationException(R.string.update_error_downgrade)
+    }
+    if (maxSeenUpdateSeq > 0 && manifest.seq < maxSeenUpdateSeq) {
+        throw UpdateVerificationException(R.string.update_error_downgrade)
+    }
+    return if (manifest.versionCode <= currentVersionCode) {
+        ManifestDecision.Latest(manifest)
+    } else {
+        ManifestDecision.Available(manifest)
+    }
+}
+
+/**
+ * APP-L5: the downloaded APK must be this app and exactly the version the signed manifest
+ * announced; otherwise installing it would not satisfy the update (endless "update available").
+ */
+internal fun updateApkIdentityMatches(
+    archivePackageName: String?,
+    archiveVersionCode: Long?,
+    expectedPackageName: String,
+    manifestVersionCode: Long,
+): Boolean =
+    archivePackageName != null &&
+        archivePackageName == expectedPackageName &&
+        archiveVersionCode != null &&
+        archiveVersionCode == manifestVersionCode
+
 class UpdateVerifier(private val context: Context) {
     private val store = SecureIdentityStore(context)
 
@@ -37,40 +165,36 @@ class UpdateVerifier(private val context: Context) {
             throw UpdateVerificationException(R.string.update_error_signer)
         }
         verifyMinisign(bundle.manifestJson, bundle.minisig, updatePubkey)
-        val manifest = parseManifest(bundle.manifestJson)
+        val manifest = parseUpdateManifest(bundle.manifestJson, PUBLIC_UPDATE_SIGNING_CERT_SHA256)
         Log.i(
             TAG,
             "public update manifest candidate seq=${manifest.seq} vc=${manifest.versionCode} maxSeen=${stored.maxSeenUpdateSeq} key=${updatePubkey.take(8)}...",
         )
-        if (manifest.schema != 1 || manifest.namespace != "apk-update-v1") {
-            Log.w(TAG, "public update rejected: invalid schema/ns ${manifest.schema}/${manifest.namespace}")
-            throw UpdateVerificationException(R.string.update_error_manifest)
+        val boot = ClockDiagnostics.currentBoot(context)
+        val elapsed = SystemClock.elapsedRealtime()
+        val systemNowMs = System.currentTimeMillis()
+        val release = store.readReleaseState()
+        val trustedTime = trustedNow(release, boot, elapsed, systemNowMs)
+        val decision = try {
+            evaluateUpdateManifest(
+                manifest = manifest,
+                pinnedSigningCertSha256 = PUBLIC_UPDATE_SIGNING_CERT_SHA256,
+                trustedNowMs = trustedTime.wallTimeMs,
+                futureReferenceMs = max(trustedTime.wallTimeMs, systemNowMs),
+                currentVersionCode = BuildConfig.VERSION_CODE.toLong(),
+                // The rollback floor applies only to the update key it was recorded under.
+                maxSeenUpdateSeq = stored.updateSeqFloorFor(updatePubkey),
+            )
+        } catch (error: UpdateVerificationException) {
+            Log.w(
+                TAG,
+                "public update rejected: ${error.textRes} seq=${manifest.seq} vc=${manifest.versionCode} " +
+                    "issued=${manifest.timestamp} expires=${manifest.expiresAt} " +
+                    "cert=${manifest.signingCertSha256.take(12)}",
+            )
+            throw error
         }
-        if (!manifest.signingCertSha256.equals(PUBLIC_UPDATE_SIGNING_CERT_SHA256, ignoreCase = true)) {
-            Log.w(TAG, "public update rejected: signing cert ${manifest.signingCertSha256.take(12)}")
-            throw UpdateVerificationException(R.string.update_error_signer)
-        }
-        val trustedTime = trustedNow(stored)
-        val manifestTimestampMs = parseInstant(manifest.timestamp)
-        val expiresAtMs = parseInstant(manifest.expiresAt)
-        if (manifestTimestampMs > trustedTime.wallTimeMs + UPDATE_MAX_FUTURE_TIMESTAMP_MS) {
-            Log.w(TAG, "public update rejected: future timestamp ${manifest.timestamp}")
-            throw UpdateVerificationException(R.string.update_error_time_untrusted)
-        }
-        if (expiresAtMs <= trustedTime.wallTimeMs) {
-            Log.w(TAG, "public update rejected: expired at ${manifest.expiresAt}")
-            throw UpdateVerificationException(R.string.update_error_expired)
-        }
-        if (manifest.versionCode < BuildConfig.VERSION_CODE.toLong()) {
-            Log.w(TAG, "public update rejected: downgrade vc=${manifest.versionCode} current=${BuildConfig.VERSION_CODE}")
-            throw UpdateVerificationException(R.string.update_error_downgrade)
-        }
-        // The rollback floor applies only to the update key it was recorded under.
-        val storedFloor = stored.updateSeqFloorFor(updatePubkey)
-        if (storedFloor > 0 && manifest.seq < storedFloor) {
-            Log.w(TAG, "public update rejected: rollback seq=${manifest.seq} maxSeen=$storedFloor")
-            throw UpdateVerificationException(R.string.update_error_downgrade)
-        }
+        val manifestTimestampMs = parseUpdateInstant(manifest.timestamp)
         // Atomic read-modify-write: re-check the pin and the rollback floor against the freshest
         // state so a concurrent writer (service, activity) can neither be overwritten nor race us.
         store.updatePublicPlatformState { current ->
@@ -86,15 +210,24 @@ class UpdateVerifier(private val context: Context) {
             current.copy(
                 maxSeenUpdateSeq = max(currentFloor, manifest.seq),
                 maxSeenUpdateSeqPin = updatePubkey,
-                trustedWallTimeMs = maxOf(current.trustedWallTimeMs, trustedTime.wallTimeMs, manifestTimestampMs),
-                trustedElapsedRealtimeMs = trustedTime.elapsedRealtimeMs,
             )
         }
-        return if (manifest.versionCode <= BuildConfig.VERSION_CODE.toLong()) {
-            ManifestDecision.Latest(manifest)
-        } else {
-            ManifestDecision.Available(manifest)
-        }
+        // Persist only signed time (issued_at) plus the same-boot monotonic delta; SNTP is used
+        // for this decision only and never stored (APP-M6/M23).
+        runCatching {
+            store.updateReleaseState { current ->
+                current.withTrustedAnchor(
+                    nextTrustedTimeAnchor(
+                        current = current.trustedAnchor,
+                        signedIssuedAtMs = manifestTimestampMs,
+                        currentBoot = boot,
+                        currentElapsedRealtimeMs = elapsed,
+                        systemNowMs = systemNowMs,
+                    ),
+                )
+            }
+        }.onFailure { Log.w(TAG, "public update trusted time anchor not persisted", it) }
+        return decision
     }
 
     fun verifyApk(apkFile: File, manifest: UpdateManifest) {
@@ -108,12 +241,30 @@ class UpdateVerifier(private val context: Context) {
                 apkFile.delete()
                 throw UpdateVerificationException(R.string.update_error_signer)
             }
-            val certMatches = result.signerCertificates.any { cert ->
-                sha256Bytes(cert.encoded).equals(PUBLIC_UPDATE_SIGNING_CERT_SHA256, ignoreCase = true)
+            val pinned = normalizeCertSha256(PUBLIC_UPDATE_SIGNING_CERT_SHA256)
+            val certMatches = pinned.isNotEmpty() && result.signerCertificates.any { cert ->
+                sha256Bytes(cert.encoded) == pinned
             }
             if (!certMatches) {
                 apkFile.delete()
                 throw UpdateVerificationException(R.string.update_error_signer)
+            }
+            val archive = archiveInfo(apkFile)
+            if (
+                !updateApkIdentityMatches(
+                    archivePackageName = archive?.packageName,
+                    archiveVersionCode = archive?.let(::longVersionCode),
+                    expectedPackageName = context.packageName,
+                    manifestVersionCode = manifest.versionCode,
+                )
+            ) {
+                Log.w(
+                    TAG,
+                    "public update APK identity mismatch package=${archive?.packageName} " +
+                        "vc=${archive?.let(::longVersionCode)} manifestVc=${manifest.versionCode}",
+                )
+                apkFile.delete()
+                throw UpdateVerificationException(R.string.update_error_apk_identity)
             }
         } catch (error: UpdateVerificationException) {
             throw error
@@ -123,6 +274,14 @@ class UpdateVerifier(private val context: Context) {
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun archiveInfo(apkFile: File): PackageInfo? =
+        context.packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0)
+
+    @Suppress("DEPRECATION")
+    private fun longVersionCode(info: PackageInfo): Long =
+        if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+
     private fun verifyMinisign(manifestJson: String, minisig: String, publicKey: String) {
         val result = JSONObject(Transport.verifyMinisign(manifestJson, minisig, publicKey))
         if (!result.optBoolean(JSON_OK, false)) {
@@ -131,82 +290,25 @@ class UpdateVerifier(private val context: Context) {
         }
     }
 
-    private fun parseManifest(raw: String): UpdateManifest {
-        val root = try {
-            JSONObject(raw)
-        } catch (_: Throwable) {
-            throw UpdateVerificationException(R.string.update_error_manifest)
+    private fun trustedNow(
+        release: StoredReleaseState,
+        boot: BootIdentity,
+        elapsed: Long,
+        systemNowMs: Long,
+    ): TrustedTimeResult {
+        val monotonic = anchoredTrustedNowMs(release.trustedAnchor, boot, elapsed)?.let {
+            TrustedTimeResult(wallTimeMs = it, elapsedRealtimeMs = elapsed, sntpAvailable = false)
         }
-        return try {
-            val versionCode = root.optLong(JSON_VERSION_CODE).takeIf { it > 0 }
-                ?: root.getLong(JSON_VERSION_CODE_CAMEL)
-            UpdateManifest(
-                schema = root.getInt(JSON_SCHEMA),
-                namespace = root.getString(JSON_NS),
-                seq = root.getLong(JSON_SEQ),
-                versionCode = versionCode,
-                versionName = root.optString(JSON_VERSION_NAME).ifBlank {
-                    root.getString(JSON_VERSION_NAME_CAMEL)
-                },
-                apkUrl = root.optString(JSON_APK_URL).ifBlank {
-                    root.optString(JSON_APK_NAME, "app-public-$versionCode.apk")
-                },
-                apkSize = root.optLong(JSON_APK_SIZE).takeIf { it > 0 }
-                    ?: root.getLong(JSON_APK_SIZE_CAMEL),
-                sha256 = root.optString(JSON_APK_SHA256).ifBlank {
-                    root.getString(JSON_SHA256)
-                },
-                signingCertSha256 = root.optString(JSON_SIGNING_CERT_SHA256, PUBLIC_UPDATE_SIGNING_CERT_SHA256),
-                minSupportedVersion = root.optLong(JSON_MIN_VERSION, 0),
-                mandatory = root.optBoolean(JSON_MANDATORY, false),
-                changelogRu = root.optString(JSON_NOTES).ifBlank {
-                    root.optJSONObject(JSON_CHANGELOG)?.optString(JSON_RU).orEmpty()
-                },
-                releasedAt = root.optString(JSON_RELEASED_AT).ifBlank {
-                    root.optString(JSON_ISSUED_AT)
-                },
-                timestamp = root.optString(JSON_TIMESTAMP).ifBlank {
-                    root.optString(JSON_ISSUED_AT)
-                },
-                expiresAt = root.optString(JSON_EXPIRES_AT).ifBlank {
-                    root.getString(JSON_EXPIRES_AT_CAMEL)
-                },
-            )
-        } catch (_: Throwable) {
-            throw UpdateVerificationException(R.string.update_error_manifest)
-        }
-    }
-
-    private fun trustedNow(stored: StoredPublicPlatformState): TrustedTimeResult {
-        val monotonic = monotonicTime(stored)
         val sntp = runCatching { ClockDiagnostics.trustedTime() }
             .onFailure { Log.w(TAG, "public update trusted SNTP unavailable", it) }
             .getOrNull()
         return selectTrustedUpdateTime(monotonic, sntp)
             ?: TrustedTimeResult(
-                wallTimeMs = System.currentTimeMillis(),
-                elapsedRealtimeMs = SystemClock.elapsedRealtime(),
+                wallTimeMs = systemNowMs,
+                elapsedRealtimeMs = elapsed,
                 sntpAvailable = false,
             )
     }
-
-    private fun monotonicTime(stored: StoredPublicPlatformState): TrustedTimeResult? {
-        if (stored.trustedWallTimeMs <= 0 || stored.trustedElapsedRealtimeMs <= 0) return null
-        val elapsed = SystemClock.elapsedRealtime()
-        if (elapsed < stored.trustedElapsedRealtimeMs) return null
-        return TrustedTimeResult(
-            wallTimeMs = stored.trustedWallTimeMs + (elapsed - stored.trustedElapsedRealtimeMs),
-            elapsedRealtimeMs = elapsed,
-            sntpAvailable = false,
-        )
-    }
-
-    private fun parseInstant(value: String): Long =
-        try {
-            Instant.parse(value).toEpochMilli()
-        } catch (_: Throwable) {
-            throw UpdateVerificationException(R.string.update_error_manifest)
-        }
 
     private fun sha256File(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -229,31 +331,32 @@ class UpdateVerifier(private val context: Context) {
 
     private companion object {
         private const val JSON_OK = "ok"
-        private const val JSON_SCHEMA = "schema"
-        private const val JSON_NS = "ns"
-        private const val JSON_SEQ = "seq"
-        private const val JSON_VERSION_CODE = "version_code"
-        private const val JSON_VERSION_CODE_CAMEL = "versionCode"
-        private const val JSON_VERSION_NAME = "version_name"
-        private const val JSON_VERSION_NAME_CAMEL = "versionName"
-        private const val JSON_APK_URL = "apk_url"
-        private const val JSON_APK_NAME = "apk_name"
-        private const val JSON_APK_SIZE = "apk_size"
-        private const val JSON_APK_SIZE_CAMEL = "apkSize"
-        private const val JSON_APK_SHA256 = "apk_sha256"
-        private const val JSON_SHA256 = "sha256"
-        private const val JSON_SIGNING_CERT_SHA256 = "signing_cert_sha256"
-        private const val JSON_MIN_VERSION = "min_version"
-        private const val JSON_MANDATORY = "mandatory"
-        private const val JSON_NOTES = "notes"
-        private const val JSON_CHANGELOG = "changelog"
-        private const val JSON_RU = "ru"
-        private const val JSON_ISSUED_AT = "issued_at"
-        private const val JSON_RELEASED_AT = "releasedAt"
-        private const val JSON_TIMESTAMP = "timestamp"
-        private const val JSON_EXPIRES_AT = "expires_at"
-        private const val JSON_EXPIRES_AT_CAMEL = "expiresAt"
         private const val HASH_BUFFER_BYTES = 64 * 1024
         private const val TAG = "TWPublicUpdate"
     }
 }
+
+private const val JSON_SCHEMA = "schema"
+private const val JSON_NS = "ns"
+private const val JSON_SEQ = "seq"
+private const val JSON_VERSION_CODE = "version_code"
+private const val JSON_VERSION_CODE_CAMEL = "versionCode"
+private const val JSON_VERSION_NAME = "version_name"
+private const val JSON_VERSION_NAME_CAMEL = "versionName"
+private const val JSON_APK_URL = "apk_url"
+private const val JSON_APK_NAME = "apk_name"
+private const val JSON_APK_SIZE = "apk_size"
+private const val JSON_APK_SIZE_CAMEL = "apkSize"
+private const val JSON_APK_SHA256 = "apk_sha256"
+private const val JSON_SHA256 = "sha256"
+private const val JSON_SIGNING_CERT_SHA256 = "signing_cert_sha256"
+private const val JSON_MIN_VERSION = "min_version"
+private const val JSON_MANDATORY = "mandatory"
+private const val JSON_NOTES = "notes"
+private const val JSON_CHANGELOG = "changelog"
+private const val JSON_RU = "ru"
+private const val JSON_ISSUED_AT = "issued_at"
+private const val JSON_RELEASED_AT = "releasedAt"
+private const val JSON_TIMESTAMP = "timestamp"
+private const val JSON_EXPIRES_AT = "expires_at"
+private const val JSON_EXPIRES_AT_CAMEL = "expiresAt"
