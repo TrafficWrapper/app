@@ -9,6 +9,11 @@ APK_PATH="${REPO_ROOT}/client/app/build/outputs/apk/public/debug/app-public-debu
 
 mkdir -p "${GRADLE_CACHE}"
 
+# Version defaults live only in client/app/build.gradle.kts; forward overrides when set.
+VERSION_ENV=()
+[[ -n "${TW_VERSION_CODE:-}" ]] && VERSION_ENV+=(-e TW_VERSION_CODE)
+[[ -n "${TW_VERSION_NAME:-}" ]] && VERSION_ENV+=(-e TW_VERSION_NAME)
+
 "${SCRIPT_DIR}/build-transport-aar.sh"
 "${SCRIPT_DIR}/prepare-xray-android.sh"
 
@@ -22,8 +27,7 @@ docker run --rm \
   -v "${GRADLE_CACHE}:/gradle-cache" \
   -e GRADLE_USER_HOME=/gradle-cache \
   -e TW_APPLICATION_ID="${TW_APPLICATION_ID:-org.trafficwrapper.app}" \
-  -e TW_VERSION_CODE="${TW_VERSION_CODE:-1001}" \
-  -e TW_VERSION_NAME="${TW_VERSION_NAME:-public-1.0.0}" \
+  ${VERSION_ENV[@]+"${VERSION_ENV[@]}"} \
   -e TW_PUBLIC_SIGNING_CERT_SHA256="${TW_PUBLIC_SIGNING_CERT_SHA256:-}" \
   -w /workspace/client \
   "${IMAGE_NAME}" \
