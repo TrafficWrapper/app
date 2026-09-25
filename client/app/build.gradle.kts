@@ -105,7 +105,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("com.android.tools.build:apksig:9.2.1")
     implementation("com.google.zxing:core:3.5.3")
-    implementation("com.squareup.okhttp3:okhttp:5.4.0")
+    implementation("com.squareup.okhttp3:okhttp:5.5.0")
     implementation("androidx.work:work-runtime:2.11.2")
 
     testImplementation("junit:junit:4.13.2")
