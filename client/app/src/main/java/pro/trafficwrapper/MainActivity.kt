@@ -129,7 +129,8 @@ class MainActivity : ComponentActivity() {
                 MAIN_HANDLER.post {
                     PUBLIC_BOOTSTRAP_IMPORTED = restored || bootstrapRaw.isNotBlank()
                     if (restored && PUBLIC_REENROLL_NEEDED) {
-                        startPublicDeviceEnrollment(appContext, silent = true)
+                        // Through the tunnel once it carries traffic, never a direct request (APP-M4).
+                        requestPublicBackgroundReEnroll(appContext, PublicReEnrollReason.VERSION_REFRESH)
                     }
                     if (!restored) {
                         TransportRuntime.auth = AuthUiState(
@@ -140,7 +141,7 @@ class MainActivity : ComponentActivity() {
                             },
                         )
                         if (PUBLIC_BOOTSTRAP_IMPORTED) {
-                            startPublicDeviceEnrollment(appContext, bootstrapRaw)
+                            startAutomaticPublicEnrollment(appContext, bootstrapRaw)
                         }
                     }
                     PUBLIC_STATE_LOADING = false
@@ -3006,16 +3007,20 @@ private fun restorePublicPlatformState(context: Context): Boolean {
 }
 
 /**
- * Enrolls this device with the public platform. [silent] is the re-enrollment of an already
- * enrolled device after an app update (see [publicEnrollmentNeedsVersionRefresh]): it keeps the
- * current authorized UI state, accepts the stored (possibly expired) bootstrap - the orchestrator
- * does not consume the token of a known device - and only logs failures. [onFinished] runs on the
- * main thread after the attempt. Returns false when another enrollment is already running.
+ * Enrolls this device with the public platform. [silent] is a background re-enrollment of an
+ * already enrolled device (app update, reality_flow_ack, missing AWG profile credentials,
+ * confirming a revocation hint): it keeps the current authorized UI state, accepts the stored
+ * (possibly expired) bootstrap - the orchestrator does not consume the token of a known device -
+ * and reports through [onOutcome] instead of the UI. [viaTunnel] sends the request through the
+ * app's SOCKS router, i.e. the running tunnel (APP-M4); otherwise it goes direct. [onFinished] runs
+ * on the main thread after the attempt. Returns false when another enrollment is already running.
  */
 private fun startPublicDeviceEnrollment(
     context: Context,
     bootstrapRawOverride: String? = null,
     silent: Boolean = false,
+    viaTunnel: Boolean = !silent && publicTunnelCarryingTraffic(),
+    onOutcome: ((PublicEnrollOutcome) -> Unit)? = null,
     onFinished: (() -> Unit)? = null,
 ): Boolean {
     if (!DeploymentConfig.IS_PUBLIC_PLATFORM) return false
@@ -3032,6 +3037,7 @@ private fun startPublicDeviceEnrollment(
     }
     ENROLLMENT_EXECUTOR.execute {
         val mainHandler = Handler(Looper.getMainLooper())
+        var outcome: PublicEnrollOutcome = PublicEnrollOutcome.Failed(IllegalStateException("enrollment did not run"))
         try {
             // Resolved here (background) rather than as a default argument on the caller's thread.
             val bootstrapRaw = bootstrapRawOverride ?: publicBootstrapRaw(context)
@@ -3041,22 +3047,9 @@ private fun startPublicDeviceEnrollment(
                 PublicPlatformConfigParser.parseBootstrap(bootstrapRaw)
             }
             val androidID = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
-            if (androidID.isBlank() && silent) {
-                Log.w(TAG, "public re-enrollment skipped: no android id")
-                return@execute
-            }
-            if (androidID.isBlank()) {
-                postPublicEnrollmentFailure(
-                    mainHandler,
-                    PublicEnrollmentFailurePolicy(
-                        kind = PublicEnrollmentFailureKind.TERMINAL,
-                        statusTextRes = R.string.enrollment_status_error,
-                        errorTextRes = R.string.enrollment_error_device_id,
-                        retryAllowed = false,
-                    ),
-                )
-                return@execute
-            }
+            // APP-L19: the orchestrator keys devices by their identity/noise keys; it only gets a
+            // per-platform hint instead of the raw ANDROID_ID.
+            val deviceHint = publicDeviceHint(androidID, parsed.configPubkeyPin)
             val store = SecureIdentityStore(context)
             val previous = store.readPublicPlatformState()
             val noiseIdentity = store.getOrCreateIdentity { Transport.generateIdentity() }
@@ -3070,8 +3063,6 @@ private fun startPublicDeviceEnrollment(
                 .put(JSON_PUBLIC_BOOTSTRAP_TOKEN, parsed.bootstrapToken)
                 .put(JSON_NOISE_PRIVATE_KEY, noiseIdentity.privateKey)
                 .put(JSON_NOISE_PUBLIC_KEY, noiseIdentity.publicKey)
-                .put(JSON_DEVICE_ID, androidID)
-                .put(JSON_ANDROID_ID, androidID)
                 .put(JSON_MODEL, model)
                 .put(JSON_IDENTITY_PUBLIC_KEY, deviceIdentity.publicKey)
                 .put(JSON_IDENTITY_KEY_TYPE, deviceIdentity.keyType)
@@ -3082,9 +3073,24 @@ private fun startPublicDeviceEnrollment(
                 .put(JSON_PUBLIC_AWG_PRIVATE_KEY, awgKeyPair.privateKey)
                 .put(JSON_PUBLIC_AWG_PUBLIC_KEY, awgKeyPair.publicKey)
                 .put(JSON_TIMEOUT_SECONDS, PUBLIC_ENROLL_TIMEOUT_SECONDS)
+            if (deviceHint.isNotBlank()) {
+                request.put(JSON_DEVICE_ID, deviceHint).put(JSON_ANDROID_ID, deviceHint)
+            }
+            publicEnrollFlowAck(previous, parsed.configPubkeyPin)?.let { request.put(JSON_PUBLIC_REALITY_FLOW_ACK, it) }
+            if (viaTunnel) request.put(JSON_PUBLIC_SOCKS_PROXY, DEFAULT_ROUTER_SOCKS_LISTEN)
+            if (parsed.orchTlsSpkiSha256.isNotEmpty()) {
+                // APP-L36: the bootstrap pin is for the first enrollment; a re-enrollment accepts
+                // the system roots too, so a certificate rotation does not lock devices out.
+                request.put(JSON_PUBLIC_ORCH_TLS_SPKI_SHA256, JSONArray(parsed.orchTlsSpkiSha256))
+                request.put(JSON_PUBLIC_REENROLL, silent)
+            }
             val response = JSONObject(Transport.publicDeviceEnroll(request.toString()))
             if (!response.optBoolean(JSON_OK, false)) {
-                throw IllegalStateException(response.optString(JSON_ERROR))
+                throw PublicEnrollmentRejectedException(
+                    code = response.optString(JSON_PUBLIC_CODE),
+                    authenticated = response.optBoolean(JSON_PUBLIC_REJECTED, false),
+                    message = response.optString(JSON_ERROR),
+                )
             }
             val clientBundle = response.optJSONObject(JSON_PUBLIC_CLIENT_BUNDLE)
                 ?: throw IllegalStateException("missing client bundle")
@@ -3100,6 +3106,7 @@ private fun startPublicDeviceEnrollment(
                 previous = previous,
                 bootstrap = parsed,
             )
+            val pendingFlow = response.optNullableString(JSON_PUBLIC_REALITY_FLOW_PENDING)
             val stored = StoredPublicPlatformState(
                 bootstrapRaw = bootstrapRaw.trim(),
                 configPubkeyPin = parsed.configPubkeyPin,
@@ -3109,7 +3116,7 @@ private fun startPublicDeviceEnrollment(
                 maxSeenUpdateSeqPin = updatePubkeyPin,
                 clientConfigJson = clientBundle.getString(JSON_PUBLIC_CONFIG_JSON),
                 clientBundleJson = clientBundle.toString(),
-                deviceID = response.optString(JSON_DEVICE_ID).ifBlank { androidID },
+                deviceID = response.optString(JSON_DEVICE_ID).ifBlank { deviceHint },
                 realityUUID = response.getString(JSON_PUBLIC_REALITY_UUID),
                 internalIP = response.getString(JSON_INTERNAL_IP),
                 psk2 = response.getString(JSON_PUBLIC_PSK2),
@@ -3118,9 +3125,12 @@ private fun startPublicDeviceEnrollment(
                 awgPublicKey = response.optString(JSON_PUBLIC_AWG_PUBLIC_KEY).ifBlank { awgKeyPair.publicKey },
                 limitsJson = (config.limits ?: parsed.limits)?.toString().orEmpty(),
                 awgProfilesJson = response.optJSONObject(JSON_PUBLIC_AWG_PROFILES)?.toString().orEmpty(),
+                // Only the active flow is applied; a pending one waits for its acknowledgement.
                 realityFlow = response.optString(JSON_PUBLIC_REALITY_FLOW).trim(),
                 realityFlowKnown = response.has(JSON_PUBLIC_REALITY_FLOW),
                 enrollVersionCode = BuildConfig.VERSION_CODE.toLong(),
+                realityFlowPending = pendingFlow?.trim().orEmpty(),
+                realityFlowPendingKnown = pendingFlow != null,
             )
             applyPublicPlatformState(
                 context = context.applicationContext,
@@ -3143,10 +3153,15 @@ private fun startPublicDeviceEnrollment(
             )
             savePublicBootstrap(context, bootstrapRaw)
             PUBLIC_REENROLL_NEEDED = false
+            outcome = PublicEnrollOutcome.Enrolled(
+                status = response.optString(JSON_STATUS),
+                flowPending = publicFlowAckNeeded(stored),
+            )
         } catch (error: Throwable) {
+            outcome = PublicEnrollOutcome.Failed(error)
             if (silent) {
                 PUBLIC_REENROLL_FAILED_AT_MS = SystemClock.elapsedRealtime()
-                Log.w(TAG, "public re-enrollment after app update failed; keeping cached state", error)
+                Log.w(TAG, "public background re-enrollment failed; keeping cached state", error)
             } else {
                 Log.w(TAG, "public device enrollment failed", error)
                 val policy = publicEnrollmentFailurePolicy(error)
@@ -3157,54 +3172,221 @@ private fun startPublicDeviceEnrollment(
             }
         } finally {
             ENROLLMENT_ACTIVE.set(false)
-            if (onFinished != null) {
-                mainHandler.post(onFinished)
+            val finalOutcome = outcome
+            mainHandler.post {
+                onOutcome?.invoke(finalOutcome)
+                onFinished?.invoke()
             }
         }
     }
     return true
 }
 
+internal sealed class PublicEnrollOutcome {
+    data class Enrolled(val status: String, val flowPending: Boolean) : PublicEnrollOutcome()
+    data class Failed(val error: Throwable) : PublicEnrollOutcome()
+}
+
+/** Reads an optional string; null when absent or JSON null (an explicit "" stays ""). */
+private fun JSONObject.optNullableString(key: String): String? =
+    if (!has(key) || isNull(key)) null else optString(key)
+
 /**
- * Runs [action] (on main) once this device's enrollment matches the running app version: the
- * orchestrator derives the device's REALITY flow from the capabilities sent at enrollment and Xray
- * rejects a flow mismatch, so an updated (or rolled back) app re-enrolls before it connects. A
- * failed re-enrollment does not block connecting with the cached state.
+ * reality_flow_ack for the next enrollment: the stored reality_flow_pending of the same platform,
+ * or null when nothing is pending (X-L13).
+ */
+internal fun publicEnrollFlowAck(previous: StoredPublicPlatformState, configPubkeyPin: String): String? {
+    if (!previous.realityFlowPendingKnown) return null
+    if (previous.configPubkeyPin.isNotBlank() && previous.configPubkeyPin != configPubkeyPin) return null
+    return previous.realityFlowPending
+}
+
+/** A pending flow that differs from the active one still has to be acknowledged. */
+internal fun publicFlowAckNeeded(state: StoredPublicPlatformState): Boolean =
+    state.realityFlowPendingKnown && !(state.realityFlowKnown && state.realityFlow == state.realityFlowPending)
+
+private fun publicTunnelCarryingTraffic(): Boolean =
+    runCatching { TransportRuntime.state.isCarryingTrafficNow() }.getOrDefault(false)
+
+/**
+ * Connects with the cached enrollment right away. A re-enrollment the running app version still
+ * needs is done in the background through the tunnel once it carries traffic (APP-M4) instead of
+ * blocking the connect on a direct request to the orchestrator.
  */
 private fun runAfterPublicVersionReEnroll(context: Context, action: () -> Unit) {
-    if (
-        !shouldWaitForPublicVersionReEnroll(
-            needed = PUBLIC_REENROLL_NEEDED,
-            lastFailureAtMs = PUBLIC_REENROLL_FAILED_AT_MS,
-            nowMs = SystemClock.elapsedRealtime(),
-        )
-    ) {
-        action()
-        return
+    if (PUBLIC_REENROLL_NEEDED) {
+        requestPublicBackgroundReEnroll(context, PublicReEnrollReason.VERSION_REFRESH)
     }
-    val started = startPublicDeviceEnrollment(
-        context.applicationContext,
-        silent = true,
-        onFinished = action,
-    )
-    if (!started) {
-        // Another enrollment (usually the startup re-enrollment) is running on the single-thread
-        // enrollment executor: queue behind it so the connect still waits for its result.
-        ENROLLMENT_EXECUTOR.execute { MAIN_HANDLER.post(action) }
-    }
+    action()
 }
 
 internal fun publicEnrollmentNeedsVersionRefresh(enrollVersionCode: Long, currentVersionCode: Long): Boolean =
     enrollVersionCode != currentVersionCode
 
 /**
- * A connect waits for the version re-enrollment unless one just failed (orchestrator unreachable):
- * then it connects with the cached state at once instead of waiting for another timeout.
+ * Whether a version re-enrollment attempt is due: it is needed and none failed within
+ * [PUBLIC_REENROLL_RETRY_AFTER_MS] (orchestrator unreachable).
  */
 internal fun shouldWaitForPublicVersionReEnroll(needed: Boolean, lastFailureAtMs: Long, nowMs: Long): Boolean =
     needed && (lastFailureAtMs <= 0L || nowMs - lastFailureAtMs !in 0 until PUBLIC_REENROLL_RETRY_AFTER_MS)
 
 internal const val PUBLIC_REENROLL_RETRY_AFTER_MS = 10 * 60_000L
+
+/** Background re-enrollment requests, drained through the tunnel (main thread only). */
+private object PublicBackgroundReEnroll {
+    val reasons: MutableSet<PublicReEnrollReason> = java.util.EnumSet.noneOf(PublicReEnrollReason::class.java)
+    val backoff = PublicEnrollmentBackoff()
+    val reauthThrottle = PublicReauthConfirmThrottle()
+    var checkScheduled = false
+
+    /** Missing AWG profiles a re-enrollment was already attempted for (no retry loop). */
+    val attemptedAwgProfiles = mutableSetOf<String>()
+}
+
+/**
+ * Asks for a silent re-enrollment for [reason]. It runs through the tunnel as soon as one carries
+ * traffic, with backoff after failures; see [publicReEnrollPlan].
+ */
+internal fun requestPublicBackgroundReEnroll(context: Context, reason: PublicReEnrollReason) {
+    if (!DeploymentConfig.IS_PUBLIC_PLATFORM) return
+    val appContext = context.applicationContext
+    MAIN_HANDLER.post {
+        val state = PublicBackgroundReEnroll
+        if (reason in state.reasons) return@post
+        if (reason == PublicReEnrollReason.REAUTH_CONFIRM &&
+            !state.reauthThrottle.tryAcquire(SystemClock.elapsedRealtime())
+        ) {
+            return@post
+        }
+        state.reasons += reason
+        schedulePublicBackgroundReEnroll(appContext, 0L)
+    }
+}
+
+private fun schedulePublicBackgroundReEnroll(context: Context, delayMs: Long) {
+    val state = PublicBackgroundReEnroll
+    if (state.checkScheduled) return
+    state.checkScheduled = true
+    MAIN_HANDLER.postDelayed({
+        state.checkScheduled = false
+        runPublicBackgroundReEnroll(context)
+    }, delayMs.coerceAtLeast(0L))
+}
+
+private fun runPublicBackgroundReEnroll(context: Context) {
+    val state = PublicBackgroundReEnroll
+    val nowMs = SystemClock.elapsedRealtime()
+    if (PublicReEnrollReason.VERSION_REFRESH in state.reasons && !PUBLIC_REENROLL_NEEDED) {
+        state.reasons -= PublicReEnrollReason.VERSION_REFRESH
+    }
+    val plan = publicReEnrollPlan(
+        reasons = state.reasons,
+        tunnelUp = publicTunnelCarryingTraffic(),
+        backoffRemainingMs = state.backoff.remainingMs(nowMs),
+    )
+    when (plan) {
+        PublicReEnrollPlan.Idle -> return
+        is PublicReEnrollPlan.Wait -> schedulePublicBackgroundReEnroll(context, plan.delayMs)
+        is PublicReEnrollPlan.Run -> {
+            val running = state.reasons.toSet()
+            val started = startPublicDeviceEnrollment(
+                context,
+                silent = true,
+                viaTunnel = plan.viaTunnel,
+                onOutcome = { outcome -> onPublicBackgroundReEnrollOutcome(context, running, outcome) },
+            )
+            if (!started) schedulePublicBackgroundReEnroll(context, PUBLIC_REENROLL_CHECK_INTERVAL_MS)
+        }
+    }
+}
+
+private fun onPublicBackgroundReEnrollOutcome(
+    context: Context,
+    ran: Set<PublicReEnrollReason>,
+    outcome: PublicEnrollOutcome,
+) {
+    val state = PublicBackgroundReEnroll
+    val nowMs = SystemClock.elapsedRealtime()
+    when (outcome) {
+        is PublicEnrollOutcome.Enrolled -> {
+            state.reasons -= ran
+            if (outcome.flowPending && PublicReEnrollReason.FLOW_ACK in ran) {
+                // Acknowledged but still pending (e.g. the orchestrator rate-limits flow changes):
+                // try again later, spaced by the backoff, instead of looping.
+                state.backoff.onFailure(nowMs)
+            } else {
+                state.backoff.onSuccess()
+            }
+            if (outcome.flowPending) state.reasons += PublicReEnrollReason.FLOW_ACK
+            if (ran.contains(PublicReEnrollReason.REAUTH_CONFIRM) &&
+                outcome.status.trim().equals(DEVICE_STATUS_PENDING, ignoreCase = true)
+            ) {
+                applyConfirmedPublicReauth(context, "orchestrator")
+            }
+        }
+        is PublicEnrollOutcome.Failed -> {
+            state.backoff.onFailure(nowMs)
+            when (authenticatedPublicEnrollmentKind(outcome.error)) {
+                PublicEnrollmentFailureKind.PENDING, PublicEnrollmentFailureKind.BLOCKED -> {
+                    // The orchestrator itself (inside Noise) says the device is not approved.
+                    state.reasons -= PublicReEnrollReason.REAUTH_CONFIRM
+                    applyConfirmedPublicReauth(context, "orchestrator")
+                }
+                PublicEnrollmentFailureKind.TERMINAL -> state.reasons.clear()
+                else -> Unit
+            }
+        }
+    }
+    schedulePublicBackgroundReEnroll(context, 0L)
+}
+
+/**
+ * After a config is applied: queue the background re-enrollments it calls for (acknowledge a
+ * pending REALITY flow, fetch credentials of AWG profiles the bundle offers).
+ */
+internal fun requestPublicReEnrollsFor(
+    context: Context,
+    stored: StoredPublicPlatformState,
+    config: PublicClientConfig,
+    credentials: PublicPlatformCredentials = stored.toPublicPlatformCredentials(),
+) {
+    if (publicFlowAckNeeded(stored)) {
+        requestPublicBackgroundReEnroll(context, PublicReEnrollReason.FLOW_ACK)
+    }
+    val missing = PublicPlatformConfigParser.missingAwgProfileCredentials(config, credentials)
+    if (missing.isEmpty()) return
+    MAIN_HANDLER.post {
+        val attempted = PublicBackgroundReEnroll.attemptedAwgProfiles
+        if (attempted.containsAll(missing)) return@post
+        attempted += missing
+        requestPublicBackgroundReEnroll(context, PublicReEnrollReason.AWG_PROFILE_CREDENTIALS)
+    }
+}
+
+/**
+ * Automatic first enrollment on activity start (no explicit user action) is spaced by a backoff,
+ * so rotating or reopening the screen does not hammer the orchestrator directly.
+ */
+private fun startAutomaticPublicEnrollment(context: Context, bootstrapRaw: String) {
+    val nowMs = SystemClock.elapsedRealtime()
+    if (PUBLIC_AUTO_ENROLL_BACKOFF.remainingMs(nowMs) > 0) {
+        TransportRuntime.auth = TransportRuntime.auth.copy(
+            inProgress = false,
+            enrollmentRetryAllowed = true,
+            statusTextRes = R.string.enrollment_status_error,
+            errorTextRes = R.string.public_enrollment_error,
+        )
+        return
+    }
+    startPublicDeviceEnrollment(context, bootstrapRaw, onOutcome = { outcome ->
+        when (outcome) {
+            is PublicEnrollOutcome.Enrolled -> PUBLIC_AUTO_ENROLL_BACKOFF.onSuccess()
+            is PublicEnrollOutcome.Failed -> PUBLIC_AUTO_ENROLL_BACKOFF.onFailure(SystemClock.elapsedRealtime())
+        }
+    })
+}
+
+private val PUBLIC_AUTO_ENROLL_BACKOFF = PublicEnrollmentBackoff()
 
 private fun postPublicEnrollmentFailure(
     mainHandler: Handler,
@@ -3248,6 +3430,7 @@ private fun applyPublicPlatformState(
     if (persist != null) {
         store.updatePublicPlatformState(persist)
     }
+    requestPublicReEnrollsFor(context, stored, config, credentials)
     val mainHandler = Handler(Looper.getMainLooper())
     // Compose-backed runtime state is updated on the main thread; posts are FIFO, so anything the
     // caller posts afterwards (e.g. starting the transport) observes these values.
@@ -4348,6 +4531,13 @@ private const val JSON_CLIENT_VERSION_CODE = "client_version_code"
 private const val JSON_CLIENT_CAPABILITIES = "client_capabilities"
 private const val JSON_PUBLIC_AWG_PROFILES = "awg_profiles"
 private const val JSON_PUBLIC_REALITY_FLOW = "reality_flow"
+private const val JSON_PUBLIC_REALITY_FLOW_PENDING = "reality_flow_pending"
+private const val JSON_PUBLIC_REALITY_FLOW_ACK = "reality_flow_ack"
+private const val JSON_PUBLIC_SOCKS_PROXY = "socks_proxy"
+private const val JSON_PUBLIC_ORCH_TLS_SPKI_SHA256 = "orch_tls_spki_sha256"
+private const val JSON_PUBLIC_REENROLL = "reenroll"
+private const val JSON_PUBLIC_CODE = "code"
+private const val JSON_PUBLIC_REJECTED = "rejected"
 private const val JSON_REQUEST_KEYS = "request_keys"
 private const val JSON_SOCKS_LISTEN = "socks_listen"
 private const val JSON_AWG_RU_SOCKS_LISTEN = "awg_ru_socks_listen"

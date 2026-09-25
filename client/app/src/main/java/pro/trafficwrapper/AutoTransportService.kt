@@ -3506,6 +3506,8 @@ class AutoTransportService : Service() {
             reality = slots.reality,
             reality2 = slots.reality2,
         )
+        // A polled bundle may offer AWG profiles this device has no credentials for (X-M4).
+        requestPublicReEnrollsFor(applicationContext, stored, config, credentials)
     }
 
     private data class PublicConfigPollResult(
@@ -3786,6 +3788,28 @@ class AutoTransportService : Service() {
             else -> ""
         }
 
+    private fun currentAwgVariantKey(route: Route): String =
+        when (route) {
+            Route.AWG_RU -> PublicAwgFamilyState.awgRuVariantKey
+            Route.AWG -> PublicAwgFamilyState.awgVariantKey
+            else -> ""
+        }
+
+    private fun setCurrentAwgVariantKey(route: Route, key: String) {
+        when (route) {
+            Route.AWG_RU -> PublicAwgFamilyState.awgRuVariantKey = key
+            Route.AWG -> PublicAwgFamilyState.awgVariantKey = key
+            else -> Unit
+        }
+    }
+
+    private fun primaryAwgRoute(route: Route): PublicRouteConfig? =
+        when (route) {
+            Route.AWG_RU -> TransportRuntime.publicPlatformRouteSlots.awgRu
+            Route.AWG -> TransportRuntime.publicPlatformRouteSlots.awg
+            else -> null
+        }
+
     private fun setCurrentAwgFamily(route: Route, family: String) {
         when (route) {
             Route.AWG_RU -> PublicAwgFamilyState.awgRu = family
@@ -3805,17 +3829,23 @@ class AutoTransportService : Service() {
         val variants = awgVariantsFor(route)
         val cursor = slot.sync(variants, TransportLifecycleStore.lastGoodVariant(applicationContext, variantSlotName(route)))
         if (cursor == null || cursor.size <= 1) {
-            // No IPv6 alternative: never send ip_family, exactly as before.
-            if (currentAwgFamily(route).isEmpty()) return false
+            // No alternative: never send ip_family, exactly as before.
+            if (currentAwgFamily(route).isEmpty() && currentAwgVariantKey(route).isEmpty()) return false
             setCurrentAwgFamily(route, "")
+            setCurrentAwgVariantKey(route, "")
             return reapplyPublicCoreConfig(route, reason)
         }
         if (advance) cursor.advance()
         val desired = cursor.current?.family?.wire.orEmpty()
-        if (desired == currentAwgFamily(route) || (desired == IpFamily.V4.wire && currentAwgFamily(route).isEmpty())) {
+        // Profile alternative (params.awg_profiles, X-M4); "" = the slot's primary route.
+        val desiredKey = awgVariantSelectionKey(cursor.current, primaryAwgRoute(route))
+        val familyUnchanged =
+            desired == currentAwgFamily(route) || (desired == IpFamily.V4.wire && currentAwgFamily(route).isEmpty())
+        if (familyUnchanged && desiredKey == currentAwgVariantKey(route)) {
             return false
         }
         setCurrentAwgFamily(route, desired)
+        setCurrentAwgVariantKey(route, desiredKey)
         telemetryEvent(
             "route_variant",
             "rsn" to reason,
