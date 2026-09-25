@@ -47,6 +47,8 @@ object Telemetry {
     // Lines currently in the spool file; -1 until counted once. Touched only on the io thread.
     private val spoolLineCount = AtomicLong(-1)
     private val backoffMs = AtomicLong(BACKOFF_MIN_MS)
+    // Worker clock minus ours from X-TW-Server-Time; in memory only (X-M5).
+    private val serverTimeOffsetMs = AtomicLong(0)
 
     @Volatile
     private var identityStore: SecureIdentityStore? = null
@@ -64,16 +66,27 @@ object Telemetry {
                 ?.let { "$safeKind:$it" }
                 ?: safeKind
             val nowMs = System.currentTimeMillis()
-            val accept = lastDedupKeyAtMs.compute(dedupKey) { _, previousAt ->
-                if (previousAt != null && nowMs - previousAt < DEDUP_WINDOW_MS) previousAt else nowMs
-            } == nowMs
+            // Dedup on the monotonic clock: a wall clock corrected backwards must not swallow
+            // events for the length of the correction (APP-L28).
+            val monoMs = SystemClock.elapsedRealtime()
+            var accept = false
+            lastDedupKeyAtMs.compute(dedupKey) { _, previousAt ->
+                if (telemetryDedupAccepts(previousAt, monoMs)) {
+                    accept = true
+                    monoMs
+                } else {
+                    previousAt
+                }
+            }
             if (!accept) return
             enqueue(
                 QueuedEvent(
                     kind = safeKind,
                     wallTimeMs = nowMs,
-                    monoMs = SystemClock.elapsedRealtime(),
+                    monoMs = monoMs,
                     fields = safeFields,
+                    // Context as of the event, not of the (possibly much later) flush (APP-L29).
+                    context = captureEventContext(context.applicationContext),
                 ),
             )
             if (BuildConfig.DEBUG) {
@@ -375,34 +388,59 @@ object Telemetry {
             )
     }
 
-    private fun snapshotFrom(context: Context, event: QueuedEvent): TelemetrySnapshot {
+    /**
+     * Device/transport context at the moment of an event (APP-L29). Stored with the queued event
+     * and used by [snapshotFrom] instead of the state at flush time.
+     */
+    private fun captureEventContext(context: Context): Map<String, Any?> {
         val state = runCatching { TransportRuntime.state }.getOrDefault(TransportUiState())
         val auth = runCatching { TransportRuntime.auth }.getOrDefault(AuthUiState())
         val network = networkSnapshot(context)
+        return linkedMapOf(
+            "net" to network.net,
+            "metered" to network.metered,
+            "vpn" to network.vpn,
+            "doze" to doze(context),
+            "batt_opt" to batteryOptimizationsIgnored(context),
+            "skew_s" to state.clockSkewSeconds,
+            "enr" to enrollmentStatus(auth),
+            "prov_awg" to (auth.provisionedSOCKS.isNotBlank() || auth.internalIP.isNotBlank() || auth.endpoint.isNotBlank()),
+            "prov_rl" to (auth.reality?.isComplete() == true),
+            "prov_rl2" to (auth.reality2?.isComplete() == true),
+            "mode" to runCatching { TransportRuntime.selectedTransport.name }.getOrDefault(""),
+            "route" to state.activeTransport,
+            "healthy" to state.handshakeEstablished,
+            "stable" to state.tunnelStable,
+            "last_exch_s" to state.lastExchangeAgeSeconds,
+            "rl2_uid8" to realityUuid8(TransportRuntime.appliedReality2Uuid),
+        ).filterValues { it != null }
+    }
+
+    private fun snapshotFrom(context: Context, event: QueuedEvent): TelemetrySnapshot {
+        // Spool lines written before the context was stored fall back to the current state.
+        val ctx = event.context.ifEmpty { captureEventContext(context) }
         val fields = event.fields
         return TelemetrySnapshot(
             kind = event.kind,
             wallTimeMs = event.wallTimeMs,
             monoMs = event.monoMs,
             reason = fields.stringValue("rsn"),
-            net = network.net,
-            metered = network.metered,
-            vpn = network.vpn,
-            doze = doze(context),
-            batteryOptimizationsIgnored = batteryOptimizationsIgnored(context),
-            skewSeconds = fields.longValue("skew_s") ?: state.clockSkewSeconds,
-            enrollment = fields.stringValue("enr").ifBlank { enrollmentStatus(auth) },
-            provisionedAwg = fields.booleanValue("prov_awg") ?: auth.provisionedSOCKS.isNotBlank() ||
-                auth.internalIP.isNotBlank() ||
-                auth.endpoint.isNotBlank(),
-            provisionedReality = fields.booleanValue("prov_rl") ?: (auth.reality?.isComplete() == true),
-            provisionedReality2 = fields.booleanValue("prov_rl2") ?: (auth.reality2?.isComplete() == true),
-            mode = fields.stringValue("mode").ifBlank { TransportRuntime.selectedTransport.name },
-            route = fields.stringValue("route").ifBlank { state.activeTransport },
-            activeRoute = fields.stringValue("active_route").ifBlank { state.activeTransport },
-            healthy = fields.booleanValue("healthy") ?: state.handshakeEstablished,
-            stable = fields.booleanValue("stable") ?: state.tunnelStable,
-            lastExchangeSeconds = fields.longValue("last_exch_s") ?: state.lastExchangeAgeSeconds,
+            net = ctx.stringValue("net").ifBlank { "unknown" },
+            metered = ctx.booleanValue("metered") ?: false,
+            vpn = ctx.booleanValue("vpn") ?: false,
+            doze = ctx.booleanValue("doze") ?: false,
+            batteryOptimizationsIgnored = ctx.booleanValue("batt_opt") ?: false,
+            skewSeconds = fields.longValue("skew_s") ?: ctx.longValue("skew_s"),
+            enrollment = fields.stringValue("enr").ifBlank { ctx.stringValue("enr") },
+            provisionedAwg = fields.booleanValue("prov_awg") ?: ctx.booleanValue("prov_awg") ?: false,
+            provisionedReality = fields.booleanValue("prov_rl") ?: ctx.booleanValue("prov_rl") ?: false,
+            provisionedReality2 = fields.booleanValue("prov_rl2") ?: ctx.booleanValue("prov_rl2") ?: false,
+            mode = fields.stringValue("mode").ifBlank { ctx.stringValue("mode") },
+            route = fields.stringValue("route").ifBlank { ctx.stringValue("route") },
+            activeRoute = fields.stringValue("active_route").ifBlank { ctx.stringValue("route") },
+            healthy = fields.booleanValue("healthy") ?: ctx.booleanValue("healthy") ?: false,
+            stable = fields.booleanValue("stable") ?: ctx.booleanValue("stable") ?: false,
+            lastExchangeSeconds = fields.longValue("last_exch_s") ?: ctx.longValue("last_exch_s"),
             backoffMs = fields.longValue("backoff_ms"),
             awgStarted = fields.booleanValue("awg_started"),
             awgStartError = fields.stringValue("awg_start_err"),
@@ -443,9 +481,7 @@ object Telemetry {
             reality2Error = fields.stringValue("rl2_err"),
             reality2RxBytes = fields.longValue("rl2_rx"),
             reality2TxBytes = fields.longValue("rl2_tx"),
-            reality2Uuid8 = fields.stringValue("rl2_uid8").ifBlank {
-                realityUuid8(TransportRuntime.appliedReality2Uuid)
-            },
+            reality2Uuid8 = fields.stringValue("rl2_uid8").ifBlank { ctx.stringValue("rl2_uid8") },
             routeVariant = fields.stringValue("rl_var"),
             errorWhere = fields.stringValue("err_where"),
             errorKind = fields.stringValue("err_kind"),
@@ -538,7 +574,9 @@ object Telemetry {
         val store = identityStore(context)
         val publicKey = store.deviceIdentityPublicKey()
         val deviceID = telemetryDeviceIDForPublicKey(publicKey)
-        val ts = System.currentTimeMillis().toString()
+        // X-TW-Ts: system time corrected by the worker's X-TW-Server-Time (memory only; this is
+        // not the trusted time used for update checks).
+        val ts = (System.currentTimeMillis() + serverTimeOffsetMs.get()).toString()
         val nonce = randomNonce()
         val bodyHash = sha256Hex(bodyBytes)
         val canonical = listOf(
@@ -587,7 +625,16 @@ object Telemetry {
         }
     }
 
+    /**
+     * Relay contract: a 422 is final, except one re-signed retry when the worker reported its
+     * time (X-TW-Server-Time) and the error is stale_timestamp (X-M5).
+     */
     private fun postPublic(context: Context, bodyBytes: ByteArray): PostResult {
+        val first = postPublicOnce(context, bodyBytes)
+        return if (first.staleTimestamp) postPublicOnce(context, bodyBytes) else first
+    }
+
+    private fun postPublicOnce(context: Context, bodyBytes: ByteArray): PostResult {
         val endpoint = URL(PUBLIC_TELEMETRY_URL)
         val port = if (endpoint.port > 0) endpoint.port else endpoint.defaultPort
         val path = endpoint.file.ifBlank { "/" }
@@ -622,6 +669,10 @@ object Telemetry {
             val statusLine = header.lineSequence().firstOrNull().orEmpty()
             val code = statusLine.split(' ').firstOrNull { it.toIntOrNull() != null }?.toIntOrNull() ?: 0
             val responseText = input.readBytes().toString(Charsets.UTF_8).take(MAX_RESPONSE_CHARS)
+            val serverTime = header.lineSequence()
+                .firstOrNull { it.substringBefore(':').trim().equals("X-TW-Server-Time", ignoreCase = true) }
+                ?.substringAfter(':', "")
+            telemetryServerTimeOffsetMs(serverTime, System.currentTimeMillis())?.let { serverTimeOffsetMs.set(it) }
             if (isExplicitDeviceNotApprovedResponse(code, responseText)) {
                 markPublicDeviceReauthRequired(context, "telemetry")
             }
@@ -631,7 +682,11 @@ object Telemetry {
             } || code in 200..299 && code != 204 && responseText.isNotBlank() && runCatching {
                 JSONObject(responseText).optBoolean("telemetry_off", false)
             }.getOrDefault(false)
-            return PostResult(httpCode = code, disableTelemetry = disable)
+            return PostResult(
+                httpCode = code,
+                disableTelemetry = disable,
+                staleTimestamp = telemetryStaleTimestampRetryable(code, serverTime != null, responseText),
+            )
         }
     }
 
@@ -742,6 +797,23 @@ object Telemetry {
     internal fun telemetryDeviceIDForPublicKey(publicKey: String): String =
         "twpk_" + sha256Hex(publicKey.toByteArray(Charsets.UTF_8)).take(32)
 
+    /** Accept an event unless the same key was accepted within [windowMs] (monotonic clock). */
+    internal fun telemetryDedupAccepts(previousAtMs: Long?, nowMs: Long, windowMs: Long = DEDUP_WINDOW_MS): Boolean =
+        previousAtMs == null || nowMs - previousAtMs !in 0 until windowMs
+
+    /** Offset of the worker clock (X-TW-Server-Time, unix ms) from ours; null without the header. */
+    internal fun telemetryServerTimeOffsetMs(headerValue: String?, localNowMs: Long): Long? {
+        val serverMs = headerValue?.trim()?.toLongOrNull() ?: return null
+        if (serverMs <= 0L) return null
+        return serverMs - localNowMs
+    }
+
+    /** A 422 is retried (once) only for stale_timestamp from a worker that reported its time. */
+    internal fun telemetryStaleTimestampRetryable(httpCode: Int, serverTimePresent: Boolean, body: String): Boolean =
+        httpCode == 422 && serverTimePresent && runCatching {
+            JSONObject(body.trim()).optString("error").trim() == "stale_timestamp"
+        }.getOrDefault(false)
+
     internal fun isNonRetryableTelemetryHttpCode(code: Int): Boolean =
         code == 400 || code == 401 || code == 403 || code == 422
 
@@ -765,6 +837,17 @@ object Telemetry {
             monoMs = 1L,
             fields = mapOf("err_msg" to "x".repeat(payloadBytes.coerceAtLeast(0))),
         ).toJson().toString()
+
+    /** Spool round trip of an event carrying [context] (APP-L29): returns the parsed context. */
+    internal fun telemetryContextRoundTripForTest(context: Map<String, Any?>): Map<String, Any?> {
+        val line = QueuedEvent(kind = "test", wallTimeMs = 1L, monoMs = 1L, fields = emptyMap(), context = context)
+            .toJson().toString()
+        return parseQueuedEvent(line)?.context.orEmpty()
+    }
+
+    /** Parsed context of a spool line (empty for lines written before the context existed). */
+    internal fun telemetryContextOfLineForTest(line: String): Map<String, Any?> =
+        parseQueuedEvent(line)?.context.orEmpty()
 
     internal fun telemetryBatchSelectionForTest(
         lines: List<String>,
@@ -895,6 +978,11 @@ object Telemetry {
                     fields.forEach { (key, value) -> root.putJsonValue(key, value) }
                 },
             )
+            .also { root ->
+                if (context.isNotEmpty()) {
+                    root.put("c", JSONObject().also { ctx -> context.forEach { (key, value) -> ctx.putJsonValue(key, value) } })
+                }
+            }
 
     private fun parseQueuedEvent(line: String): QueuedEvent? =
         runCatching {
@@ -906,11 +994,19 @@ object Telemetry {
                     fields[key] = fieldsJson.get(key).takeUnless { it == JSONObject.NULL }
                 }
             }
+            val contextJson = root.optJSONObject("c") ?: JSONObject()
+            val eventContext = linkedMapOf<String, Any?>()
+            contextJson.keys().forEach { key ->
+                if (key in CONTEXT_KEYS && !contextJson.isNull(key)) {
+                    eventContext[key] = contextJson.get(key)
+                }
+            }
             QueuedEvent(
                 kind = sanitizeToken(root.optString("k"), MAX_KIND_CHARS).ifBlank { "unknown" },
                 wallTimeMs = root.optLong("t"),
                 monoMs = root.optLong("mono"),
                 fields = fields,
+                context = eventContext,
             )
         }.getOrNull()
 
@@ -982,6 +1078,8 @@ object Telemetry {
         val wallTimeMs: Long,
         val monoMs: Long,
         val fields: Map<String, Any?>,
+        /** Context captured when the event happened (see captureEventContext); empty in old spools. */
+        val context: Map<String, Any?> = emptyMap(),
     )
 
     private data class TelemetrySnapshot(
@@ -1061,7 +1159,11 @@ object Telemetry {
 
     private data class Batch(val events: List<QueuedEvent>, val consumedLines: Int)
 
-    private data class PostResult(val httpCode: Int, val disableTelemetry: Boolean)
+    private data class PostResult(
+        val httpCode: Int,
+        val disableTelemetry: Boolean,
+        val staleTimestamp: Boolean = false,
+    )
 
     enum class TelemetryFlushDisposition {
         SUCCESS,
@@ -1110,6 +1212,10 @@ object Telemetry {
     private const val MAX_ERROR_CHARS = 160
     private const val SEQ_UNINITIALIZED = Long.MIN_VALUE
     private val BANNED_ENDPOINT_PORTS = setOf(18080, 18081, 18082, 18083)
+    private val CONTEXT_KEYS = setOf(
+        "net", "metered", "vpn", "doze", "batt_opt", "skew_s", "enr", "prov_awg", "prov_rl",
+        "prov_rl2", "mode", "route", "healthy", "stable", "last_exch_s", "rl2_uid8",
+    )
     private val ALLOWED_FIELD_KEYS = setOf(
         "rsn",
         "skew_s",
