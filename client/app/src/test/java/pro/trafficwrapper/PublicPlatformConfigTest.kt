@@ -1143,7 +1143,13 @@ class PublicPlatformConfigTest {
             awgPrivateKey = "private",
             awgPublicKey = "public",
         )
-        val slots = PublicPlatformConfigParser.routeSlots(config, stored.deviceID, stored.toPublicPlatformCredentials())
+        val profiles = JSONObject().put("awg-v2", JSONObject().put("awg_public_key", "pk2").put("internal_ip", "10.14.0.2/32").put("psk2", "p2"))
+        // The awg-v2 route needs this device's awg-v2 credentials to take the slot (X-M4).
+        val slots = PublicPlatformConfigParser.routeSlots(
+            config,
+            stored.deviceID,
+            stored.copy(awgProfilesJson = profiles.toString()).toPublicPlatformCredentials(),
+        )
         val legacy = publicCoreApplyRequest(stored, config, slots, "127.0.0.1:18082", "127.0.0.1:18084", awgRuFamily = "", awgFamily = "")
         assertEquals(false, legacy.has("awg_profiles"))
         assertEquals(false, legacy.has("rendezvous_public_key"))
@@ -1156,7 +1162,6 @@ class PublicPlatformConfigTest {
         assertEquals("awg-v2", legacy.getJSONObject("awg_ru").getString("awg_profile"))
         assertEquals("10.8.0.1", legacy.getJSONObject("awg_ru").getJSONArray("dns").getString(0))
 
-        val profiles = JSONObject().put("awg-v2", JSONObject().put("awg_public_key", "pk2").put("internal_ip", "10.14.0.2/32").put("psk2", "p2"))
         val request = publicCoreApplyRequest(
             stored.copy(awgProfilesJson = profiles.toString()),
             config,
@@ -1197,7 +1202,10 @@ class PublicPlatformConfigTest {
     @Test
     fun clientCapabilitiesAreTheAgreedSet() {
         assertEquals(
-            listOf("reality_vision", "reality_profiles", "reality_short_id", "awg_dialect_wide", "ipv6_endpoints", "tunnel_dns"),
+            listOf(
+                "reality_vision", "reality_profiles", "reality_short_id", "awg_dialect_wide", "ipv6_endpoints", "tunnel_dns",
+                "route_alternatives_v1", "reality_flow_ack",
+            ),
             PUBLIC_CLIENT_CAPABILITIES,
         )
     }

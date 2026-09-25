@@ -18,7 +18,21 @@ data class PublicBootstrapConfig(
     val bootstrapToken: String,
     val expiresAt: String,
     val limits: JSONObject?,
+    /**
+     * Optional orch_tls_spki_sha256: SHA-256 SPKI pins of the orchestrator TLS certificate
+     * (current + spare). Used only for the first enrollment; empty = legacy behaviour.
+     */
+    val orchTlsSpkiSha256: List<String> = emptyList(),
 )
+
+/**
+ * An expiry decided only by the device clock (bootstrap or client config) beyond the skew
+ * tolerance: retryable, since a wrong clock is the usual cause (APP-L27).
+ */
+class PublicClockSkewException(message: String) : PublicConfigVerificationException(message)
+
+/** Tolerance for device clock skew in bootstrap/config expiry checks. */
+internal const val PUBLIC_CLOCK_SKEW_TOLERANCE_MS = 10 * 60_000L
 
 data class PublicClientConfigEnvelope(
     val configJson: String,
@@ -27,6 +41,21 @@ data class PublicClientConfigEnvelope(
     val configSha256: String,
     val serverTime: String,
 )
+
+/**
+ * REALITY uTLS fingerprint for this build: params.fingerprint_modern when the bundle offers it and
+ * this build's derived version code reaches fingerprint_modern_min_version_code, otherwise
+ * params.fingerprint ("chrome" by default).
+ */
+internal fun realityFingerprintFor(params: JSONObject, clientVersionCode: Long): String {
+    val modern = params.optString("fingerprint_modern").trim()
+    val threshold = params.opt("fingerprint_modern_min_version_code")
+        .let { (it as? Number)?.toLong() ?: (it as? String)?.trim()?.toLongOrNull() }
+    if (modern.isNotEmpty() && threshold != null && threshold > 0 && clientVersionCode >= threshold) {
+        return modern
+    }
+    return params.optString("fingerprint", "chrome")
+}
 
 internal fun clampRealityFingerprint(value: String): String =
     when (value.trim().lowercase()) {
@@ -94,6 +123,16 @@ data class PublicPlatformCredentials(
     val realityFlow: String = "",
     /** True when the enroll response carried reality_flow (even an empty one). */
     val realityFlowKnown: Boolean = false,
+    /**
+     * Names of the AWG profiles this device holds awg_profiles credentials for; null = unknown
+     * (no filtering). A non-base profile outside this set is never used (X-M4).
+     */
+    val awgProfileNames: Set<String>? = null,
+    /** Version gate code of this build (see [derivedClientVersionCode]), not the Android versionCode. */
+    val clientVersionCode: Long = PUBLIC_CLIENT_DERIVED_VERSION_CODE,
+    /** reality_flow_pending of the last enroll response (two-phase Vision switch). */
+    val realityFlowPending: String = "",
+    val realityFlowPendingKnown: Boolean = false,
 )
 
 internal fun StoredPublicPlatformState.toPublicPlatformCredentials(): PublicPlatformCredentials =
@@ -107,7 +146,40 @@ internal fun StoredPublicPlatformState.toPublicPlatformCredentials(): PublicPlat
         awgPublicKey = awgPublicKey,
         realityFlow = realityFlow,
         realityFlowKnown = realityFlowKnown,
+        awgProfileNames = publicAwgProfileNames(awgProfilesJson),
+        realityFlowPending = realityFlowPending,
+        realityFlowPendingKnown = realityFlowPendingKnown,
     )
+
+/** Worker AWG profile a route targets (awg_profile wins over profile); "" = base. */
+internal fun awgRouteProfileName(route: PublicRouteConfig): String =
+    route.params.optString("awg_profile").ifBlank { route.params.optString("profile") }.trim()
+
+/** The worker's base AWG inbound, served with the top-level device credentials. */
+internal fun isBaseAwgProfile(profile: String): Boolean = profile.isBlank() || profile.trim() == "awg"
+
+/** A base profile always; another one only with this device's credentials for it (or when unknown). */
+internal fun awgProfileUsable(profile: String, credentials: PublicPlatformCredentials): Boolean {
+    if (isBaseAwgProfile(profile)) return true
+    val known = credentials.awgProfileNames ?: return true
+    return profile.trim() in known
+}
+
+/** Profiles with complete credentials (internal_ip and psk2) in an enroll awg_profiles object. */
+internal fun publicAwgProfileNames(awgProfilesJson: String): Set<String> {
+    val root = awgProfilesJson.trim().takeIf { it.isNotEmpty() }
+        ?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return emptySet()
+    val out = linkedSetOf<String>()
+    val keys = root.keys()
+    while (keys.hasNext()) {
+        val name = keys.next()
+        val creds = root.optJSONObject(name) ?: continue
+        if (creds.optString("internal_ip").isNotBlank() && creds.optString("psk2").isNotBlank()) {
+            out += name.trim()
+        }
+    }
+    return out
+}
 
 /**
  * Capabilities announced in the enroll request (client_capabilities). The orchestrator stores
@@ -120,7 +192,43 @@ val PUBLIC_CLIENT_CAPABILITIES: List<String> = listOf(
     "awg_dialect_wide",
     "ipv6_endpoints",
     "tunnel_dns",
+    // Nested params.awg_profiles alternatives chosen by credentials and min_version_code (X-M4).
+    "route_alternatives_v1",
+    // Two-phase Vision switch: reality_flow_pending is confirmed with reality_flow_ack (X-L13).
+    "reality_flow_ack",
 )
+
+/**
+ * Version gate code of a versionName: major*10000 + minor*100 + patch ("0.1.31" -> 131). This is
+ * the unit of min_version_code and fingerprint_modern_min_version_code, never the Android
+ * versionCode. Suffixes after the numeric part are ignored; an unparsable name gives 0.
+ */
+internal fun derivedClientVersionCode(versionName: String): Long {
+    val match = Regex("""^\s*v?(\d{1,4})\.(\d{1,2})(?:\.(\d{1,2}))?""").find(versionName) ?: return 0L
+    val (major, minor, patch) = match.destructured
+    return major.toLong() * 10_000L + minor.toLong() * 100L + (patch.toLongOrNull() ?: 0L)
+}
+
+val PUBLIC_CLIENT_DERIVED_VERSION_CODE: Long by lazy { derivedClientVersionCode(BuildConfig.VERSION_NAME) }
+
+/**
+ * Per-platform device hint sent instead of ANDROID_ID (APP-L19): HMAC-SHA256 keyed by the
+ * platform's config_pubkey_pin, so two platforms cannot link the same device by it. Blank when
+ * ANDROID_ID is unavailable.
+ */
+internal fun publicDeviceHint(androidId: String, configPubkeyPin: String): String {
+    if (androidId.isBlank()) return ""
+    val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+    mac.init(
+        javax.crypto.spec.SecretKeySpec(
+            "TrafficWrapper device hint v1\n${configPubkeyPin.trim()}".toByteArray(Charsets.UTF_8),
+            "HmacSHA256",
+        ),
+    )
+    return "h1_" + mac.doFinal(androidId.trim().toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        .take(32)
+}
 
 const val REALITY_FLOW_VISION = "xtls-rprx-vision"
 
@@ -197,6 +305,26 @@ object PublicAwgFamilyState {
 
     @Volatile
     var awg: String = ""
+
+    /** Key of the AWG_RU/AWG profile alternative in use ("" = the slot's primary route). */
+    @Volatile
+    var awgRuVariantKey: String = ""
+
+    @Volatile
+    var awgVariantKey: String = ""
+}
+
+/** Selection key of an AWG slot variant: "" for the primary route, else the variant key. */
+internal fun awgVariantSelectionKey(variant: AwgRouteVariant?, primary: PublicRouteConfig?): String =
+    if (variant == null || variant.route === primary) "" else variant.key
+
+private fun selectedAwgRoute(
+    primary: PublicRouteConfig?,
+    variants: List<AwgRouteVariant>,
+    selectionKey: String,
+): PublicRouteConfig? {
+    if (primary == null || selectionKey.isBlank()) return primary
+    return variants.firstOrNull { it.key == selectionKey }?.route ?: primary
 }
 
 /**
@@ -213,6 +341,8 @@ internal fun publicCoreApplyRequest(
     rendezvousPublicKey: String? = null,
     awgRuFamily: String = PublicAwgFamilyState.awgRu,
     awgFamily: String = PublicAwgFamilyState.awg,
+    awgRuVariantKey: String = PublicAwgFamilyState.awgRuVariantKey,
+    awgVariantKey: String = PublicAwgFamilyState.awgVariantKey,
 ): JSONObject {
     val request = JSONObject()
         .put("awg_private_key", stored.awgPrivateKey)
@@ -234,8 +364,11 @@ internal fun publicCoreApplyRequest(
     if (awgProfiles != null && awgProfiles.length() > 0) {
         request.put("awg_profiles", awgProfiles)
     }
-    slots.awgRu?.let { request.put("awg_ru", publicAwgRouteRequest(it, awgRuFamily, slots.awgRuWorkerId)) }
-    slots.awg?.let { request.put("awg", publicAwgRouteRequest(it, awgFamily, slots.awgWorkerId)) }
+    // AWG alternatives are routes of the same worker, so the slot's worker id still applies.
+    selectedAwgRoute(slots.awgRu, slots.awgRuVariants, awgRuVariantKey)
+        ?.let { request.put("awg_ru", publicAwgRouteRequest(it, awgRuFamily, slots.awgRuWorkerId)) }
+    selectedAwgRoute(slots.awg, slots.awgVariants, awgVariantKey)
+        ?.let { request.put("awg", publicAwgRouteRequest(it, awgFamily, slots.awgWorkerId)) }
     return request
 }
 
@@ -287,7 +420,7 @@ data class PublicPlatformRouteSlots(
         awgRu != null || awg != null || reality2?.isComplete() == true || reality?.isComplete() == true
 }
 
-class PublicConfigVerificationException(message: String) : IllegalArgumentException(message)
+open class PublicConfigVerificationException(message: String) : IllegalArgumentException(message)
 
 interface PublicMinisignVerifier {
     fun verify(message: String, signature: String, publicKey: String): Boolean
@@ -305,8 +438,9 @@ object PublicPlatformConfigParser {
         val json = decodePossiblyBase64Json(raw)
         val root = JSONObject(json)
         val expiresAt = root.getString(JSON_EXPIRES)
-        if (parseInstantMs(expiresAt) <= nowMs) {
-            throw PublicConfigVerificationException("bootstrap expired")
+        if (expiredBeyondClockTolerance(parseInstantMs(expiresAt), nowMs)) {
+            // Only the device clock says so: retryable, see PublicClockSkewException.
+            throw PublicClockSkewException("bootstrap expired by device clock")
         }
         val seedWorkers = root.optJSONArray(JSON_SEED_WORKERS).toStringList()
         return PublicBootstrapConfig(
@@ -318,8 +452,20 @@ object PublicPlatformConfigParser {
             bootstrapToken = root.getString(JSON_BOOTSTRAP_TOKEN),
             expiresAt = expiresAt,
             limits = root.optJSONObject(JSON_LIMITS),
+            orchTlsSpkiSha256 = root.optJSONArray(JSON_ORCH_TLS_SPKI_SHA256).toStringListLenient(),
         )
     }
+
+    /** nowMs <= 0 disables the check (re-enrollment of an enrolled device, restore). */
+    private fun expiredBeyondClockTolerance(expiresAtMs: Long, nowMs: Long): Boolean =
+        nowMs > 0 && expiresAtMs <= nowMs - PUBLIC_CLOCK_SKEW_TOLERANCE_MS
+
+    private fun JSONArray?.toStringListLenient(): List<String> =
+        if (this == null) {
+            emptyList()
+        } else {
+            (0 until length()).mapNotNull { index -> (opt(index) as? String)?.trim()?.takeIf { it.isNotEmpty() } }
+        }
 
     fun verifyAndParseClientConfig(
         envelopeRaw: String,
@@ -350,8 +496,8 @@ object PublicPlatformConfigParser {
         if (config.seq < maxSeenSeq) {
             throw PublicConfigVerificationException("client config rollback")
         }
-        if (parseInstantMs(config.expiresAt) <= nowMs) {
-            throw PublicConfigVerificationException("client config expired")
+        if (expiredBeyondClockTolerance(parseInstantMs(config.expiresAt), nowMs)) {
+            throw PublicClockSkewException("client config expired by device clock")
         }
         return config
     }
@@ -395,6 +541,9 @@ object PublicPlatformConfigParser {
         val ordered = deterministicRouteOrder(config, deviceId)
         val awgResolved = ordered
             .filter { it.route.type in AWG_ROUTE_TYPES && it.route.address.isNotBlank() && it.route.port > 0 }
+            // A route on another AWG profile needs this device's credentials for that profile;
+            // the base ones have no peer there (X-M4).
+            .filter { awgProfileUsable(awgRouteProfileName(it.route), credentials) }
         val realityCandidates = ordered
             .filter { it.route.type in REALITY_ROUTE_TYPES && it.route.address.isNotBlank() && it.route.port > 0 }
         // Fallback profiles (xhttp, another port) never take a slot of their own: they only
@@ -451,9 +600,34 @@ object PublicPlatformConfigParser {
             ),
             realityVariants = realityVariants,
             reality2Variants = reality2Variants,
-            awgRuVariants = primaryAwgResolved?.let { RouteVariants.expandAwgVariants(it) }.orEmpty(),
-            awgVariants = secondaryAwgResolved?.let { RouteVariants.expandAwgVariants(it) }.orEmpty(),
+            awgRuVariants = primaryAwgResolved?.let { RouteVariants.expandAwgVariants(it, credentials = credentials) }.orEmpty(),
+            awgVariants = secondaryAwgResolved?.let { RouteVariants.expandAwgVariants(it, credentials = credentials) }.orEmpty(),
         )
+    }
+
+    /**
+     * AWG profiles the bundle offers to this build (route-level profiles and nested
+     * params.awg_profiles passing min_version_code) for which the device holds no credentials.
+     * Non-empty means a re-enrollment could fetch them (X-M4). Empty when credentials are unknown.
+     */
+    fun missingAwgProfileCredentials(
+        config: PublicClientConfig,
+        credentials: PublicPlatformCredentials,
+    ): Set<String> {
+        val known = credentials.awgProfileNames ?: return emptySet()
+        val missing = linkedSetOf<String>()
+        config.workers.flatMap { it.routes }
+            .filter { it.enabled && it.type in AWG_ROUTE_TYPES }
+            .forEach { route ->
+                val profile = awgRouteProfileName(route)
+                if (!isBaseAwgProfile(profile) && profile !in known) missing += profile
+                RouteVariants.nestedAwgProfiles(route).forEach { nested ->
+                    if (nested.minVersionCode <= credentials.clientVersionCode && nested.profile !in known) {
+                        missing += nested.profile
+                    }
+                }
+            }
+        return missing
     }
 
     fun awgRouteJson(route: PublicRouteConfig): JSONObject =
@@ -655,7 +829,7 @@ object PublicPlatformConfigParser {
                 params.optString(JSON_REALITY_PUBLIC_KEY_SNAKE)
             },
             shortId = resolveRealityShortId(params, credentials.deviceID),
-            fingerprint = clampRealityFingerprint(params.optString(JSON_REALITY_FINGERPRINT, "chrome")),
+            fingerprint = clampRealityFingerprint(realityFingerprintFor(params, credentials.clientVersionCode)),
             spiderX = params.optString(JSON_REALITY_SPIDER_X, "/"),
             dest = params.optString(JSON_REALITY_DEST),
             xhttpHost = params.xhttpString(JSON_REALITY_XHTTP_HOST, JSON_REALITY_XHTTP_HOST_SNAKE),
@@ -764,6 +938,7 @@ object PublicPlatformConfigParser {
     private const val JSON_BOOTSTRAP_TOKEN = "bootstrap_token"
     private const val JSON_LIMITS = "limits"
     private const val JSON_EXPIRES = "expires"
+    private const val JSON_ORCH_TLS_SPKI_SHA256 = "orch_tls_spki_sha256"
     private const val JSON_CONFIG_JSON = "config_json"
     private const val JSON_CONFIG_JSON_MINISIG = "config_json_minisig"
     private const val JSON_MINISIG = "minisig"

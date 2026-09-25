@@ -3,7 +3,6 @@ package transport
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -56,6 +55,16 @@ type publicDeviceEnrollAPIRequest struct {
 	AWGPrivateKey      string   `json:"awg_private_key,omitempty"`
 	AWGPublicKey       string   `json:"awg_public_key,omitempty"`
 	TimeoutSeconds     int64    `json:"timeout_seconds,omitempty"`
+	// RealityFlowAck confirms a reality_flow_pending from an earlier enroll
+	// response (two-phase Vision switch). Absent = no acknowledgement.
+	RealityFlowAck *string `json:"reality_flow_ack,omitempty"`
+	// SOCKSProxy routes enrollment through the app's loopback SOCKS router
+	// (the running tunnel) instead of a direct connection.
+	SOCKSProxy string `json:"socks_proxy,omitempty"`
+	// OrchTLSSPKISHA256 are the bootstrap orch_tls_spki_sha256 pins; ReEnroll
+	// selects the re-enrollment TLS rule (system roots or a pin).
+	OrchTLSSPKISHA256 []string `json:"orch_tls_spki_sha256,omitempty"`
+	ReEnroll          bool     `json:"reenroll,omitempty"`
 }
 
 // publicAWGProfileCredentials is the per-profile device AWG record the
@@ -81,6 +90,11 @@ type publicDeviceEnrollAPIResult struct {
 	ClientBundle    json.RawMessage `json:"client_bundle,omitempty"`
 	AWGPrivateKey   string          `json:"awg_private_key,omitempty"`
 	AWGPublicKey    string          `json:"awg_public_key,omitempty"`
+	// Code is the orchestrator's structured rejection code (ok=false). Rejected
+	// marks an error that came from inside the Noise channel, i.e. an
+	// authenticated orchestrator decision rather than a carrier failure.
+	Code     string `json:"code,omitempty"`
+	Rejected bool   `json:"rejected,omitempty"`
 	publicEnrollExtras
 }
 
@@ -91,6 +105,9 @@ type publicDeviceEnrollAPIResult struct {
 type publicEnrollExtras struct {
 	AWGProfiles map[string]publicAWGProfileCredentials `json:"awg_profiles,omitempty"`
 	RealityFlow *string                                `json:"reality_flow,omitempty"`
+	// RealityFlowPending is the flow the orchestrator will switch the device
+	// to once a later enroll acknowledges it (reality_flow_ack).
+	RealityFlowPending *string `json:"reality_flow_pending,omitempty"`
 }
 
 type publicDeviceEnrollWireRequest struct {
@@ -107,11 +124,16 @@ type publicDeviceEnrollWireRequest struct {
 
 	ClientVersionCode  int64    `json:"client_version_code,omitempty"`
 	ClientCapabilities []string `json:"client_capabilities,omitempty"`
+	RealityFlowAck     *string  `json:"reality_flow_ack,omitempty"`
+	// Pad is random filler (ignored by the orchestrator) that varies the size
+	// of the encrypted request.
+	Pad string `json:"pad,omitempty"`
 }
 
 type publicDeviceEnrollWireResponse struct {
 	OK              bool            `json:"ok"`
 	Error           string          `json:"error,omitempty"`
+	Code            string          `json:"code,omitempty"`
 	DeviceID        string          `json:"device_id,omitempty"`
 	Status          string          `json:"status,omitempty"`
 	RealityUUID     string          `json:"reality_uuid,omitempty"`
@@ -125,6 +147,7 @@ type publicDeviceEnrollWireResponse struct {
 
 type publicNoiseStartRequest struct {
 	Message string `json:"message"`
+	Pad     string `json:"pad,omitempty"`
 }
 
 type publicNoiseStartResponse struct {
@@ -138,6 +161,7 @@ type publicNoiseEnvelope struct {
 	SID     string `json:"sid"`
 	Message string `json:"message"`
 	Payload string `json:"payload"`
+	Pad     string `json:"pad,omitempty"`
 }
 
 type publicNoiseEnvelopeResponse struct {
@@ -211,7 +235,13 @@ func PublicDeviceEnroll(requestJSON string) string {
 	}
 	result, err := publicDeviceEnroll(req)
 	if err != nil {
-		return encodePublicDeviceEnrollResult(publicDeviceEnrollAPIResult{OK: false, Error: err.Error()})
+		failure := publicDeviceEnrollAPIResult{OK: false, Error: err.Error()}
+		var rejected *publicEnrollRejectedError
+		if errors.As(err, &rejected) {
+			failure.Code = rejected.code
+			failure.Rejected = true
+		}
+		return encodePublicDeviceEnrollResult(failure)
 	}
 	return encodePublicDeviceEnrollResult(result)
 }
@@ -251,11 +281,25 @@ func publicDeviceEnroll(req publicDeviceEnrollAPIRequest) (publicDeviceEnrollAPI
 	if req.TimeoutSeconds > 0 {
 		timeout = time.Duration(req.TimeoutSeconds) * time.Second
 	}
+	pins, err := parsePublicTLSPins(req.OrchTLSSPKISHA256)
+	if err != nil {
+		return publicDeviceEnrollAPIResult{}, err
+	}
+	client, err := publicHTTPClientWith(publicEnrollTransportOptions{
+		socksProxy: strings.TrimSpace(req.SOCKSProxy),
+		spkiPins:   pins,
+		reEnroll:   req.ReEnroll,
+	})
+	if err != nil {
+		return publicDeviceEnrollAPIResult{}, err
+	}
+	defer client.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	var wireResp publicDeviceEnrollWireResponse
-	err = publicNoiseJSONRequest(
+	err = publicNoiseJSONRequestWithClient(
 		ctx,
+		client,
 		req.OrchestratorURL,
 		req.OrchNoisePublic,
 		req.NoisePrivateKey,
@@ -275,6 +319,8 @@ func publicDeviceEnroll(req publicDeviceEnrollAPIRequest) (publicDeviceEnrollAPI
 
 			ClientVersionCode:  req.ClientVersionCode,
 			ClientCapabilities: req.ClientCapabilities,
+			RealityFlowAck:     req.RealityFlowAck,
+			Pad:                publicEnrollPad(),
 		},
 		&wireResp,
 	)
@@ -282,7 +328,10 @@ func publicDeviceEnroll(req publicDeviceEnrollAPIRequest) (publicDeviceEnrollAPI
 		return publicDeviceEnrollAPIResult{}, err
 	}
 	if !wireResp.OK {
-		return publicDeviceEnrollAPIResult{}, fmt.Errorf("public device enrollment rejected: %s", sanitizeUntrustedText(wireResp.Error))
+		return publicDeviceEnrollAPIResult{}, &publicEnrollRejectedError{
+			code: sanitizePublicErrorCode(wireResp.Code),
+			msg:  "public device enrollment rejected: " + sanitizeUntrustedText(wireResp.Error),
+		}
 	}
 	return publicDeviceEnrollAPIResult{
 		OK:              true,
@@ -320,7 +369,37 @@ func publicEnrollAWGKeyPair(req publicDeviceEnrollAPIRequest, generate func() (s
 	return generatedPrivate, generatedPublic, nil
 }
 
+// publicEnrollRejectedError is an ok=false answer decrypted from the Noise
+// channel: an authenticated orchestrator decision with an optional code.
+type publicEnrollRejectedError struct {
+	code string
+	msg  string
+}
+
+func (e *publicEnrollRejectedError) Error() string { return e.msg }
+
+// sanitizePublicErrorCode keeps a code token ([a-z0-9_], at most 64 bytes);
+// anything else is dropped so the platform falls back to the error text.
+func sanitizePublicErrorCode(code string) string {
+	code = strings.ToLower(strings.TrimSpace(code))
+	if code == "" || len(code) > 64 {
+		return ""
+	}
+	for _, r := range code {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_') {
+			return ""
+		}
+	}
+	return code
+}
+
 func publicNoiseJSONRequest(ctx context.Context, baseURL, serverPublic, clientPrivate, clientPublic, path string, req any, resp any) error {
+	client := publicHTTPClient()
+	defer client.CloseIdleConnections()
+	return publicNoiseJSONRequestWithClient(ctx, client, baseURL, serverPublic, clientPrivate, clientPublic, path, req, resp)
+}
+
+func publicNoiseJSONRequestWithClient(ctx context.Context, client *http.Client, baseURL, serverPublic, clientPrivate, clientPublic, path string, req any, resp any) error {
 	serverPub, err := decodeKeyBase64(serverPublic)
 	if err != nil {
 		return fmt.Errorf("orchestrator static public key: %w", err)
@@ -344,11 +423,10 @@ func publicNoiseJSONRequest(ctx context.Context, baseURL, serverPublic, clientPr
 	if err != nil {
 		return err
 	}
-	client := publicHTTPClient()
-	defer client.CloseIdleConnections()
 	var start publicNoiseStartResponse
 	if err := postJSON(ctx, client, joinPublicURL(baseURL, "/d/v1/handshake/start"), publicNoiseStartRequest{
 		Message: base64.StdEncoding.EncodeToString(msg1),
+		Pad:     publicEnrollPad(),
 	}, &start); err != nil {
 		return err
 	}
@@ -380,6 +458,7 @@ func publicNoiseJSONRequest(ctx context.Context, baseURL, serverPublic, clientPr
 		SID:     start.SID,
 		Message: base64.StdEncoding.EncodeToString(msg3),
 		Payload: base64.StdEncoding.EncodeToString(payload),
+		Pad:     publicEnrollPad(),
 	}, &envelope); err != nil {
 		return err
 	}
@@ -398,17 +477,18 @@ func publicNoiseJSONRequest(ctx context.Context, baseURL, serverPublic, clientPr
 	return json.Unmarshal(decrypted, resp)
 }
 
-// publicHTTPClient deliberately has no http.Client.Timeout: the overall
-// deadline comes from the request context (timeout_seconds), so a caller
-// asking for more than publicEnrollTimeout is not silently cut short.
+// publicHTTPClient is the legacy carrier (direct, no certificate pin; Noise
+// pins the orchestrator static key). It deliberately has no
+// http.Client.Timeout: the overall deadline comes from the request context
+// (timeout_seconds), so a caller asking for more than publicEnrollTimeout is
+// not silently cut short.
 func publicHTTPClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, // Noise pins the orchestrator static key.
-			IdleConnTimeout:     publicEnrollIdleConnTimeout,
-			MaxIdleConnsPerHost: 1,
-		},
+	client, err := publicHTTPClientWith(publicEnrollTransportOptions{})
+	if err != nil {
+		// Unreachable: the zero options never fail.
+		return &http.Client{Transport: &http.Transport{TLSClientConfig: publicTLSConfig(publicEnrollTransportOptions{})}}
 	}
+	return client
 }
 
 func postJSON(ctx context.Context, client *http.Client, endpoint string, req any, resp any) error {
@@ -492,10 +572,11 @@ func applyPublicPlatformConfig(req publicApplyAPIRequest) (publicApplyAPIResult,
 		req.AWGRUSOCKSListen = defaultAWGRUSOCKSListen
 	}
 	var rejected []awgRouteRejection
-	// A route whose dialect fails the production policy is skipped (its
-	// stored config is kept) so REALITY and the other AWG slot still apply.
+	// A route whose dialect fails the production policy, or that targets an
+	// AWG profile without device credentials (X-M4), is skipped (its stored
+	// config is kept) so REALITY and the other AWG slot still apply.
 	skipDialect := func(route string, err error) bool {
-		if !errors.Is(err, errNonProductionDialect) {
+		if !errors.Is(err, errNonProductionDialect) && !errors.Is(err, errAWGProfileCredentialsMissing) {
 			return false
 		}
 		log.Printf("transport: public %s route skipped: %v", route, err)
@@ -556,13 +637,17 @@ func publicAWGConfigJSON(route *publicRouteSpec, req publicApplyAPIRequest, sock
 	internalIP, psk2 := req.InternalIP, req.PSK2
 	var profileCreds *publicAWGProfileCredentials
 	if !isBaseAWGProfile(profile) {
-		if creds, ok := req.AWGProfiles[profile]; ok {
-			if strings.TrimSpace(creds.InternalIP) == "" || strings.TrimSpace(creds.PSK2) == "" {
-				return "", provisionedConfigMeta{}, fmt.Errorf("awg_profiles[%q] credentials are incomplete", profile)
-			}
-			internalIP, psk2 = strings.TrimSpace(creds.InternalIP), strings.TrimSpace(creds.PSK2)
-			profileCreds = &creds
+		creds, ok := req.AWGProfiles[profile]
+		if !ok {
+			// The base internal_ip/psk2 belong to the base profile only: the
+			// worker has no peer for them on another profile (X-M4).
+			return "", provisionedConfigMeta{}, fmt.Errorf("%w: %q", errAWGProfileCredentialsMissing, profile)
 		}
+		if strings.TrimSpace(creds.InternalIP) == "" || strings.TrimSpace(creds.PSK2) == "" {
+			return "", provisionedConfigMeta{}, fmt.Errorf("awg_profiles[%q] credentials are incomplete", profile)
+		}
+		internalIP, psk2 = strings.TrimSpace(creds.InternalIP), strings.TrimSpace(creds.PSK2)
+		profileCreds = &creds
 	}
 	endpoint, v6, err := route.endpointFor(profileCreds)
 	if err != nil {
@@ -601,6 +686,10 @@ func publicAWGConfigJSON(route *publicRouteSpec, req publicApplyAPIRequest, sock
 		slot:    discoverySlotIdentity{WorkerID: strings.TrimSpace(route.WorkerID), EgressIP: route.egressIP()},
 	}, nil
 }
+
+// errAWGProfileCredentialsMissing: a route names a non-base AWG profile the
+// device holds no awg_profiles credentials for.
+var errAWGProfileCredentialsMissing = errors.New("no device credentials for awg profile")
 
 // profileName returns the worker AWG profile this route targets; awg_profile
 // wins over the older profile key.

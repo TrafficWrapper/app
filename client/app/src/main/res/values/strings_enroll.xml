@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="public_enrollment_error_clock">Срок действия bootstrap или конфигурации истёк по часам устройства. Проверьте дату и время и повторите.</string>
+</resources>

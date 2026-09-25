@@ -3,6 +3,7 @@ package transport
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -269,7 +270,6 @@ func TestPublicAWGConfigJSONUsesProfileCredentials(t *testing.T) {
 		{"profile fallback", publicRouteSpec{Profile: "awg_v2"}, "10.14.0.7/32", testKey(5), "awg_v2"},
 		{"base profile uses top-level", publicRouteSpec{AWGProfile: "awg"}, "10.13.13.42/32", testKey(3), "awg"},
 		{"no profile", publicRouteSpec{}, "10.13.13.42/32", testKey(3), ""},
-		{"unknown profile falls back", publicRouteSpec{AWGProfile: "awg_v9"}, "10.13.13.42/32", testKey(3), "awg_v9"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			route := tc.route
@@ -287,6 +287,11 @@ func TestPublicAWGConfigJSONUsesProfileCredentials(t *testing.T) {
 				t.Fatalf("meta=%+v", meta)
 			}
 		})
+	}
+	// X-M4: a non-base profile without its own credentials is skipped, never
+	// configured with the base internal_ip/psk2 (the worker has no such peer).
+	if _, _, err := publicAWGConfigJSON(&publicRouteSpec{Endpoint: "203.0.113.10:51821", AWGProfile: "awg_v9"}, req, "127.0.0.1:18080"); !errors.Is(err, errAWGProfileCredentialsMissing) {
+		t.Fatalf("unknown profile err=%v, want errAWGProfileCredentialsMissing", err)
 	}
 	req.AWGProfiles["awg_v3"] = publicAWGProfileCredentials{InternalIP: "10.15.0.2/32"}
 	if _, _, err := publicAWGConfigJSON(&publicRouteSpec{Endpoint: "203.0.113.10:51821", AWGProfile: "awg_v3", AWGPreset: testBasePresetRaw()}, req, "127.0.0.1:18080"); err == nil {

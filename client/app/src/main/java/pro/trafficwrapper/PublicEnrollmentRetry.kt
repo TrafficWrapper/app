@@ -19,10 +19,56 @@ internal data class PublicEnrollmentFailurePolicy(
     val retryAllowed: Boolean,
 )
 
+/**
+ * An ok=false enroll answer. [authenticated] is true when the Go core decrypted it from the Noise
+ * channel (result "rejected": true); [code] is the orchestrator's structured code, blank for an
+ * older orchestrator.
+ */
+internal class PublicEnrollmentRejectedException(
+    val code: String,
+    val authenticated: Boolean,
+    message: String,
+) : IllegalStateException(message)
+
+/** Kind of a structured enroll rejection code; unknown codes are retryable (APP-L23). */
+internal fun publicEnrollmentKindForCode(code: String): PublicEnrollmentFailureKind =
+    when (code.trim().lowercase(Locale.ROOT)) {
+        "device_not_approved" -> PublicEnrollmentFailureKind.PENDING
+        "device_revoked" -> PublicEnrollmentFailureKind.BLOCKED
+        "token_invalid", "token_expired", "token_exhausted",
+        "identity_mismatch", "noise_mismatch", "awg_key_mismatch",
+        -> PublicEnrollmentFailureKind.TERMINAL
+        else -> PublicEnrollmentFailureKind.TRANSIENT
+    }
+
+/** The failure kind decided by the orchestrator itself (authenticated), or null. */
+internal fun authenticatedPublicEnrollmentKind(error: Throwable): PublicEnrollmentFailureKind? {
+    val rejected = generateSequence(error) { it.cause }
+        .filterIsInstance<PublicEnrollmentRejectedException>()
+        .firstOrNull { it.authenticated } ?: return null
+    return publicEnrollmentFailurePolicy(rejected).kind
+}
+
 internal fun publicEnrollmentFailurePolicy(error: Throwable): PublicEnrollmentFailurePolicy {
     val causes = generateSequence(error) { it.cause }.toList()
     val message = causes.joinToString(" ") { it.message.orEmpty() }.lowercase(Locale.ROOT)
+    if (causes.any { it is PublicClockSkewException }) {
+        // Expired by the device clock only: fixing the clock (or a new bootstrap) helps (APP-L27).
+        return PublicEnrollmentFailurePolicy(
+            kind = PublicEnrollmentFailureKind.TRANSIENT,
+            statusTextRes = R.string.enrollment_status_error,
+            errorTextRes = R.string.public_enrollment_error_clock,
+            retryAllowed = true,
+        )
+    }
+    val coded = causes.filterIsInstance<PublicEnrollmentRejectedException>()
+        .firstOrNull { it.authenticated && it.code.isNotBlank() }
     val kind = when {
+        // A structured code from inside the Noise channel wins; text is only the fallback for an
+        // orchestrator that predates "code".
+        coded != null -> publicEnrollmentKindForCode(coded.code)
+        // Text sent outside the Noise channel never decides pending/blocked/terminal (APP-L22).
+        PUBLIC_ENROLLMENT_UNAUTHENTICATED_MARKER in message -> PublicEnrollmentFailureKind.TRANSIENT
         PUBLIC_ENROLLMENT_PENDING_MARKERS.any(message::contains) -> PublicEnrollmentFailureKind.PENDING
         PUBLIC_ENROLLMENT_BLOCKED_MARKERS.any(message::contains) -> PublicEnrollmentFailureKind.BLOCKED
         PUBLIC_ENROLLMENT_TERMINAL_MARKERS.any(message::contains) -> PublicEnrollmentFailureKind.TERMINAL
@@ -78,6 +124,103 @@ internal fun retryPublicEnrollmentIfAllowed(
     enroll(bootstrapRaw)
     return true
 }
+
+/** Prefix of every error text the core received outside the Noise channel (untrustedServerPrefix). */
+private const val PUBLIC_ENROLLMENT_UNAUTHENTICATED_MARKER = "unauthenticated server response"
+
+/**
+ * Exponential backoff for enrollment attempts that start without an explicit user action
+ * (activity start, background re-enrollment). Times are SystemClock.elapsedRealtime().
+ */
+internal class PublicEnrollmentBackoff(
+    private val minDelayMs: Long = PUBLIC_ENROLL_BACKOFF_MIN_MS,
+    private val maxDelayMs: Long = PUBLIC_ENROLL_BACKOFF_MAX_MS,
+) {
+    private var failures = 0
+    private var notBeforeMs = 0L
+
+    @Synchronized
+    fun remainingMs(nowMs: Long): Long = if (failures == 0) 0L else (notBeforeMs - nowMs).coerceAtLeast(0L)
+
+    @Synchronized
+    fun onFailure(nowMs: Long) {
+        failures = (failures + 1).coerceAtMost(MAX_SHIFT)
+        val delay = (minDelayMs shl (failures - 1)).coerceIn(minDelayMs, maxDelayMs)
+        notBeforeMs = nowMs + delay
+    }
+
+    @Synchronized
+    fun onSuccess() {
+        failures = 0
+        notBeforeMs = 0L
+    }
+
+    private companion object {
+        const val MAX_SHIFT = 20
+    }
+}
+
+internal const val PUBLIC_ENROLL_BACKOFF_MIN_MS = 30_000L
+internal const val PUBLIC_ENROLL_BACKOFF_MAX_MS = 60 * 60_000L
+
+/**
+ * Rate limit for confirming an unauthenticated "device not approved" hint (worker poll or
+ * telemetry) with a Noise re-enrollment: at most one confirmation per [intervalMs].
+ */
+internal class PublicReauthConfirmThrottle(private val intervalMs: Long = PUBLIC_REAUTH_CONFIRM_INTERVAL_MS) {
+    private var lastAtMs = Long.MIN_VALUE
+
+    @Synchronized
+    fun tryAcquire(nowMs: Long): Boolean {
+        if (lastAtMs != Long.MIN_VALUE && nowMs - lastAtMs in 0 until intervalMs) return false
+        lastAtMs = nowMs
+        return true
+    }
+}
+
+internal const val PUBLIC_REAUTH_CONFIRM_INTERVAL_MS = 10 * 60_000L
+
+/** Why a background (silent) re-enrollment is wanted. */
+internal enum class PublicReEnrollReason {
+    /** The cached enrollment was made by another app version (capabilities changed). */
+    VERSION_REFRESH,
+
+    /** The orchestrator announced reality_flow_pending: acknowledge it (two-phase Vision). */
+    FLOW_ACK,
+
+    /** The client bundle names an AWG profile this device holds no credentials for (X-M4). */
+    AWG_PROFILE_CREDENTIALS,
+
+    /** A worker said "device not approved" outside the Noise channel: confirm it (APP-L8). */
+    REAUTH_CONFIRM,
+}
+
+internal sealed class PublicReEnrollPlan {
+    data class Wait(val delayMs: Long) : PublicReEnrollPlan()
+    data class Run(val viaTunnel: Boolean) : PublicReEnrollPlan()
+    object Idle : PublicReEnrollPlan()
+}
+
+/**
+ * Background re-enrollment runs through the tunnel (APP-M4) and waits for one when none carries
+ * traffic. The only exception is confirming a revocation hint - a revoked device has no tunnel -
+ * which may go direct, still under the backoff and the confirmation throttle.
+ */
+internal fun publicReEnrollPlan(
+    reasons: Set<PublicReEnrollReason>,
+    tunnelUp: Boolean,
+    backoffRemainingMs: Long,
+    checkIntervalMs: Long = PUBLIC_REENROLL_CHECK_INTERVAL_MS,
+): PublicReEnrollPlan =
+    when {
+        reasons.isEmpty() -> PublicReEnrollPlan.Idle
+        backoffRemainingMs > 0 -> PublicReEnrollPlan.Wait(backoffRemainingMs)
+        tunnelUp -> PublicReEnrollPlan.Run(viaTunnel = true)
+        PublicReEnrollReason.REAUTH_CONFIRM in reasons -> PublicReEnrollPlan.Run(viaTunnel = false)
+        else -> PublicReEnrollPlan.Wait(checkIntervalMs)
+    }
+
+internal const val PUBLIC_REENROLL_CHECK_INTERVAL_MS = 15_000L
 
 private val PUBLIC_ENROLLMENT_PENDING_MARKERS = listOf(
     "device is not approved",

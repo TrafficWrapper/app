@@ -112,6 +112,12 @@ object RouteVariants {
                 profileEntry(route, profile, credentials)?.let { alternatives += it }
             }
         }
+        // Two-phase Vision switch (X-L13): while a flow is pending, the orchestrator may already
+        // have switched the account when our acknowledgement's answer got lost. The primary route
+        // with the other known flow is the first alternative, so a failing handshake tries it.
+        pendingFlowAlternative(route, primaryConfig, credentials)?.let { config ->
+            entries += RealityEntry(primaryProfile, config, bareIpv6Address(route.params.optString("address_v6")))
+        }
         entries += alternatives.sortedBy { entry ->
             when {
                 entry.config.network.equals("xhttp", ignoreCase = true) -> 2
@@ -139,32 +145,103 @@ object RouteVariants {
         return orderForNetwork(unique, RealityRouteVariant::family, families)
     }
 
-    /** AWG slot variants: the route as is (v4) and, when the worker publishes endpoint_v6, v6. */
+    /**
+     * AWG slot variants: the route as is (v4) and, when the worker publishes endpoint_v6, v6;
+     * then the nested params.awg_profiles alternatives this device may use (X-M4): only with
+     * its own credentials for that profile and when this build reaches min_version_code.
+     */
     fun expandAwgVariants(
         resolved: PublicResolvedRoute,
         families: NetworkIpFamilies = NetworkIpFamilies.ALL,
+        credentials: PublicPlatformCredentials? = null,
     ): List<AwgRouteVariant> {
         val route = resolved.route
-        val profile = awgProfileName(route)
-        val v4 = AwgRouteVariant(
-            key = routeVariantKey(resolved.worker.workerId, profile, "awg", IpFamily.V4, ""),
-            family = IpFamily.V4,
-            route = route,
-        )
-        val endpointV6 = route.params.optString("endpoint_v6").trim()
-        val variants = if (endpointV6.isNotEmpty()) {
-            listOf(
-                v4,
-                AwgRouteVariant(
-                    key = routeVariantKey(resolved.worker.workerId, profile, "awg", IpFamily.V6, ""),
-                    family = IpFamily.V6,
-                    route = route,
-                ),
+        val workerId = resolved.worker.workerId
+        val routes = listOf(route) + nestedAwgAlternatives(route, credentials)
+        val variants = routes.flatMap { candidate ->
+            val profile = awgProfileName(candidate)
+            val v4 = AwgRouteVariant(
+                key = routeVariantKey(workerId, profile, "awg", IpFamily.V4, ""),
+                family = IpFamily.V4,
+                route = candidate,
             )
-        } else {
-            listOf(v4)
-        }
+            if (candidate.params.optString("endpoint_v6").isNotBlank()) {
+                listOf(
+                    v4,
+                    AwgRouteVariant(
+                        key = routeVariantKey(workerId, profile, "awg", IpFamily.V6, ""),
+                        family = IpFamily.V6,
+                        route = candidate,
+                    ),
+                )
+            } else {
+                listOf(v4)
+            }
+        }.distinctBy { it.key }
         return orderForNetwork(variants, AwgRouteVariant::family, families)
+    }
+
+    /** One params.awg_profiles[] entry of a route (orchestrator route_alternatives_v1 shape). */
+    data class NestedAwgProfile(
+        val profile: String,
+        val minVersionCode: Long,
+        val entry: JSONObject,
+    )
+
+    /** Well-formed, non-base params.awg_profiles[] entries of [route] (other than its own profile). */
+    fun nestedAwgProfiles(route: PublicRouteConfig): List<NestedAwgProfile> {
+        val profiles = route.params.optJSONArray("awg_profiles") ?: return emptyList()
+        val own = awgProfileName(route)
+        return (0 until profiles.length()).mapNotNull { index ->
+            val entry = profiles.optJSONObject(index) ?: return@mapNotNull null
+            val name = entry.optString("profile").ifBlank { entry.optString("name") }.trim()
+            if (isBaseAwgProfile(name) || name == own) return@mapNotNull null
+            val minVersion = entry.opt("min_version_code")
+                .let { (it as? Number)?.toLong() ?: (it as? String)?.trim()?.toLongOrNull() } ?: 0L
+            NestedAwgProfile(name, minVersion, entry)
+        }.distinctBy { it.profile }
+    }
+
+    private fun nestedAwgAlternatives(
+        route: PublicRouteConfig,
+        credentials: PublicPlatformCredentials?,
+    ): List<PublicRouteConfig> {
+        // Unknown credentials: no alternative (there is no fallback onto base credentials).
+        val known = credentials?.awgProfileNames ?: return emptyList()
+        return nestedAwgProfiles(route)
+            .filter { it.profile in known && credentials.clientVersionCode >= it.minVersionCode }
+            .mapNotNull { nestedAwgRoute(route, it) }
+    }
+
+    /** The primary route re-targeted at a nested profile: its port/endpoint/key/dialect/dns. */
+    private fun nestedAwgRoute(primary: PublicRouteConfig, nested: NestedAwgProfile): PublicRouteConfig? {
+        val entry = nested.entry
+        val port = entry.optInt("port", 0)
+        val endpoint = entry.optString("endpoint").trim()
+        val endpointPort = endpoint.substringAfterLast(":", "").toIntOrNull() ?: 0
+        val effectivePort = if (port > 0) port else endpointPort
+        if (effectivePort !in 1..65535) return null
+        val params = JSONObject(primary.params.toString())
+        listOf(
+            "awg_profiles", "profile", "awg_profile", "endpoint", "endpoint_v6", "public_key",
+            "server_public", "server_public_key", "dialect", "awg_preset", "dialect_id", "dns", "port",
+        ).forEach { params.remove(it) }
+        params.put("profile", nested.profile).put("awg_profile", nested.profile)
+        if (endpoint.isNotEmpty()) params.put("endpoint", endpoint)
+        entry.optString("endpoint_v6").trim().takeIf { it.isNotEmpty() }?.let { params.put("endpoint_v6", it) }
+        val serverKey = entry.optString("public_key").ifBlank { entry.optString("server_public_key") }.trim()
+        if (serverKey.isEmpty()) return null
+        params.put("public_key", serverKey)
+        listOf("dialect", "awg_preset").forEach { key ->
+            entry.opt(key)?.takeIf { it != JSONObject.NULL }?.let { params.put(key, it) }
+        }
+        entry.optString("dialect_id").trim().takeIf { it.isNotEmpty() }?.let { params.put("dialect_id", it) }
+        entry.optJSONArray("dns")?.let { params.put("dns", it) }
+        return primary.copy(
+            port = effectivePort,
+            dialectId = entry.optString("dialect_id").trim().ifBlank { primary.dialectId },
+            params = params,
+        )
     }
 
     /**
@@ -179,6 +256,22 @@ object RouteVariants {
             families.v6Only -> v6 + v4
             else -> v4 + v6
         }
+    }
+
+    private fun pendingFlowAlternative(
+        route: PublicRouteConfig,
+        primaryConfig: RealityUiConfig,
+        credentials: PublicPlatformCredentials,
+    ): RealityUiConfig? {
+        if (!credentials.realityFlowKnown || !credentials.realityFlowPendingKnown) return null
+        val flow = resolveRealityFlow(
+            network = primaryConfig.network,
+            deviceFlow = credentials.realityFlowPending,
+            deviceFlowKnown = true,
+            paramsFlow = route.params.optString("flow"),
+            routeVision = realityRouteVision(route.params),
+        )
+        return if (flow == primaryConfig.flow) null else primaryConfig.copy(flow = flow)
     }
 
     private data class RealityEntry(
