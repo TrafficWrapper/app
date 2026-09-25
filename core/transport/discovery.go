@@ -101,9 +101,13 @@ type applyDiscoveredResult struct {
 	// AWGMergeSkipped is set when the stored AWG config targets a non-base
 	// worker profile or an IPv6 endpoint: the bundle's base IPv4 endpoint
 	// would break it, so config_json is returned unchanged.
-	AWGMergeSkipped bool                       `json:"awg_merge_skipped,omitempty"`
-	EgressIP        string                     `json:"egress_ip,omitempty"`
-	Reality         *discoveredRealityEndpoint `json:"reality,omitempty"`
+	AWGMergeSkipped bool `json:"awg_merge_skipped,omitempty"`
+	// AWGRejected lists feed AWG entries skipped because of their dialect.
+	// When no entry is usable the stored config is returned unchanged with
+	// awg_merge_skipped set.
+	AWGRejected []awgRouteRejection        `json:"awg_rejected,omitempty"`
+	EgressIP    string                     `json:"egress_ip,omitempty"`
+	Reality     *discoveredRealityEndpoint `json:"reality,omitempty"`
 }
 
 func ApplyDiscoveredEndpoints(requestJSON string) string {
@@ -147,9 +151,15 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 	if err := validateDiscoveredBundle(bundle, max(storedMaxSeq, req.MaxSeenSeq), now); err != nil {
 		return applyDiscoveredResult{}, err
 	}
-	awg, err := selectAWGEndpoint(bundle.Endpoints.AWG)
+	awg, rejected, err := selectAWGEndpointSkipping(bundle.Endpoints.AWG)
+	noUsableAWG := false
 	if err != nil {
-		return applyDiscoveredResult{}, err
+		if len(rejected) == 0 || len(rejected) != len(bundle.Endpoints.AWG) {
+			return applyDiscoveredResult{}, err
+		}
+		// Every entry was rejected for its dialect: keep the stored AWG
+		// config and still apply the rest of the feed.
+		noUsableAWG = true
 	}
 	reality := selectRealityEndpoint(bundle.Endpoints.Reality)
 	var mergedJSON string
@@ -159,7 +169,11 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 		// provisioned config is neither read nor overwritten. Without stored
 		// metadata only the endpoint family can be checked.
 		meta := provisionedConfigMeta{v6: configEndpointIsIPv6(req.BaseConfigJSON)}
-		mergedJSON, mergeSkipped, err = mergeDiscoveredAWGConfigFor(req.BaseConfigJSON, meta, awg)
+		if noUsableAWG {
+			mergedJSON, mergeSkipped, err = keepBaseAWGConfig(req.BaseConfigJSON)
+		} else {
+			mergedJSON, mergeSkipped, err = mergeDiscoveredAWGConfigFor(req.BaseConfigJSON, meta, awg)
+		}
 		if err == nil {
 			err = recordDiscoveredSeq(pubkey, bundle.Seq)
 		}
@@ -174,7 +188,11 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 			pendingProvision.Unlock()
 			return applyDiscoveredResult{}, errors.New("provisioned config is missing")
 		}
-		mergedJSON, mergeSkipped, err = mergeDiscoveredAWGConfigFor(pendingProvision.configJSON, pendingProvision.configMeta, awg)
+		if noUsableAWG {
+			mergedJSON, mergeSkipped, err = keepBaseAWGConfig(pendingProvision.configJSON)
+		} else {
+			mergedJSON, mergeSkipped, err = mergeDiscoveredAWGConfigFor(pendingProvision.configJSON, pendingProvision.configMeta, awg)
+		}
 		if err == nil {
 			err = recordDiscoveredSeq(pubkey, bundle.Seq)
 		}
@@ -192,6 +210,7 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 		ConfigJSON: mergedJSON,
 
 		AWGMergeSkipped: mergeSkipped,
+		AWGRejected:     rejected,
 	}
 	if reality != nil {
 		result.Reality = reality
@@ -371,14 +390,46 @@ func mergeDiscoveredAWGConfig(baseJSON string, awg discoveredAWGEndpoint) (strin
 	return string(raw), nil
 }
 
+// keepBaseAWGConfig validates the stored config and returns it unchanged.
+func keepBaseAWGConfig(baseJSON string) (string, bool, error) {
+	if _, err := parseConfig(baseJSON); err != nil {
+		return "", false, fmt.Errorf("base config: %w", err)
+	}
+	return baseJSON, true, nil
+}
+
 func selectAWGEndpoint(endpoints []discoveredAWGEndpoint) (discoveredAWGEndpoint, error) {
+	selected, _, err := selectAWGEndpointSkipping(endpoints)
+	return selected, err
+}
+
+// selectAWGEndpointSkipping returns the highest-priority entry, skipping
+// entries whose dialect is not a production dialect (reported in rejected).
+// Other defects of the selected entry still fail as before.
+func selectAWGEndpointSkipping(endpoints []discoveredAWGEndpoint) (discoveredAWGEndpoint, []awgRouteRejection, error) {
 	if len(endpoints) == 0 {
-		return discoveredAWGEndpoint{}, errors.New("no awg endpoints in bundle")
+		return discoveredAWGEndpoint{}, nil, errors.New("no awg endpoints in bundle")
 	}
 	sort.SliceStable(endpoints, func(i, j int) bool {
 		return endpoints[i].Priority < endpoints[j].Priority
 	})
-	selected := endpoints[0]
+	var rejected []awgRouteRejection
+	var lastErr error
+	for i, candidate := range endpoints {
+		selected, err := validateAWGEndpoint(candidate)
+		if err == nil {
+			return selected, rejected, nil
+		}
+		if !errors.Is(err, errNonProductionDialect) {
+			return discoveredAWGEndpoint{}, rejected, err
+		}
+		rejected = append(rejected, awgRouteRejection{Route: fmt.Sprintf("awg[%d]", i), Reason: err.Error()})
+		lastErr = err
+	}
+	return discoveredAWGEndpoint{}, rejected, lastErr
+}
+
+func validateAWGEndpoint(selected discoveredAWGEndpoint) (discoveredAWGEndpoint, error) {
 	if strings.TrimSpace(selected.Endpoint) == "" ||
 		strings.TrimSpace(selected.ServerPublicKey) == "" {
 		return discoveredAWGEndpoint{}, errors.New("selected awg endpoint is incomplete")

@@ -213,8 +213,25 @@ func normalizeEndpoint(endpoint string) (string, error) {
 // client config or rendezvous feed), and workers only ever issue production
 // dialects, so the Compat (plain WireGuard) profile is refused here instead
 // of producing a tunnel that could never complete a handshake.
+//
+// Failures wrap errNonProductionDialect so server-config callers can skip
+// the one AWG route instead of failing the whole apply.
 func validatePreset(p preset, mtu int) error {
-	return awgdialect.ValidateProduction(p, mtu)
+	if err := awgdialect.ValidateProduction(p, mtu); err != nil {
+		return fmt.Errorf("%w: %v", errNonProductionDialect, err)
+	}
+	return nil
+}
+
+// errNonProductionDialect marks an AWG dialect that is missing, the Compat
+// profile or outside the production bounds.
+var errNonProductionDialect = errors.New("awg dialect is not a production dialect")
+
+// awgRouteRejection reports an AWG route that was skipped because of its
+// dialect; the rest of the config is still applied.
+type awgRouteRejection struct {
+	Route  string `json:"route"`
+	Reason string `json:"reason"`
 }
 
 func base64KeyToHex(value string) (string, error) {
