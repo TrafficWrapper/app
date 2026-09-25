@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="public_enrollment_error_clock">The bootstrap or configuration looks expired by the device clock. Check the date and time and try again.</string>
+</resources>

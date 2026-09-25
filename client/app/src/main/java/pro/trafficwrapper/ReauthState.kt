@@ -25,7 +25,19 @@ internal fun reauthRequiredAuthState(current: AuthUiState): AuthUiState =
         message = "",
     )
 
+/**
+ * A worker (config poll body, telemetry 403) said "device not approved". That text is not
+ * authenticated, so it only asks for a Noise re-enrollment; the UI switches to "approval
+ * required" once the orchestrator itself confirms it (see [applyConfirmedPublicReauth], APP-L8).
+ */
 internal fun markPublicDeviceReauthRequired(context: Context, reason: String) {
+    if (!DeploymentConfig.IS_PUBLIC_PLATFORM) return
+    Log.i(REAUTH_LOG_TAG, "unauthenticated device-not-approved hint from $reason; confirming with the orchestrator")
+    requestPublicBackgroundReEnroll(context, PublicReEnrollReason.REAUTH_CONFIRM)
+}
+
+/** The orchestrator confirmed over Noise that this device is not (or no longer) approved. */
+internal fun applyConfirmedPublicReauth(context: Context, reason: String) {
     if (!DeploymentConfig.IS_PUBLIC_PLATFORM) return
     val appContext = context.applicationContext
     TransportRuntime.auth = reauthRequiredAuthState(TransportRuntime.auth)

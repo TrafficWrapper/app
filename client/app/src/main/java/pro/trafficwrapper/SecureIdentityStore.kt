@@ -179,6 +179,12 @@ data class StoredPublicPlatformState(
     val realityFlowKnown: Boolean = false,
     /** BuildConfig.VERSION_CODE of the app that performed the last enrollment (0 = unknown). */
     val enrollVersionCode: Long = 0,
+    /**
+     * Enroll-response reality_flow_pending (two-phase Vision switch): acknowledged by the next
+     * enrollment, applied only once a response reports it as the active reality_flow.
+     */
+    val realityFlowPending: String = "",
+    val realityFlowPendingKnown: Boolean = false,
 )
 
 internal fun publicPlatformStateToJson(state: StoredPublicPlatformState): JSONObject =
@@ -205,6 +211,8 @@ internal fun publicPlatformStateToJson(state: StoredPublicPlatformState): JSONOb
         .put(PPS_REALITY_FLOW, state.realityFlow)
         .put(PPS_REALITY_FLOW_KNOWN, state.realityFlowKnown)
         .put(PPS_ENROLL_VERSION_CODE, state.enrollVersionCode)
+        .put(PPS_REALITY_FLOW_PENDING, state.realityFlowPending)
+        .put(PPS_REALITY_FLOW_PENDING_KNOWN, state.realityFlowPendingKnown)
 
 /** Reads a stored public platform state; fields missing in older JSON keep their defaults. */
 internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatformState {
@@ -239,6 +247,8 @@ internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatform
         realityFlow = root.optString(PPS_REALITY_FLOW),
         realityFlowKnown = root.optBoolean(PPS_REALITY_FLOW_KNOWN, false),
         enrollVersionCode = root.optLong(PPS_ENROLL_VERSION_CODE, 0),
+        realityFlowPending = root.optString(PPS_REALITY_FLOW_PENDING),
+        realityFlowPendingKnown = root.optBoolean(PPS_REALITY_FLOW_PENDING_KNOWN, false),
     )
 }
 
@@ -264,6 +274,8 @@ private const val PPS_AWG_PROFILES_JSON = "awg_profiles_json"
 private const val PPS_REALITY_FLOW = "reality_flow"
 private const val PPS_REALITY_FLOW_KNOWN = "reality_flow_known"
 private const val PPS_ENROLL_VERSION_CODE = "enroll_version_code"
+private const val PPS_REALITY_FLOW_PENDING = "reality_flow_pending"
+private const val PPS_REALITY_FLOW_PENDING_KNOWN = "reality_flow_pending_known"
 
 data class StoredPublicAWGKeyPair(
     val privateKey: String,
