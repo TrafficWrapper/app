@@ -101,15 +101,18 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
+/** Debug-only launch extra that fakes a clock skew for the clock diagnostics. */
+private const val EXTRA_FAKE_CLOCK_SKEW_SECONDS = "pro.trafficwrapper.extra.FAKE_CLOCK_SKEW_SECONDS"
+
 class MainActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val appListExecutor = Executors.newSingleThreadExecutor()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (BuildConfig.DEBUG && intent.hasExtra(TransportService.EXTRA_FAKE_CLOCK_SKEW_SECONDS)) {
+        if (BuildConfig.DEBUG && intent.hasExtra(EXTRA_FAKE_CLOCK_SKEW_SECONDS)) {
             TransportRuntime.debugClockSkewSeconds =
-                intent.getLongExtra(TransportService.EXTRA_FAKE_CLOCK_SKEW_SECONDS, 0L)
+                intent.getLongExtra(EXTRA_FAKE_CLOCK_SKEW_SECONDS, 0L)
         }
         requestNotificationPermission()
         if (DeploymentConfig.IS_PUBLIC_PLATFORM) {
@@ -167,6 +170,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         refreshAttentionState(applicationContext)
         requestForegroundResync(applicationContext)
+        VpnAutoRestore.maybeRestoreWithTransport(applicationContext, "activity_resume")
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -4045,30 +4049,6 @@ fun recoverStoredTransportKeys(context: Context) {
     startDeviceEnrollment(appContext)
 }
 
-private fun startTransport(context: Context) {
-    val intent = Intent(context, TransportService::class.java).setAction(TransportService.ACTION_START)
-    if (BuildConfig.DEBUG) {
-        TransportRuntime.debugClockSkewSeconds?.let {
-            intent.putExtra(TransportService.EXTRA_FAKE_CLOCK_SKEW_SECONDS, it)
-        }
-    }
-    if (Build.VERSION.SDK_INT >= 26) {
-        context.startForegroundService(intent)
-    } else {
-        context.startService(intent)
-    }
-}
-
-private fun startRealityTransport(context: Context) {
-    stopTransport(context)
-    val intent = Intent(context, RealityService::class.java).setAction(RealityService.ACTION_START)
-    if (Build.VERSION.SDK_INT >= 26) {
-        context.startForegroundService(intent)
-    } else {
-        context.startService(intent)
-    }
-}
-
 private fun startSelectedTransport(context: Context) {
     TRANSPORT_KEEP_ALIVE.set(true)
     TransportLifecycleStore.rememberActiveTransport(context.applicationContext, TransportRuntime.selectedTransport)
@@ -4080,18 +4060,6 @@ private fun startSelectedTransport(context: Context) {
     } else {
         context.startService(intent)
     }
-}
-
-private fun stopTransport(context: Context) {
-    context.startService(
-        Intent(context, TransportService::class.java).setAction(TransportService.ACTION_STOP),
-    )
-}
-
-private fun stopRealityTransport(context: Context) {
-    context.startService(
-        Intent(context, RealityService::class.java).setAction(RealityService.ACTION_STOP),
-    )
 }
 
 private fun stopAllTransports(context: Context, keepAlive: Boolean = false) {
@@ -4106,8 +4074,6 @@ private fun stopAllTransports(context: Context, keepAlive: Boolean = false) {
             .setAction(AutoTransportService.ACTION_STOP)
             .putExtra(AutoTransportService.EXTRA_KEEP_ALIVE_AFTER_STOP, keepAlive),
     )
-    stopTransport(context)
-    stopRealityTransport(context)
 }
 
 private fun sleepEnrollment(durationMs: Long) {

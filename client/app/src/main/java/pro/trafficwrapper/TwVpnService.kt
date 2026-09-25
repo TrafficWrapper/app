@@ -34,9 +34,11 @@ class TwVpnService : VpnService() {
     private var blackholeReconnectDelayMs = BLACKHOLE_RECONNECT_MIN_MS
     private val blackholeReconnectInFlight = AtomicBoolean(false)
     private val activeRebindInFlight = AtomicBoolean(false)
+    private val blackholeRecoveryGate = NetworkRecoveryGate<Network>()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (vpnStartKind(intent?.action)) {
+        val kind = vpnStartKindForIntent(hasIntent = intent != null, action = intent?.action)
+        when (kind) {
             VpnStartKind.APP_START -> {
                 if (TransportLifecycleStore.vpnEnabled(applicationContext)) {
                     startVpnForeground()
@@ -57,9 +59,37 @@ class TwVpnService : VpnService() {
                 notifyVpnConfigChanged()
                 vpnExecutor.execute { stopVpn() }
             }
+            VpnStartKind.STICKY_RESTART -> {
+                // The process died while the VPN was up (crash or system kill). Bring the tunnel
+                // back if the user still wants it; never re-enable a VPN the user switched off.
+                val appContext = applicationContext
+                if (shouldRestoreVpnOnStickyRestart(
+                        vpnFeatureEnabled = BuildConfig.VPN_ENABLED,
+                        vpnPreferenceEnabled = TransportLifecycleStore.vpnEnabled(appContext),
+                        transportKeepAlive = TransportLifecycleStore.shouldKeepAlive(appContext),
+                        vpnPermissionGranted = runCatching { VpnService.prepare(appContext) == null }.getOrDefault(false),
+                    )
+                ) {
+                    Log.i(LOG_TAG, "VPN sticky restart: restoring tunnel")
+                    Telemetry.event(appContext, "vpn_state", "action" to "sticky_restore")
+                    val promoted = runCatching { startVpnForeground() }
+                        .onFailure { Log.w(LOG_TAG, "VPN sticky restart foreground failed", it) }
+                        .isSuccess
+                    if (promoted) {
+                        vpnExecutor.execute { startFromSystem(startId) }
+                    } else {
+                        stopSelf(startId)
+                    }
+                } else {
+                    Log.i(LOG_TAG, "VPN sticky restart ignored: VPN not requested")
+                    stopSelf(startId)
+                }
+            }
             VpnStartKind.IGNORE -> Unit
         }
-        return START_NOT_STICKY
+        // Sticky, so that a process death while the VPN is up restarts the service (null intent)
+        // instead of silently leaving traffic outside the tunnel until the next reboot.
+        return if (kind == VpnStartKind.STOP) START_NOT_STICKY else START_STICKY
     }
 
     private fun startFromSystem(startId: Int) {
@@ -174,19 +204,23 @@ class TwVpnService : VpnService() {
 
     private fun establishAndStart() {
         if (bridgeStarted) {
+            // Make-before-break: the running bridge keeps its TUN until the replacement interface
+            // is established and handed to Go (StartVpnBridge replaces the old instance), so
+            // traffic never leaves the tunnel while the VPN is rebuilt.
             Log.i(LOG_TAG, "VPN config changed, rebuilding TUN")
-            stopVpnBridgeOnly(publishInactive = false)
+            unregisterActiveNetworkCallback()
+            activeRebindInFlight.set(false)
         }
         var detachedFd = -1
         var fdHandedToGo = false
         try {
             val underlying = bindToUnderlyingNetwork()
+            blackholeRecoveryGate.onAttempt(underlying)
             if (underlying == null && shouldFailClosedWithoutUnderlying()) {
                 establishBlackholeVpn("no_underlying")
                 notifyVpnConfigChanged()
                 return
             }
-            closeBlackholeVpn()
             val pfd = Builder()
                 .setSession("TrafficWrapper")
                 .addAddress(VPN_ADDRESS, 32)
@@ -209,6 +243,8 @@ class TwVpnService : VpnService() {
                 throw IllegalStateException(result.optString("error", "StartVpnBridge failed"))
             }
             bridgeStarted = true
+            // The new interface is live; only now drop the kill-switch blackhole (if any).
+            closeBlackholeVpn()
             currentUnderlyingNetwork = underlying
             registerActiveNetworkCallback()
             pushLastUdpRoute()
@@ -245,7 +281,6 @@ class TwVpnService : VpnService() {
 
     private fun establishBlackholeVpn(reason: String) {
         unregisterActiveNetworkCallback()
-        closeBlackholeVpn(resetRecovery = false)
         val pfd = Builder()
             .setSession("TrafficWrapper (blocked)")
             .addAddress(VPN_ADDRESS, 32)
@@ -254,8 +289,21 @@ class TwVpnService : VpnService() {
             .addDnsServer(VPN_DNS_SERVER)
             .setMtu(VPN_MTU)
             .establish() ?: throw IllegalStateException("VpnService blackhole establish returned null")
+        // Make-before-break: the blackhole interface is up before the previous bridge / blackhole
+        // is released, so there is no window without a VPN interface.
+        val previousBlackhole = blackholePfd
         blackholePfd = pfd
-        bridgeStarted = false
+        if (bridgeStarted) {
+            runCatching { Transport.stopVpnBridge() }
+                .onFailure { Log.w(LOG_TAG, "VPN bridge stop failed", it) }
+            bridgeStarted = false
+        }
+        previousBlackhole?.let { old ->
+            runCatching { old.close() }
+                .onFailure { Log.w(LOG_TAG, "VPN blackhole close failed", it) }
+        }
+        cancelBlackholeReconnect(resetDelay = false)
+        blackholeReconnectInFlight.set(false)
         publishVpnActive(true)
         Log.w(LOG_TAG, "VPN kill-switch fail-closed active reason=$reason")
         Telemetry.event(
@@ -279,19 +327,29 @@ class TwVpnService : VpnService() {
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
+        // Callbacks only trigger an out-of-schedule attempt for a network not tried yet; repeated
+        // callbacks for the same network (signal strength, link properties...) wait for the
+        // backoff schedule instead of rebuilding the interface each time.
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                requestBlackholeReconnect("underlying_available")
+                if (blackholeRecoveryGate.shouldReconnectNow(network)) {
+                    requestBlackholeReconnect("underlying_available")
+                }
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
                 if (
                     networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                     networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
-                    !networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                    !networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                    blackholeRecoveryGate.shouldReconnectNow(network)
                 ) {
                     requestBlackholeReconnect("underlying_capable")
                 }
+            }
+
+            override fun onLost(network: Network) {
+                blackholeRecoveryGate.onLost(network)
             }
         }
         runCatching {
@@ -303,6 +361,7 @@ class TwVpnService : VpnService() {
     }
 
     private fun unregisterBlackholeNetworkCallback() {
+        blackholeRecoveryGate.reset()
         val callback = blackholeNetworkCallback ?: return
         blackholeNetworkCallback = null
         runCatching {
@@ -443,9 +502,10 @@ class TwVpnService : VpnService() {
                 if (network == null) {
                     if (shouldFailClosedWithoutUnderlying()) {
                         Log.w(LOG_TAG, "VPN active underlying lost; entering blackhole reason=$reason")
-                        stopVpnBridgeOnly(publishInactive = false)
-                        establishBlackholeVpn("underlying_lost")
-                        notifyVpnConfigChanged()
+                        currentUnderlyingNetwork = null
+                        runCatching { establishBlackholeVpn("underlying_lost") }
+                            .onSuccess { notifyVpnConfigChanged() }
+                            .onFailure { Log.w(LOG_TAG, "VPN kill-switch blackhole failed", it) }
                     }
                     return@execute
                 }
@@ -664,6 +724,9 @@ internal enum class VpnStartKind {
     APP_START,
     SYSTEM_START,
     STOP,
+
+    /** START_STICKY restart after the process died: the system redelivers a null intent. */
+    STICKY_RESTART,
     IGNORE,
 }
 
@@ -677,3 +740,48 @@ internal fun vpnStartKind(action: String?): VpnStartKind =
         null, VPN_SERVICE_INTERFACE_ACTION -> VpnStartKind.SYSTEM_START
         else -> VpnStartKind.IGNORE
     }
+
+/**
+ * Like [vpnStartKind], but distinguishes a sticky restart (no intent at all) from an always-on
+ * system start (an intent with action android.net.VpnService or no action).
+ */
+internal fun vpnStartKindForIntent(hasIntent: Boolean, action: String?): VpnStartKind =
+    if (!hasIntent) VpnStartKind.STICKY_RESTART else vpnStartKind(action)
+
+/** A sticky restart restores the tunnel only when the user still has VPN mode (and the transport) on. */
+internal fun shouldRestoreVpnOnStickyRestart(
+    vpnFeatureEnabled: Boolean,
+    vpnPreferenceEnabled: Boolean,
+    transportKeepAlive: Boolean,
+    vpnPermissionGranted: Boolean,
+): Boolean = vpnFeatureEnabled && vpnPreferenceEnabled && transportKeepAlive && vpnPermissionGranted
+
+/**
+ * Rate-limits network-callback driven reconnects of the kill-switch blackhole: a callback triggers
+ * an immediate attempt only for a network that has not been tried (or seen) since it last
+ * appeared. Everything else is left to the exponential backoff schedule.
+ */
+internal class NetworkRecoveryGate<T : Any> {
+    private val seen = HashSet<T>()
+
+    /** Records the network an attempt is being made on (null: no usable network). */
+    @Synchronized
+    fun onAttempt(network: T?) {
+        if (network != null) seen.add(network)
+    }
+
+    /** True when [network] was not seen before; it is then remembered. */
+    @Synchronized
+    fun shouldReconnectNow(network: T): Boolean = seen.add(network)
+
+    /** A lost network counts as new again when it comes back. */
+    @Synchronized
+    fun onLost(network: T) {
+        seen.remove(network)
+    }
+
+    @Synchronized
+    fun reset() {
+        seen.clear()
+    }
+}
