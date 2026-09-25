@@ -57,6 +57,11 @@ data class StoredPublicPlatformState(
     val updatePubkeyPin: String = "",
     val maxSeenConfigSeq: Long = 0,
     val maxSeenUpdateSeq: Long = 0,
+    /**
+     * update_pubkey pin that [maxSeenUpdateSeq] was recorded under; the counter does not apply to
+     * any other key. Legacy state without the field is read as owned by [updatePubkeyPin]; blank = unknown owner.
+     */
+    val maxSeenUpdateSeqPin: String = "",
     val trustedWallTimeMs: Long = 0,
     val trustedElapsedRealtimeMs: Long = 0,
     val clientConfigJson: String = "",
@@ -86,6 +91,7 @@ internal fun publicPlatformStateToJson(state: StoredPublicPlatformState): JSONOb
         .put(PPS_UPDATE_PUBKEY_PIN, state.updatePubkeyPin)
         .put(PPS_MAX_SEEN_CONFIG_SEQ, state.maxSeenConfigSeq)
         .put(PPS_MAX_SEEN_UPDATE_SEQ, state.maxSeenUpdateSeq)
+        .put(PPS_MAX_SEEN_UPDATE_SEQ_PIN, state.maxSeenUpdateSeqPin)
         .put(PPS_TRUSTED_WALL_TIME_MS, state.trustedWallTimeMs)
         .put(PPS_TRUSTED_ELAPSED_REALTIME_MS, state.trustedElapsedRealtimeMs)
         .put(PPS_CLIENT_CONFIG_JSON, state.clientConfigJson)
@@ -104,13 +110,22 @@ internal fun publicPlatformStateToJson(state: StoredPublicPlatformState): JSONOb
         .put(PPS_ENROLL_VERSION_CODE, state.enrollVersionCode)
 
 /** Reads a stored public platform state; fields missing in older JSON keep their defaults. */
-internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatformState =
-    StoredPublicPlatformState(
+internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatformState {
+    val updatePubkeyPin = root.optString(PPS_UPDATE_PUBKEY_PIN)
+    return StoredPublicPlatformState(
         bootstrapRaw = root.optString(PPS_BOOTSTRAP_RAW),
         configPubkeyPin = root.optString(PPS_CONFIG_PUBKEY_PIN),
-        updatePubkeyPin = root.optString(PPS_UPDATE_PUBKEY_PIN),
+        updatePubkeyPin = updatePubkeyPin,
         maxSeenConfigSeq = root.optLong(PPS_MAX_SEEN_CONFIG_SEQ, 0),
         maxSeenUpdateSeq = root.optLong(PPS_MAX_SEEN_UPDATE_SEQ, 0),
+        // Legacy state has no owner: the counter was recorded under the key pinned at that time.
+        // Fixing the owner on read makes a later in-memory change of updatePubkeyPin (e.g. a signed
+        // key rotation in the config poll) reset the rollback floor for the new key.
+        maxSeenUpdateSeqPin = if (root.has(PPS_MAX_SEEN_UPDATE_SEQ_PIN)) {
+            root.optString(PPS_MAX_SEEN_UPDATE_SEQ_PIN)
+        } else {
+            updatePubkeyPin
+        },
         trustedWallTimeMs = root.optLong(PPS_TRUSTED_WALL_TIME_MS, 0),
         trustedElapsedRealtimeMs = root.optLong(PPS_TRUSTED_ELAPSED_REALTIME_MS, 0),
         clientConfigJson = root.optString(PPS_CLIENT_CONFIG_JSON),
@@ -128,12 +143,14 @@ internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatform
         realityFlowKnown = root.optBoolean(PPS_REALITY_FLOW_KNOWN, false),
         enrollVersionCode = root.optLong(PPS_ENROLL_VERSION_CODE, 0),
     )
+}
 
 private const val PPS_BOOTSTRAP_RAW = "bootstrap_raw"
 private const val PPS_CONFIG_PUBKEY_PIN = "config_pubkey_pin"
 private const val PPS_UPDATE_PUBKEY_PIN = "update_pubkey_pin"
 private const val PPS_MAX_SEEN_CONFIG_SEQ = "max_seen_config_seq"
 private const val PPS_MAX_SEEN_UPDATE_SEQ = "max_seen_update_seq"
+private const val PPS_MAX_SEEN_UPDATE_SEQ_PIN = "max_seen_update_seq_pin"
 private const val PPS_TRUSTED_WALL_TIME_MS = "trusted_wall_time_ms"
 private const val PPS_TRUSTED_ELAPSED_REALTIME_MS = "trusted_elapsed_realtime_ms"
 private const val PPS_CLIENT_CONFIG_JSON = "client_config_json"

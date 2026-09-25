@@ -3076,19 +3076,22 @@ private fun startPublicDeviceEnrollment(
             val config = PublicPlatformConfigParser.verifyAndParseClientConfig(
                 envelopeRaw = clientBundle.toString(),
                 expectedPublicKey = parsed.configPubkeyPin,
-                maxSeenSeq = previous.maxSeenConfigSeq,
+                // Rollback floor only for the same platform (config key); a confirmed switch starts at 0.
+                maxSeenSeq = previous.configSeqFloorFor(parsed.configPubkeyPin),
+            )
+            // Recomputed atomically against the freshest state in mergeEnrolledPublicPlatformState.
+            val updatePubkeyPin = resolveUpdatePubkeyPin(
+                signedConfigUpdatePubkey = config.updatePubkey,
+                previous = previous,
+                bootstrap = parsed,
             )
             val stored = StoredPublicPlatformState(
                 bootstrapRaw = bootstrapRaw.trim(),
                 configPubkeyPin = parsed.configPubkeyPin,
-                // Recomputed atomically against the freshest state in mergeEnrolledPublicPlatformState.
-                updatePubkeyPin = resolveUpdatePubkeyPin(
-                    signedConfigUpdatePubkey = config.updatePubkey,
-                    previous = previous,
-                    bootstrap = parsed,
-                ),
-                maxSeenConfigSeq = maxOf(previous.maxSeenConfigSeq, config.seq),
-                maxSeenUpdateSeq = previous.maxSeenUpdateSeq,
+                updatePubkeyPin = updatePubkeyPin,
+                maxSeenConfigSeq = maxOf(previous.configSeqFloorFor(parsed.configPubkeyPin), config.seq),
+                maxSeenUpdateSeq = previous.updateSeqFloorFor(updatePubkeyPin),
+                maxSeenUpdateSeqPin = updatePubkeyPin,
                 clientConfigJson = clientBundle.getString(JSON_PUBLIC_CONFIG_JSON),
                 clientBundleJson = clientBundle.toString(),
                 deviceID = response.optString(JSON_DEVICE_ID).ifBlank { androidID },
