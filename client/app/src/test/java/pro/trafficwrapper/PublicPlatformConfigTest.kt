@@ -230,6 +230,164 @@ class PublicPlatformConfigTest {
     }
 
     @Test
+    fun mergeEnrolledStateAfterConfirmedPlatformSwitchStartsCountersFromZero() {
+        // APP-M3: platform A reached seq 240; platform B (different config key) is at seq 3.
+        val bootstrap = PublicPlatformConfigParser.parseBootstrap(bootstrapJson("2035-01-01T00:00:00Z"), nowMs = 0)
+        val platformA = StoredPublicPlatformState(
+            configPubkeyPin = "RWQplatformA",
+            updatePubkeyPin = "RWQupdateA",
+            maxSeenConfigSeq = 240,
+            maxSeenUpdateSeq = 50,
+            maxSeenUpdateSeqPin = "RWQupdateA",
+            deviceID = "old",
+        )
+        // What the enrollment path computes against the previous state.
+        assertEquals(0L, platformA.configSeqFloorFor(PUBLIC_KEY))
+        val config = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = envelope(clientConfig(seq = 3), signature = "sig"),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = platformA.configSeqFloorFor(PUBLIC_KEY),
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        val updatePin = resolveUpdatePubkeyPin("RWQupdateB", platformA, bootstrap)
+        val enrolled = StoredPublicPlatformState(
+            configPubkeyPin = PUBLIC_KEY,
+            updatePubkeyPin = updatePin,
+            maxSeenConfigSeq = maxOf(platformA.configSeqFloorFor(PUBLIC_KEY), config.seq),
+            maxSeenUpdateSeq = platformA.updateSeqFloorFor(updatePin),
+            maxSeenUpdateSeqPin = updatePin,
+            deviceID = "new",
+        )
+
+        val merged = mergeEnrolledPublicPlatformState(platformA, enrolled, config.seq, "RWQupdateB", bootstrap)
+        assertEquals("new", merged.deviceID)
+        assertEquals(PUBLIC_KEY, merged.configPubkeyPin)
+        assertEquals("RWQupdateB", merged.updatePubkeyPin)
+        assertEquals(3L, merged.maxSeenConfigSeq)
+        assertEquals(0L, merged.maxSeenUpdateSeq)
+        assertEquals("RWQupdateB", merged.maxSeenUpdateSeqPin)
+
+        // Same platform: the floor still applies and a lower seq is a rollback.
+        val sameAsB = merged.copy(maxSeenConfigSeq = 9)
+        assertThrows(PublicConfigVerificationException::class.java) {
+            mergeEnrolledPublicPlatformState(sameAsB, enrolled, 3, "RWQupdateB", bootstrap)
+        }
+        assertThrows(PublicConfigVerificationException::class.java) {
+            PublicPlatformConfigParser.verifyAndParseClientConfig(
+                envelopeRaw = envelope(clientConfig(seq = 3), signature = "sig"),
+                expectedPublicKey = PUBLIC_KEY,
+                maxSeenSeq = sameAsB.configSeqFloorFor(PUBLIC_KEY),
+                verifier = fakeVerifier(ok = true),
+                nowMs = 0,
+            )
+        }
+    }
+
+    @Test
+    fun updateSeqFloorIsBoundToUpdatePubkeyPin() {
+        val state = StoredPublicPlatformState(
+            configPubkeyPin = PUBLIC_KEY,
+            updatePubkeyPin = "RWQupdateA",
+            maxSeenUpdateSeq = 50,
+            maxSeenUpdateSeqPin = "RWQupdateA",
+        )
+        assertEquals(50L, state.updateSeqFloorFor("RWQupdateA"))
+        assertEquals(0L, state.updateSeqFloorFor("RWQupdateB"))
+        // Unknown owner (blank) keeps the floor: never weaker than before.
+        assertEquals(50L, state.copy(maxSeenUpdateSeqPin = "").updateSeqFloorFor("RWQupdateB"))
+        // A signed key rotation on the same platform (config poll only changes updatePubkeyPin)
+        // leaves the owner behind, so the new key starts from 0.
+        val rotated = state.copy(updatePubkeyPin = "RWQupdateB")
+        assertEquals(0L, rotated.updateSeqFloorFor(rotated.updatePubkeyPin))
+        // Config floor: blank stored pin keeps the floor, other platform resets it.
+        val cfg = StoredPublicPlatformState(configPubkeyPin = "RWQa", maxSeenConfigSeq = 7)
+        assertEquals(7L, cfg.configSeqFloorFor("RWQa"))
+        assertEquals(0L, cfg.configSeqFloorFor("RWQb"))
+        assertEquals(7L, cfg.copy(configPubkeyPin = "").configSeqFloorFor("RWQb"))
+    }
+
+    @Test
+    fun mergeEnrolledStateResetsUpdateFloorWhenSignedUpdateKeyRotates() {
+        val bootstrap = PublicPlatformConfigParser.parseBootstrap(bootstrapJson("2035-01-01T00:00:00Z"), nowMs = 0)
+        val current = StoredPublicPlatformState(
+            configPubkeyPin = PUBLIC_KEY,
+            updatePubkeyPin = "RWQupdateA",
+            maxSeenConfigSeq = 5,
+            maxSeenUpdateSeq = 50,
+            maxSeenUpdateSeqPin = "RWQupdateA",
+        )
+        val enrolled = StoredPublicPlatformState(
+            configPubkeyPin = PUBLIC_KEY,
+            updatePubkeyPin = "RWQupdateA",
+            maxSeenConfigSeq = 6,
+            maxSeenUpdateSeq = 50,
+            maxSeenUpdateSeqPin = "RWQupdateA",
+        )
+        val kept = mergeEnrolledPublicPlatformState(current, enrolled, 6, "RWQupdateA", bootstrap)
+        assertEquals(50L, kept.maxSeenUpdateSeq)
+        val rotated = mergeEnrolledPublicPlatformState(current, enrolled, 6, "RWQupdateB", bootstrap)
+        assertEquals("RWQupdateB", rotated.updatePubkeyPin)
+        assertEquals(0L, rotated.maxSeenUpdateSeq)
+        assertEquals("RWQupdateB", rotated.maxSeenUpdateSeqPin)
+        assertEquals(6L, rotated.maxSeenConfigSeq)
+    }
+
+    @Test
+    fun clientConfigSeqContractAcceptsLargeJumpsAndEqualSeq() {
+        // client-config-v1 seq contract: only seq < maxSeen is a rollback. A migration jump
+        // (+1_000_000 or an operator floor) is accepted; an equal seq is accepted by verification
+        // so the poll can ignore it (seq <= maxSeen) without raising an error.
+        fun verify(seq: Long, maxSeen: Long) =
+            PublicPlatformConfigParser.verifyAndParseClientConfig(
+                envelopeRaw = envelope(clientConfig(seq), signature = "sig"),
+                expectedPublicKey = PUBLIC_KEY,
+                maxSeenSeq = maxSeen,
+                verifier = fakeVerifier(ok = true),
+                nowMs = 0,
+            )
+        val jumped = 240L + 1_000_000L
+        assertEquals(jumped, verify(jumped, maxSeen = 240).seq)
+        assertEquals(jumped, verify(jumped, maxSeen = jumped).seq)
+        assertEquals(jumped + 1, verify(jumped + 1, maxSeen = jumped).seq)
+        val huge = 4_000_000_000_000_000_000L
+        assertEquals(huge, verify(huge, maxSeen = jumped).seq)
+        assertThrows(PublicConfigVerificationException::class.java) { verify(jumped - 1, maxSeen = jumped) }
+        assertThrows(PublicConfigVerificationException::class.java) { verify(240, maxSeen = jumped) }
+    }
+
+    @Test
+    fun clientConfigContractAcceptsEmptyWorkersArray() {
+        // ORC-L35 contract: the orchestrator sends workers: [] instead of null.
+        val config = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = envelope(
+                """{"schema":1,"ns":"client-config-v1","seq":1000005,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[]}""",
+                signature = "sig",
+            ),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 5,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        assertTrue(config.workers.isEmpty())
+        assertTrue(PublicPlatformConfigParser.deterministicRouteOrder(config, "device-a").isEmpty())
+    }
+
+    @Test
+    fun workerOrderDoesNotChangeWhenOnlySeqChanges() {
+        // APP-L26: a re-issued bundle (new seq, same workers) must not reshuffle clients.
+        val base = parseConfig(clientConfigWithWorkers())
+        val reissued = base.copy(seq = base.seq + 1_000_000)
+        repeat(200) { index ->
+            val deviceId = "device-$index"
+            assertEquals(
+                PublicPlatformConfigParser.deterministicRouteOrder(base, deviceId),
+                PublicPlatformConfigParser.deterministicRouteOrder(reissued, deviceId),
+            )
+        }
+    }
+
+    @Test
     fun discoveryValidationTimeNeverRewindsBelowLocalClock() {
         assertEquals(5_000L, discoveryValidationNowMs(mirrorDateMs = 1_000L, localNowMs = 5_000L))
         assertEquals(9_000L, discoveryValidationNowMs(mirrorDateMs = 9_000L, localNowMs = 5_000L))
@@ -317,8 +475,8 @@ class PublicPlatformConfigTest {
             nowMs = 0,
         ).workers
 
-        val first = PublicPlatformConfigParser.deterministicWorkerOrder(workers, "device-a", 11)
-        val second = PublicPlatformConfigParser.deterministicWorkerOrder(workers, "device-a", 11)
+        val first = PublicPlatformConfigParser.deterministicWorkerOrder(workers, "device-a")
+        val second = PublicPlatformConfigParser.deterministicWorkerOrder(workers, "device-a")
         assertEquals(first, second)
         assertTrue(first.all { it.priority == 0 })
     }
@@ -336,7 +494,7 @@ class PublicPlatformConfigTest {
         var highWeightFirst = 0
         repeat(5_000) { index ->
             val first = PublicPlatformConfigParser
-                .deterministicWorkerOrder(workers, "device-$index", 17)
+                .deterministicWorkerOrder(workers, "device-$index")
                 .first()
             if (first.workerId == "heavy") highWeightFirst++
         }

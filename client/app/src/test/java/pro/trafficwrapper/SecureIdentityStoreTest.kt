@@ -192,4 +192,19 @@ class SecureIdentityStoreTest {
         val written = publicPlatformStateToJson(state)
         legacy.keys().forEach { key -> assertTrue(key, written.has(key)) }
     }
+
+    @Test
+    fun legacyUpdateSeqIsOwnedByUpdatePinPinnedAtThatTime() {
+        val legacy = org.json.JSONObject(
+            """{"config_pubkey_pin":"pin","update_pubkey_pin":"upd","max_seen_update_seq":9}""",
+        )
+        val state = publicPlatformStateFromJson(legacy)
+        assertEquals("upd", state.maxSeenUpdateSeqPin)
+        assertEquals(9L, state.updateSeqFloorFor("upd"))
+        // A later signed rotation of the update key does not carry the old floor over.
+        assertEquals(0L, state.copy(updatePubkeyPin = "upd2").updateSeqFloorFor("upd2"))
+        // The owner survives a round trip.
+        val owned = state.copy(maxSeenUpdateSeqPin = "other")
+        assertEquals("other", publicPlatformStateFromJson(publicPlatformStateToJson(owned)).maxSeenUpdateSeqPin)
+    }
 }

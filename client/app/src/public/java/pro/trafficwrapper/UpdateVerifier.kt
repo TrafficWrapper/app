@@ -65,8 +65,10 @@ class UpdateVerifier(private val context: Context) {
             Log.w(TAG, "public update rejected: downgrade vc=${manifest.versionCode} current=${BuildConfig.VERSION_CODE}")
             throw UpdateVerificationException(R.string.update_error_downgrade)
         }
-        if (stored.maxSeenUpdateSeq > 0 && manifest.seq < stored.maxSeenUpdateSeq) {
-            Log.w(TAG, "public update rejected: rollback seq=${manifest.seq} maxSeen=${stored.maxSeenUpdateSeq}")
+        // The rollback floor applies only to the update key it was recorded under.
+        val storedFloor = stored.updateSeqFloorFor(updatePubkey)
+        if (storedFloor > 0 && manifest.seq < storedFloor) {
+            Log.w(TAG, "public update rejected: rollback seq=${manifest.seq} maxSeen=$storedFloor")
             throw UpdateVerificationException(R.string.update_error_downgrade)
         }
         // Atomic read-modify-write: re-check the pin and the rollback floor against the freshest
@@ -76,12 +78,14 @@ class UpdateVerifier(private val context: Context) {
                 Log.w(TAG, "public update rejected: update_pubkey pin changed during verification")
                 throw UpdateVerificationException(R.string.update_error_signer)
             }
-            if (current.maxSeenUpdateSeq > 0 && manifest.seq < current.maxSeenUpdateSeq) {
-                Log.w(TAG, "public update rejected: rollback seq=${manifest.seq} maxSeen=${current.maxSeenUpdateSeq}")
+            val currentFloor = current.updateSeqFloorFor(updatePubkey)
+            if (currentFloor > 0 && manifest.seq < currentFloor) {
+                Log.w(TAG, "public update rejected: rollback seq=${manifest.seq} maxSeen=$currentFloor")
                 throw UpdateVerificationException(R.string.update_error_downgrade)
             }
             current.copy(
-                maxSeenUpdateSeq = max(current.maxSeenUpdateSeq, manifest.seq),
+                maxSeenUpdateSeq = max(currentFloor, manifest.seq),
+                maxSeenUpdateSeqPin = updatePubkey,
                 trustedWallTimeMs = maxOf(current.trustedWallTimeMs, trustedTime.wallTimeMs, manifestTimestampMs),
                 trustedElapsedRealtimeMs = trustedTime.elapsedRealtimeMs,
             )
