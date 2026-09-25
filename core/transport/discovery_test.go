@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -608,5 +609,122 @@ func testPublicApplyRequest() publicApplyAPIRequest {
 		PSK2:            testKey(3),
 		ServerAWGPublic: testKey(2),
 		AWG:             &publicRouteSpec{Endpoint: "203.0.113.10:51821"},
+	}
+}
+
+func discoveryTrustMaxSeenSeq() int64 {
+	discoveryTrust.Lock()
+	defer discoveryTrust.Unlock()
+	return discoveryTrust.maxSeenSeq
+}
+
+func TestApplyDiscoveredEndpointsReportsNestedForbiddenPath(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	awg := bundle["endpoints"].(map[string]any)["awg"].([]any)[0].(map[string]any)
+	awg["psk2"] = testKey(8)
+	req := signer.request(t, bundle, testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
+
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))
+	if result.OK || result.Error != "forbidden discovery field: endpoints.awg[0].psk2" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestForbiddenDiscoveryPathDoesNotAllocateOnCleanDocument(t *testing.T) {
+	// A wide, deep, key-heavy document without forbidden keys: the walker must
+	// not build a path per visited key.
+	leaf := map[string]any{}
+	for i := 0; i < 64; i++ {
+		leaf["k"+strconv.Itoa(i)] = strings.Repeat("v", 8)
+	}
+	var doc any = leaf
+	for depth := 0; depth < 12; depth++ {
+		doc = map[string]any{"level_" + strconv.Itoa(depth): []any{doc, doc}}
+	}
+	allocs := testing.AllocsPerRun(3, func() {
+		if path := forbiddenDiscoveryPath(doc); path != nil {
+			t.Fatalf("unexpected forbidden path %v", path)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("walker allocated %.0f times on a clean document", allocs)
+	}
+}
+
+func TestFormatDiscoveryPath(t *testing.T) {
+	cases := map[string][]string{
+		"psk2":                  {"psk2"},
+		"[3].private_key":       {"private_key", "[3]"},
+		"endpoints.awg[0].psk2": {"psk2", "[0]", "awg", "endpoints"},
+		"a[1][2].internal_ip":   {"internal_ip", "[2]", "[1]", "a"},
+	}
+	for want, leafFirst := range cases {
+		if got := formatDiscoveryPath(leafFirst); got != want {
+			t.Fatalf("formatDiscoveryPath(%v) = %q, want %q", leafFirst, got, want)
+		}
+	}
+}
+
+func TestApplyDiscoveredEndpointsRejectsOversizedSignedBundle(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	bundle["padding"] = strings.Repeat("x", maxDiscoveryBundleBytes)
+	req := signer.request(t, bundle, testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
+
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))
+	if result.OK || !strings.Contains(result.Error, "endpoints_json too large") {
+		t.Fatalf("oversized bundle accepted or wrong error: %+v", result)
+	}
+	if got := discoveryTrustMaxSeenSeq(); got != 0 {
+		t.Fatalf("rejected bundle advanced seq to %d", got)
+	}
+}
+
+func TestApplyDiscoveredEndpointsRejectsOversizedRequest(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	message := mustJSON(t, testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z"))
+	req := requestJSON(t, signer.publicKey, message, signer.sign(message), strings.Repeat(" ", maxDiscoveryRequestBytes), 9, "2026-06-13T12:00:00Z")
+
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))
+	if result.OK || !strings.Contains(result.Error, "discovery request too large") {
+		t.Fatalf("oversized request accepted or wrong error: %+v", result)
+	}
+}
+
+func TestApplyDiscoveredEndpointsRejectsOversizedBaseConfig(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	req := signer.request(t, bundle, testBaseConfig(t)+strings.Repeat(" ", maxDiscoveryBaseConfigBytes), 9, "2026-06-13T12:00:00Z")
+
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))
+	if result.OK || !strings.Contains(result.Error, "base_config_json too large") {
+		t.Fatalf("oversized base config accepted or wrong error: %+v", result)
+	}
+}
+
+// Reduced-mode feed (orchestrator default): no REALITY entries, AWG entries
+// carry an extra worker_id, plus signed next_sinks. It must apply like a full
+// feed minus the REALITY result; unknown fields are ignored.
+func TestApplyDiscoveredEndpointsAcceptsReducedFeed(t *testing.T) {
+	signer := newTestSigner(t)
+	pinTestSigner(t, signer)
+	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
+	endpoints := bundle["endpoints"].(map[string]any)
+	endpoints["reality"] = []any{}
+	endpoints["awg"].([]any)[0].(map[string]any)["worker_id"] = "w-1"
+	bundle["next_sinks"] = []any{"https://operator.example/discovery"}
+	req := signer.request(t, bundle, testBaseConfig(t), 9, "2026-06-13T12:00:00Z")
+
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))
+	if !result.OK || result.Seq != 10 || result.ConfigJSON == "" {
+		t.Fatalf("reduced feed rejected: %+v", result)
+	}
+	if result.Reality != nil || result.EgressIP != "" {
+		t.Fatalf("reduced feed must not produce a reality endpoint: %+v", result)
 	}
 }
