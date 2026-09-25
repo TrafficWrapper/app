@@ -11,8 +11,6 @@ import (
 	"time"
 
 	"aead.dev/minisign"
-
-	awgdialect "github.com/TrafficWrapper/app/core/awg/dialect"
 )
 
 func init() {
@@ -64,7 +62,7 @@ func TestApplyDiscoveredEndpointsMergesAWGWithStoredSecrets(t *testing.T) {
 	if merged.ServerPublicKey != testDiscoveredServerKey {
 		t.Fatalf("server_public_key=%q", merged.ServerPublicKey)
 	}
-	if !awgdialect.IsCompat(merged.AWGPreset) {
+	if merged.AWGPreset != testWidePreset() {
 		t.Fatalf("awg_preset was not applied: %+v", merged.AWGPreset)
 	}
 	if merged.MTU != original.MTU {
@@ -481,7 +479,7 @@ func testBundle(t *testing.T, seq int64, issuedAt string, expiresAt string) map[
 					"endpoint":          "worker.example:51821",
 					"egress_ip":         "198.51.100.50",
 					"server_public_key": testDiscoveredServerKey,
-					"awg_preset":        awgdialect.Compat(),
+					"awg_preset":        testWidePreset(),
 				},
 			},
 			"reality": []any{
@@ -514,7 +512,7 @@ func testBaseConfig(t *testing.T) string {
 		Endpoint:        "203.0.113.10:51821",
 		ServerPublicKey: testKey(2),
 		PSK2:            testKey(3),
-		AWGPreset:       awgdialect.Compat(),
+		AWGPreset:       testBasePreset(),
 		SOCKSListen:     "127.0.0.1:18080",
 		MTU:             1420,
 		DNSServers:      []string{"1.1.1.1"},
@@ -608,7 +606,7 @@ func testPublicApplyRequest() publicApplyAPIRequest {
 		InternalIP:      "10.13.13.42/32",
 		PSK2:            testKey(3),
 		ServerAWGPublic: testKey(2),
-		AWG:             &publicRouteSpec{Endpoint: "203.0.113.10:51821"},
+		AWG:             &publicRouteSpec{Endpoint: "203.0.113.10:51821", AWGPreset: testBasePresetRaw()},
 	}
 }
 

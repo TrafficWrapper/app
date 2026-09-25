@@ -29,6 +29,12 @@ const (
 	maxHeader             = uint32(1<<31 - 1)
 	minHeaderSpan         = uint32(8 * 1024 * 1024)
 	maxHeaderSpan         = uint32(32 * 1024 * 1024)
+
+	// WireGuard message sizes before AWG padding.
+	messageInitiationSize   = 148
+	messageResponseSize     = 92
+	messageCookieReplySize  = 64
+	messageTransportMinSize = 32
 )
 
 // Production junk-packet bounds, kept in sync with the worker's
@@ -89,13 +95,19 @@ func GenerateWithReader(r io.Reader) (Dialect, error) {
 			break
 		}
 	}
-	s3, err := randInt(r, 0, 64)
-	if err != nil {
-		return Dialect{}, err
-	}
-	s4, err := randInt(r, 0, 32)
-	if err != nil {
-		return Dialect{}, err
+	var s3, s4 int
+	for {
+		s3, err = randInt(r, 0, 64)
+		if err != nil {
+			return Dialect{}, err
+		}
+		s4, err = randInt(r, 0, 32)
+		if err != nil {
+			return Dialect{}, err
+		}
+		if !paddedSizesCollide(s1, s2, s3, s4) {
+			break
+		}
 	}
 	headers, err := generateHeaders(r)
 	if err != nil {
@@ -163,6 +175,9 @@ func transportPadding(d Dialect) int {
 	return d.S4
 }
 
+// ValidateProduction is the policy for dialects received from the server:
+// the Compat (plain WireGuard) profile and anything outside the worker's
+// production bounds are rejected.
 func ValidateProduction(d Dialect, mtu int) error {
 	if mtu <= 0 {
 		return errors.New("mtu must be positive")
@@ -326,27 +341,85 @@ func Summary(d Dialect) string {
 	)
 }
 
+// generateHeaders picks four random, pairwise disjoint H ranges anywhere in
+// [minHeader, maxHeader], each between minHeaderSpan and maxHeaderSpan wide,
+// assigned to H1..H4 in random order. Fixed per-slot windows would make every
+// deployment share the same header neighbourhoods.
 func generateHeaders(r io.Reader) ([4]HeaderRange, error) {
-	buckets := [][2]uint32{
-		{100_000_000, 450_000_000},
-		{600_000_000, 950_000_000},
-		{1_100_000_000, 1_450_000_000},
-		{1_600_000_000, 2_050_000_000},
-	}
 	var out [4]HeaderRange
-	for i, bucket := range buckets {
-		width, err := randUint32(r, minHeaderSpan, maxHeaderSpan)
+	var widths [4]uint64
+	var total uint64
+	for i := range widths {
+		w, err := randUint32(r, minHeaderSpan, maxHeaderSpan)
 		if err != nil {
 			return out, err
 		}
-		maxStart := bucket[1] - width
-		start, err := randUint32(r, bucket[0], maxStart)
+		widths[i] = uint64(w)
+		total += uint64(w) + 1 // a range [s, s+w] holds w+1 values
+	}
+	space := uint64(maxHeader) - uint64(minHeader) + 1
+	slack := space - total
+	// Four sorted cut points in [0, slack] split the free space into the
+	// gaps before, between and after the ranges.
+	var cuts [4]uint64
+	for i := range cuts {
+		c, err := randUint64(r, slack)
 		if err != nil {
 			return out, err
 		}
-		out[i] = HeaderRange{Start: start, End: start + width}
+		cuts[i] = c
+	}
+	for i := 1; i < len(cuts); i++ {
+		for j := i; j > 0 && cuts[j] < cuts[j-1]; j-- {
+			cuts[j], cuts[j-1] = cuts[j-1], cuts[j]
+		}
+	}
+	pos := uint64(minHeader)
+	prevCut := uint64(0)
+	for i := range out {
+		pos += cuts[i] - prevCut
+		prevCut = cuts[i]
+		out[i] = HeaderRange{Start: uint32(pos), End: uint32(pos + widths[i])}
+		pos += widths[i] + 1
+	}
+	// Random slot order (Fisher-Yates), so H1 is not always the lowest.
+	for i := len(out) - 1; i > 0; i-- {
+		j, err := randInt(r, 0, i)
+		if err != nil {
+			return out, err
+		}
+		out[i], out[j] = out[j], out[i]
 	}
 	return out, nil
+}
+
+// paddedSizesCollide reports whether two handshake message types (or a
+// handshake and the smallest transport packet) would have the same size on
+// the wire once padded. The worker's generator rejects the same
+// combinations; ValidateProduction does not, so existing dialects stay valid.
+func paddedSizesCollide(s1, s2, s3, s4 int) bool {
+	sizes := []int{
+		messageInitiationSize + s1,
+		messageResponseSize + s2,
+		messageCookieReplySize + s3,
+		messageTransportMinSize + s4,
+	}
+	for i := range sizes {
+		for j := i + 1; j < len(sizes); j++ {
+			if sizes[i] == sizes[j] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func randUint64(r io.Reader, max uint64) (uint64, error) {
+	n, err := rand.Int(r, new(big.Int).SetUint64(max+1))
+	if err != nil {
+		return 0, err
+	}
+	return n.Uint64(), nil
 }
 
 func randInt(r io.Reader, min, max int) (int, error) {

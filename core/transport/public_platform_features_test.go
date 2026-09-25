@@ -232,7 +232,7 @@ func TestApplyPublicPlatformConfigLegacyJSONUnchanged(t *testing.T) {
 	setPendingProvision(t, "", "")
 	raw := `{"awg_private_key":"` + testKey(1) + `","internal_ip":"10.13.13.42/32","psk2":"` + testKey(3) +
 		`","server_awg_public":"` + testKey(2) + `","dns_servers":["9.9.9.9"],` +
-		`"awg":{"type":"awg","address":"203.0.113.10","port":51821,"public_key":"` + testKey(2) + `"}}`
+		`"awg":{"type":"awg","address":"203.0.113.10","port":51821,"public_key":"` + testKey(2) + `","awg_preset":` + string(testBasePresetRaw()) + `}}`
 	var result publicApplyAPIResult
 	if err := json.Unmarshal([]byte(ApplyPublicPlatformConfig(raw)), &result); err != nil || !result.OK {
 		t.Fatalf("apply failed: %+v %v", result, err)
@@ -274,6 +274,7 @@ func TestPublicAWGConfigJSONUsesProfileCredentials(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			route := tc.route
 			route.Endpoint = "203.0.113.10:51821"
+			route.AWGPreset = testBasePresetRaw()
 			raw, meta, err := publicAWGConfigJSON(&route, req, "127.0.0.1:18080")
 			if err != nil {
 				t.Fatal(err)
@@ -288,7 +289,7 @@ func TestPublicAWGConfigJSONUsesProfileCredentials(t *testing.T) {
 		})
 	}
 	req.AWGProfiles["awg_v3"] = publicAWGProfileCredentials{InternalIP: "10.15.0.2/32"}
-	if _, _, err := publicAWGConfigJSON(&publicRouteSpec{Endpoint: "203.0.113.10:51821", AWGProfile: "awg_v3"}, req, "127.0.0.1:18080"); err == nil {
+	if _, _, err := publicAWGConfigJSON(&publicRouteSpec{Endpoint: "203.0.113.10:51821", AWGProfile: "awg_v3", AWGPreset: testBasePresetRaw()}, req, "127.0.0.1:18080"); err == nil {
 		t.Fatal("incomplete profile credentials accepted")
 	}
 }
@@ -315,6 +316,7 @@ func TestPublicAWGConfigJSONSelectsIPv6Endpoint(t *testing.T) {
 			req := req
 			req.AWGProfiles = tc.profiles
 			route := tc.route
+			route.AWGPreset = testBasePresetRaw()
 			raw, meta, err := publicAWGConfigJSON(&route, req, "127.0.0.1:18080")
 			if err != nil {
 				t.Fatal(err)
@@ -328,7 +330,7 @@ func TestPublicAWGConfigJSONSelectsIPv6Endpoint(t *testing.T) {
 		})
 	}
 	for _, bad := range []string{"203.0.113.10:51821", "[2001:db8::1]", "worker.example:51821", "[::ffff:1.2.3.4]:51821"} {
-		route := publicRouteSpec{Endpoint: "203.0.113.10:51821", EndpointV6: bad, IPFamily: "v6"}
+		route := publicRouteSpec{Endpoint: "203.0.113.10:51821", EndpointV6: bad, IPFamily: "v6", AWGPreset: testBasePresetRaw()}
 		if _, _, err := publicAWGConfigJSON(&route, req, "127.0.0.1:18080"); err == nil {
 			t.Fatalf("endpoint_v6 %q accepted", bad)
 		}
@@ -346,10 +348,11 @@ func TestPublicAWGConfigJSONRouteDNS(t *testing.T) {
 		{"absent uses dns_servers", nil, []string{"9.9.9.9"}},
 		{"empty list uses dns_servers", []string{}, []string{"9.9.9.9"}},
 		{"blank values use dns_servers", []string{" ", ""}, []string{"9.9.9.9"}},
-		{"route dns overrides", []string{" 10.13.13.1 ", "", "2001:db8::53"}, []string{"10.13.13.1", "2001:db8::53"}},
+		// The netstack is IPv4-only, so IPv6 resolvers are dropped (APP-L37).
+		{"route dns overrides", []string{" 10.13.13.1 ", "", "2001:db8::53"}, []string{"10.13.13.1"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			route := publicRouteSpec{Endpoint: "203.0.113.10:51821", DNS: tc.dns}
+			route := publicRouteSpec{Endpoint: "203.0.113.10:51821", DNS: tc.dns, AWGPreset: testBasePresetRaw()}
 			raw, _, err := publicAWGConfigJSON(&route, req, "127.0.0.1:18080")
 			if err != nil {
 				t.Fatal(err)
@@ -361,7 +364,7 @@ func TestPublicAWGConfigJSONRouteDNS(t *testing.T) {
 	}
 	setPendingProvision(t, "stored", "")
 	bad := req
-	bad.AWG = &publicRouteSpec{Endpoint: "203.0.113.10:51821", DNS: []string{"10.13.13.1", "dns.example"}}
+	bad.AWG = &publicRouteSpec{Endpoint: "203.0.113.10:51821", DNS: []string{"10.13.13.1", "dns.example"}, AWGPreset: testBasePresetRaw()}
 	if _, err := applyPublicPlatformConfig(bad); err == nil || !strings.Contains(err.Error(), "dns") {
 		t.Fatalf("invalid route dns accepted: %v", err)
 	}
@@ -379,7 +382,7 @@ func TestApplyPublicPlatformConfigStoresProfileMetaAndWideDialect(t *testing.T) 
 		`","server_awg_public":"` + testKey(2) + `",` +
 		`"awg_profiles":{"awg_v2":{"awg_public_key":"k","internal_ip":"10.14.0.7/32","psk2":"` + testKey(5) + `"}},` +
 		`"awg":{"endpoint":"203.0.113.10:51822","awg_profile":"awg_v2","awg_preset":` + preset + `},` +
-		`"awg_ru":{"endpoint":"203.0.113.11:51821","endpoint_v6":"[2001:db8::11]:51821","ip_family":"v6","dns":["10.13.13.1"]}}`
+		`"awg_ru":{"endpoint":"203.0.113.11:51821","endpoint_v6":"[2001:db8::11]:51821","ip_family":"v6","dns":["10.13.13.1"],"awg_preset":` + string(testBasePresetRaw()) + `}}`
 	var result publicApplyAPIResult
 	if err := json.Unmarshal([]byte(ApplyPublicPlatformConfig(raw)), &result); err != nil || !result.OK {
 		t.Fatalf("apply failed: %+v %v", result, err)

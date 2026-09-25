@@ -58,6 +58,8 @@ type status struct {
 	TXBytes              uint64 `json:"tx_bytes,omitempty"`
 	PeerAllowedIP        string `json:"peer_allowed_ip,omitempty"`
 	UAPIReadError        string `json:"uapi_read_error,omitempty"`
+	// SOCKSDead is set while the SOCKS listener's accept loop keeps failing.
+	SOCKSDead bool `json:"socks_dead,omitempty"`
 }
 
 func Start(configJSON string) string {
@@ -249,6 +251,7 @@ func (inst *instance) status() *status {
 	}
 	if inst.socks != nil {
 		status.SOCKSListen = inst.socks.addr()
+		status.SOCKSDead = inst.socks.isDead()
 	}
 	var raw strings.Builder
 	if err := inst.dev.IpcGetOperation(&raw); err != nil {

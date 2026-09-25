@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -172,6 +173,9 @@ type publicApplyAPIResult struct {
 	Error             string `json:"error,omitempty"`
 	ConfigStored      bool   `json:"config_stored,omitempty"`
 	AWGRUConfigStored bool   `json:"awg_ru_config_stored,omitempty"`
+	// AWGRejected lists AWG routes skipped because their dialect is not a
+	// production dialect; their previously stored config is kept.
+	AWGRejected []awgRouteRejection `json:"awg_rejected,omitempty"`
 }
 
 type publicRouteSpec struct {
@@ -484,23 +488,38 @@ func applyPublicPlatformConfig(req publicApplyAPIRequest) (publicApplyAPIResult,
 	if req.AWGRUSOCKSListen == "" {
 		req.AWGRUSOCKSListen = defaultAWGRUSOCKSListen
 	}
+	var rejected []awgRouteRejection
+	// A route whose dialect fails the production policy is skipped (its
+	// stored config is kept) so REALITY and the other AWG slot still apply.
+	skipDialect := func(route string, err error) bool {
+		if !errors.Is(err, errNonProductionDialect) {
+			return false
+		}
+		log.Printf("transport: public %s route skipped: %v", route, err)
+		rejected = append(rejected, awgRouteRejection{Route: route, Reason: err.Error()})
+		return true
+	}
 	var defaultConfigJSON string
 	var defaultMeta provisionedConfigMeta
 	if req.AWG != nil {
 		raw, meta, err := publicAWGConfigJSON(req.AWG, req, req.SOCKSListen)
-		if err != nil {
+		if err != nil && !skipDialect("awg", err) {
 			return publicApplyAPIResult{}, fmt.Errorf("public awg config: %w", err)
 		}
-		defaultConfigJSON, defaultMeta = raw, meta
+		if err == nil {
+			defaultConfigJSON, defaultMeta = raw, meta
+		}
 	}
 	var awgRUConfigJSON string
 	var awgRUMeta provisionedConfigMeta
 	if req.AWGRU != nil {
 		raw, meta, err := publicAWGConfigJSON(req.AWGRU, req, req.AWGRUSOCKSListen)
-		if err != nil {
+		if err != nil && !skipDialect("awg_ru", err) {
 			return publicApplyAPIResult{}, fmt.Errorf("public awg-ru config: %w", err)
 		}
-		awgRUConfigJSON, awgRUMeta = raw, meta
+		if err == nil {
+			awgRUConfigJSON, awgRUMeta = raw, meta
+		}
 	}
 	if strings.TrimSpace(req.RendezvousPublicKey) != "" {
 		// Replace is allowed: this request carries the currently verified
@@ -525,6 +544,7 @@ func applyPublicPlatformConfig(req publicApplyAPIRequest) (publicApplyAPIResult,
 		OK:                true,
 		ConfigStored:      defaultConfigJSON != "",
 		AWGRUConfigStored: awgRUConfigJSON != "",
+		AWGRejected:       rejected,
 	}, nil
 }
 

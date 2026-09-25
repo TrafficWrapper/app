@@ -107,12 +107,16 @@ func proxyPair(left, right net.Conn, idle time.Duration, leftBytes, rightBytes *
 		err error
 	}
 	results := make(chan copyResult, 2)
-	go func() {
-		results <- copyResult{dst: left, err: copyWithTracker(left, right, tracker, leftBytes)}
-	}()
-	go func() {
-		results <- copyResult{dst: right, err: copyWithTracker(right, left, tracker, rightBytes)}
-	}()
+	copyDir := func(dst, src net.Conn, counter *atomic.Uint64) {
+		// The result is always delivered, even after a recovered panic,
+		// so the waiting loop below cannot hang.
+		err := errRecoveredPanic
+		defer func() { results <- copyResult{dst: dst, err: err} }()
+		defer recoverGoroutine("proxy copy")
+		err = copyWithTracker(dst, src, tracker, counter)
+	}
+	go copyDir(left, right, leftBytes)
+	go copyDir(right, left, rightBytes)
 	var firstErr error
 	for i := 0; i < 2; i++ {
 		result := <-results

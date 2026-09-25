@@ -196,7 +196,7 @@ func TestVpnBridgeDNSMuxSharesOneAssociate(t *testing.T) {
 			defer wg.Done()
 			query := vpnBridgeTestDNSQueryName(fmt.Sprintf("q%d.example", i))
 			binary.BigEndian.PutUint16(query[:2], 0x1234) // same app-side ID for all
-			resp, err := b.resolveDNSOverUDPRoute(query, route)
+			resp, err := b.resolveDNSOverUDPRoute(ctx, query, route)
 			if err != nil {
 				errs <- err
 				return
