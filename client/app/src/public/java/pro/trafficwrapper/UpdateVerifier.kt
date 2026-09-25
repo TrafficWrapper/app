@@ -182,7 +182,8 @@ class UpdateVerifier(private val context: Context) {
                 trustedNowMs = trustedTime.wallTimeMs,
                 futureReferenceMs = max(trustedTime.wallTimeMs, systemNowMs),
                 currentVersionCode = BuildConfig.VERSION_CODE.toLong(),
-                maxSeenUpdateSeq = stored.maxSeenUpdateSeq,
+                // The rollback floor applies only to the update key it was recorded under.
+                maxSeenUpdateSeq = stored.updateSeqFloorFor(updatePubkey),
             )
         } catch (error: UpdateVerificationException) {
             Log.w(
@@ -201,11 +202,15 @@ class UpdateVerifier(private val context: Context) {
                 Log.w(TAG, "public update rejected: update_pubkey pin changed during verification")
                 throw UpdateVerificationException(R.string.update_error_signer)
             }
-            if (current.maxSeenUpdateSeq > 0 && manifest.seq < current.maxSeenUpdateSeq) {
-                Log.w(TAG, "public update rejected: rollback seq=${manifest.seq} maxSeen=${current.maxSeenUpdateSeq}")
+            val currentFloor = current.updateSeqFloorFor(updatePubkey)
+            if (currentFloor > 0 && manifest.seq < currentFloor) {
+                Log.w(TAG, "public update rejected: rollback seq=${manifest.seq} maxSeen=$currentFloor")
                 throw UpdateVerificationException(R.string.update_error_downgrade)
             }
-            current.copy(maxSeenUpdateSeq = max(current.maxSeenUpdateSeq, manifest.seq))
+            current.copy(
+                maxSeenUpdateSeq = max(currentFloor, manifest.seq),
+                maxSeenUpdateSeqPin = updatePubkey,
+            )
         }
         // Persist only signed time (issued_at) plus the same-boot monotonic delta; SNTP is used
         // for this decision only and never stored (APP-M6/M23).

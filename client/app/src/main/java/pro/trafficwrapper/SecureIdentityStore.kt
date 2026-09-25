@@ -72,6 +72,10 @@ data class StoredRendezvousState(
     val trustedElapsedRealtimeMs: Long = 0,
     val lastValidIssuedAtMs: Long = 0,
     val discoverySinks: List<String> = emptyList(),
+    /** seq of the signed rendezvous feed that carried [discoverySinks]; 0 = unknown (legacy state). */
+    val discoverySinksSeq: Long = 0,
+    /** expires_at of that feed; the sinks expire with it. 0 = unknown (legacy state). */
+    val discoverySinksExpiresAtMs: Long = 0,
     val trustedBootCount: Int = -1,
     val trustedBootWallMs: Long = 0,
 ) {
@@ -90,7 +94,8 @@ data class StoredRendezvousState(
 /**
  * Next persisted rendezvous state after a verified bundle. The trusted-time anchor is advanced
  * only from the signed issued_at and the same-boot monotonic extrapolation of the previous
- * anchor; the caller's SNTP-derived wall time is not persisted (APP-M6/M23).
+ * anchor; the caller's SNTP-derived wall time is not persisted (APP-M6/M23). Sinks follow
+ * [mergeRendezvousSinks] (APP-L25).
  */
 internal fun nextRendezvousState(
     current: StoredRendezvousState,
@@ -100,6 +105,7 @@ internal fun nextRendezvousState(
     boot: BootIdentity,
     systemNowMs: Long,
     discoverySinks: List<String>,
+    discoverySinksExpiresAtMs: Long = 0,
 ): StoredRendezvousState {
     val anchor = nextTrustedTimeAnchor(
         current = current.trustedAnchor,
@@ -108,15 +114,39 @@ internal fun nextRendezvousState(
         currentElapsedRealtimeMs = elapsedRealtimeMs,
         systemNowMs = systemNowMs,
     )
+    val (sinks, sinksSeq, sinksExpiresAtMs) =
+        mergeRendezvousSinks(current, seq, discoverySinks, discoverySinksExpiresAtMs)
     return StoredRendezvousState(
         maxSeenRendezvousSeq = maxOf(current.maxSeenRendezvousSeq, seq),
         trustedWallTimeMs = anchor.wallTimeMs,
         trustedElapsedRealtimeMs = anchor.elapsedRealtimeMs,
         lastValidIssuedAtMs = maxOf(current.lastValidIssuedAtMs, issuedAtMs),
-        discoverySinks = discoverySinks.ifEmpty { current.discoverySinks },
+        discoverySinks = sinks,
+        discoverySinksSeq = sinksSeq,
+        discoverySinksExpiresAtMs = sinksExpiresAtMs,
         trustedBootCount = anchor.boot.bootCount,
         trustedBootWallMs = anchor.boot.bootWallMs,
     )
+}
+
+/**
+ * next_sinks inherit seq and expires_at of the signed feed that carried them (APP-L25). A feed
+ * with a higher seq is authoritative and replaces the stored list even when it is empty, so the
+ * operator can withdraw a sink; re-reading the same seq keeps the stored list. Legacy state (no
+ * recorded seq/expiry) is always replaced by the next verified feed.
+ */
+internal fun mergeRendezvousSinks(
+    current: StoredRendezvousState,
+    feedSeq: Long,
+    feedSinks: List<String>,
+    feedExpiresAtMs: Long,
+): Triple<List<String>, Long, Long> {
+    val legacy = current.discoverySinksExpiresAtMs <= 0L
+    return if (legacy || feedSeq > current.discoverySinksSeq) {
+        Triple(feedSinks, feedSeq, feedExpiresAtMs)
+    } else {
+        Triple(current.discoverySinks, current.discoverySinksSeq, current.discoverySinksExpiresAtMs)
+    }
 }
 
 data class StoredPublicPlatformState(
@@ -125,6 +155,11 @@ data class StoredPublicPlatformState(
     val updatePubkeyPin: String = "",
     val maxSeenConfigSeq: Long = 0,
     val maxSeenUpdateSeq: Long = 0,
+    /**
+     * update_pubkey pin that [maxSeenUpdateSeq] was recorded under; the counter does not apply to
+     * any other key. Legacy state without the field is read as owned by [updatePubkeyPin]; blank = unknown owner.
+     */
+    val maxSeenUpdateSeqPin: String = "",
     val trustedWallTimeMs: Long = 0,
     val trustedElapsedRealtimeMs: Long = 0,
     val clientConfigJson: String = "",
@@ -154,6 +189,7 @@ internal fun publicPlatformStateToJson(state: StoredPublicPlatformState): JSONOb
         .put(PPS_UPDATE_PUBKEY_PIN, state.updatePubkeyPin)
         .put(PPS_MAX_SEEN_CONFIG_SEQ, state.maxSeenConfigSeq)
         .put(PPS_MAX_SEEN_UPDATE_SEQ, state.maxSeenUpdateSeq)
+        .put(PPS_MAX_SEEN_UPDATE_SEQ_PIN, state.maxSeenUpdateSeqPin)
         .put(PPS_TRUSTED_WALL_TIME_MS, state.trustedWallTimeMs)
         .put(PPS_TRUSTED_ELAPSED_REALTIME_MS, state.trustedElapsedRealtimeMs)
         .put(PPS_CLIENT_CONFIG_JSON, state.clientConfigJson)
@@ -172,13 +208,22 @@ internal fun publicPlatformStateToJson(state: StoredPublicPlatformState): JSONOb
         .put(PPS_ENROLL_VERSION_CODE, state.enrollVersionCode)
 
 /** Reads a stored public platform state; fields missing in older JSON keep their defaults. */
-internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatformState =
-    StoredPublicPlatformState(
+internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatformState {
+    val updatePubkeyPin = root.optString(PPS_UPDATE_PUBKEY_PIN)
+    return StoredPublicPlatformState(
         bootstrapRaw = root.optString(PPS_BOOTSTRAP_RAW),
         configPubkeyPin = root.optString(PPS_CONFIG_PUBKEY_PIN),
-        updatePubkeyPin = root.optString(PPS_UPDATE_PUBKEY_PIN),
+        updatePubkeyPin = updatePubkeyPin,
         maxSeenConfigSeq = root.optLong(PPS_MAX_SEEN_CONFIG_SEQ, 0),
         maxSeenUpdateSeq = root.optLong(PPS_MAX_SEEN_UPDATE_SEQ, 0),
+        // Legacy state has no owner: the counter was recorded under the key pinned at that time.
+        // Fixing the owner on read makes a later in-memory change of updatePubkeyPin (e.g. a signed
+        // key rotation in the config poll) reset the rollback floor for the new key.
+        maxSeenUpdateSeqPin = if (root.has(PPS_MAX_SEEN_UPDATE_SEQ_PIN)) {
+            root.optString(PPS_MAX_SEEN_UPDATE_SEQ_PIN)
+        } else {
+            updatePubkeyPin
+        },
         trustedWallTimeMs = root.optLong(PPS_TRUSTED_WALL_TIME_MS, 0),
         trustedElapsedRealtimeMs = root.optLong(PPS_TRUSTED_ELAPSED_REALTIME_MS, 0),
         clientConfigJson = root.optString(PPS_CLIENT_CONFIG_JSON),
@@ -196,12 +241,14 @@ internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatform
         realityFlowKnown = root.optBoolean(PPS_REALITY_FLOW_KNOWN, false),
         enrollVersionCode = root.optLong(PPS_ENROLL_VERSION_CODE, 0),
     )
+}
 
 private const val PPS_BOOTSTRAP_RAW = "bootstrap_raw"
 private const val PPS_CONFIG_PUBKEY_PIN = "config_pubkey_pin"
 private const val PPS_UPDATE_PUBKEY_PIN = "update_pubkey_pin"
 private const val PPS_MAX_SEEN_CONFIG_SEQ = "max_seen_config_seq"
 private const val PPS_MAX_SEEN_UPDATE_SEQ = "max_seen_update_seq"
+private const val PPS_MAX_SEEN_UPDATE_SEQ_PIN = "max_seen_update_seq_pin"
 private const val PPS_TRUSTED_WALL_TIME_MS = "trusted_wall_time_ms"
 private const val PPS_TRUSTED_ELAPSED_REALTIME_MS = "trusted_elapsed_realtime_ms"
 private const val PPS_CLIENT_CONFIG_JSON = "client_config_json"
@@ -578,6 +625,7 @@ class SecureIdentityStore(context: Context) {
         trustedElapsedRealtimeMs: Long,
         issuedAtMs: Long,
         discoverySinks: List<String> = emptyList(),
+        discoverySinksExpiresAtMs: Long = 0,
     ): StoredRendezvousState {
         return synchronized(LOCK) {
             val keyState = getOrCreateWrappingKey()
@@ -593,6 +641,7 @@ class SecureIdentityStore(context: Context) {
                 boot = ClockDiagnostics.currentBoot(appContext),
                 systemNowMs = System.currentTimeMillis(),
                 discoverySinks = discoverySinks,
+                discoverySinksExpiresAtMs = discoverySinksExpiresAtMs,
             )
             val root = JSONObject()
                 .put(JSON_MAX_SEEN_RENDEZVOUS_SEQ, next.maxSeenRendezvousSeq)
@@ -602,6 +651,8 @@ class SecureIdentityStore(context: Context) {
                 .put(JSON_TRUSTED_BOOT_WALL_MS, next.trustedBootWallMs)
                 .put(JSON_LAST_VALID_ISSUED_AT_MS, next.lastValidIssuedAtMs)
                 .put(JSON_DISCOVERY_SINKS, JSONArray(next.discoverySinks))
+                .put(JSON_DISCOVERY_SINKS_SEQ, next.discoverySinksSeq)
+                .put(JSON_DISCOVERY_SINKS_EXPIRES_AT_MS, next.discoverySinksExpiresAtMs)
             if (!prefs.edit().putString(KEY_RENDEZVOUS_STATE, seal(root.toString(), keyState.key)).commit()) {
                 throw IllegalStateException("failed to persist rendezvous state")
             }
@@ -619,6 +670,8 @@ class SecureIdentityStore(context: Context) {
             trustedElapsedRealtimeMs = root.optLong(JSON_TRUSTED_ELAPSED_REALTIME_MS, 0),
             lastValidIssuedAtMs = root.optLong(JSON_LAST_VALID_ISSUED_AT_MS, 0),
             discoverySinks = root.optJSONArray(JSON_DISCOVERY_SINKS).toStringList(),
+            discoverySinksSeq = root.optLong(JSON_DISCOVERY_SINKS_SEQ, 0),
+            discoverySinksExpiresAtMs = root.optLong(JSON_DISCOVERY_SINKS_EXPIRES_AT_MS, 0),
             trustedBootCount = root.optInt(JSON_TRUSTED_BOOT_COUNT, -1),
             trustedBootWallMs = root.optLong(JSON_TRUSTED_BOOT_WALL_MS, 0),
         )
@@ -807,6 +860,8 @@ class SecureIdentityStore(context: Context) {
         private const val JSON_MAX_MIN_SUPPORTED_VERSION = "max_min_supported_version"
         private const val JSON_MAX_SEEN_RENDEZVOUS_SEQ = "max_seen_rendezvous_seq"
         private const val JSON_DISCOVERY_SINKS = "discovery_sinks"
+        private const val JSON_DISCOVERY_SINKS_SEQ = "discovery_sinks_seq"
+        private const val JSON_DISCOVERY_SINKS_EXPIRES_AT_MS = "discovery_sinks_expires_at_ms"
         private const val JSON_TRUSTED_WALL_TIME_MS = "trusted_wall_time_ms"
         private const val JSON_TRUSTED_ELAPSED_REALTIME_MS = "trusted_elapsed_realtime_ms"
         private const val JSON_LAST_VALID_ISSUED_AT_MS = "last_valid_issued_at_ms"

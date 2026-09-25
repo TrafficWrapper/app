@@ -68,22 +68,49 @@ class TrustedTimeAnchorTest {
 
     @Test
     fun rendezvousStateDoesNotPersistCallerWallTime() {
-        val current = StoredRendezvousState(maxSeenRendezvousSeq = 3, discoverySinks = listOf("a"))
-        val next = nextRendezvousState(
+        val current = StoredRendezvousState(
+            maxSeenRendezvousSeq = 3,
+            discoverySinks = listOf("a"),
+            discoverySinksSeq = 3,
+            discoverySinksExpiresAtMs = now + day,
+        )
+        // Same feed seq re-read: sinks are kept (APP-L25); time comes from issued_at only.
+        val sameSeq = nextRendezvousState(
             current = current,
-            seq = 4,
+            seq = 3,
             issuedAtMs = now - day,
             elapsedRealtimeMs = 5_000,
             boot = boot5,
             systemNowMs = now,
             discoverySinks = emptyList(),
+            discoverySinksExpiresAtMs = now + 2 * day,
         )
-        assertEquals(now - day, next.trustedWallTimeMs)
-        assertEquals(5_000, next.trustedElapsedRealtimeMs)
-        assertEquals(5, next.trustedBootCount)
-        assertEquals(4, next.maxSeenRendezvousSeq)
-        assertEquals(now - day, next.lastValidIssuedAtMs)
-        assertEquals(listOf("a"), next.discoverySinks)
+        assertEquals(now - day, sameSeq.trustedWallTimeMs)
+        assertEquals(5_000, sameSeq.trustedElapsedRealtimeMs)
+        assertEquals(5, sameSeq.trustedBootCount)
+        assertEquals(boot5.bootWallMs, sameSeq.trustedBootWallMs)
+        assertEquals(3, sameSeq.maxSeenRendezvousSeq)
+        assertEquals(now - day, sameSeq.lastValidIssuedAtMs)
+        assertEquals(listOf("a"), sameSeq.discoverySinks)
+        assertEquals(3, sameSeq.discoverySinksSeq)
+        assertEquals(now + day, sameSeq.discoverySinksExpiresAtMs)
+
+        // A newer feed is authoritative for sinks, even when it withdraws them.
+        val newer = nextRendezvousState(
+            current = sameSeq,
+            seq = 4,
+            issuedAtMs = now - day,
+            elapsedRealtimeMs = 65_000,
+            boot = boot5,
+            systemNowMs = now,
+            discoverySinks = emptyList(),
+            discoverySinksExpiresAtMs = now + 3 * day,
+        )
+        assertEquals(4, newer.maxSeenRendezvousSeq)
+        assertEquals(emptyList<String>(), newer.discoverySinks)
+        assertEquals(4, newer.discoverySinksSeq)
+        assertEquals(now + 3 * day, newer.discoverySinksExpiresAtMs)
+        assertEquals(now - day + 60_000, newer.trustedWallTimeMs)
     }
 
     @Test

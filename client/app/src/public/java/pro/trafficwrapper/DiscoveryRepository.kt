@@ -100,6 +100,8 @@ class DiscoveryRepository(private val context: Context) {
             trustedElapsedRealtimeMs = trusted.second,
             issuedAtMs = issuedAtMs,
             discoverySinks = signedNextSinks(jsonResponse.body),
+            // Go core already validated expires_at; next_sinks expire together with the feed.
+            discoverySinksExpiresAtMs = parseExpiresAt(jsonResponse.body),
         )
         response.optJSONObject("reality")?.optString("egress_ip")?.takeIf { it.isNotBlank() }?.let {
             TransportRuntime.publicRealityEgressIp = it
@@ -153,8 +155,16 @@ class DiscoveryRepository(private val context: Context) {
             if (!response.isSuccessful) {
                 throw IllegalStateException("discovery ${response.code}")
             }
+            val body = response.body
+            if (body.contentLength() > MAX_DISCOVERY_BODY_BYTES) {
+                throw IllegalStateException("discovery response too large")
+            }
+            val source = body.source()
+            if (source.request(MAX_DISCOVERY_BODY_BYTES + 1)) {
+                throw IllegalStateException("discovery response too large")
+            }
             return FetchResponse(
-                body = response.body.string(),
+                body = source.buffer.readUtf8(),
                 dateHeaderMs = parseHttpDate(response.header("Date")),
             )
         }
@@ -225,6 +235,8 @@ class DiscoveryRepository(private val context: Context) {
         private const val AWG_SOCKS_LISTEN = "127.0.0.1:18082"
         private const val AWG_RU_SOCKS_LISTEN = "127.0.0.1:18084"
         private const val DEFAULT_MTU = 1420
+        // Signed feeds, pointers and signatures are a few KiB; matches the core's 256 KiB bundle cap.
+        private const val MAX_DISCOVERY_BODY_BYTES = 256L * 1024
 
         private fun clientFor(socksListen: String): OkHttpClient {
             val dispatcher = Dispatcher().apply {
@@ -252,11 +264,19 @@ class DiscoveryRepository(private val context: Context) {
     }
 }
 
+/**
+ * Discovery sinks come only from operator-signed fields (APP-M20): the tunnel config_url of each
+ * route, next_sinks of the last verified rendezvous feed and discovery_rescue_pointers of the
+ * client bundle, plus the orchestrator itself. Worker-supplied route params such as
+ * discovery_url(s) are ignored: a single worker must not point the fleet at direct (off-tunnel)
+ * hosts. next_sinks and rescue pointers expire together with their signed container (APP-L25).
+ */
 internal fun discoverySinks(
     stored: StoredPublicPlatformState,
     config: PublicClientConfig,
     socksListen: String,
     rendezvousState: StoredRendezvousState = StoredRendezvousState(),
+    nowMs: Long = discoveryNowMs(null),
 ): List<DiscoverySink> {
     val tunnelSinks = linkedMapOf<String, DiscoverySink>()
     val directSinks = linkedMapOf<String, DiscoverySink>()
@@ -265,14 +285,6 @@ internal fun discoverySinks(
         .flatMap { it.routes }
         .map { it.params }
         .forEachIndexed { index, params ->
-            collectDiscoveryUrls(params.optJSONArray("discovery_urls")).forEach { url ->
-                addDiscoverySink(tunnelSinks, directSinks, "route-discovery-$index", url, tunnelSocks)
-            }
-            params.optString("discovery_url").trim().takeIf { it.isNotBlank() }?.let { raw ->
-                normalizeDiscoveryUrl(raw)?.let { url ->
-                    addDiscoverySink(tunnelSinks, directSinks, "route-discovery-$index", url, tunnelSocks)
-                }
-            }
             params.optString("config_url").trim().takeIf { it.isNotBlank() }?.let { raw ->
                 normalizeDiscoveryUrl(raw)?.let { url ->
                     tunnelSinks.putIfAbsent(
@@ -282,14 +294,18 @@ internal fun discoverySinks(
                 }
             }
         }
-    rendezvousState.discoverySinks.forEachIndexed { index, raw ->
-        normalizeDiscoveryUrl(raw)?.let { url ->
-            addDiscoverySink(tunnelSinks, directSinks, "signed-next-$index", url, tunnelSocks)
+    if (signedContainerValid(rendezvousState.discoverySinksExpiresAtMs, nowMs)) {
+        rendezvousState.discoverySinks.forEachIndexed { index, raw ->
+            normalizeDiscoveryUrl(raw)?.let { url ->
+                addDiscoverySink(tunnelSinks, directSinks, "signed-next-$index", url, tunnelSocks)
+            }
         }
     }
-    config.discoveryRescuePointers.forEachIndexed { index, raw ->
-        normalizeDiscoveryUrl(raw)?.takeIf { it.startsWith("https://", ignoreCase = true) }?.let { url ->
-            directSinks.putIfAbsent("rescue|$url", DiscoverySink("rescue-pointer-$index", url, pointerUrl = url))
+    if (signedContainerValid(parseInstantMsOrZero(config.expiresAt), nowMs)) {
+        config.discoveryRescuePointers.forEachIndexed { index, raw ->
+            normalizeDiscoveryUrl(raw)?.takeIf { it.startsWith("https://", ignoreCase = true) }?.let { url ->
+                directSinks.putIfAbsent("rescue|$url", DiscoverySink("rescue-pointer-$index", url, pointerUrl = url))
+            }
         }
     }
     val bootstrapBase = runCatching {
@@ -300,6 +316,17 @@ internal fun discoverySinks(
     }
     return tunnelSinks.values.toList() + directSinks.values.toList()
 }
+
+/**
+ * A pointer inherited from a signed container is usable until that container's expires_at.
+ * 0 means the expiry is unknown (sinks persisted by an older app); those stay usable until the
+ * next verified feed replaces them.
+ */
+internal fun signedContainerValid(expiresAtMs: Long, nowMs: Long): Boolean =
+    expiresAtMs <= 0L || nowMs < expiresAtMs
+
+private fun parseInstantMsOrZero(value: String): Long =
+    runCatching { Instant.parse(value.trim()).toEpochMilli() }.getOrDefault(0L)
 
 private fun addDiscoverySink(
     tunnelSinks: MutableMap<String, DiscoverySink>,
@@ -313,15 +340,6 @@ private fun addDiscoverySink(
     } else {
         tunnelSinks.putIfAbsent("tunnel|$url", DiscoverySink(name, url, tunnelSocks))
     }
-}
-
-private fun collectDiscoveryUrls(array: JSONArray?): List<String> {
-    if (array == null) return emptyList()
-    val out = mutableListOf<String>()
-    for (index in 0 until array.length()) {
-        normalizeDiscoveryUrl(array.optString(index))?.let(out::add)
-    }
-    return out
 }
 
 internal fun signedNextSinks(bundleJSON: String): List<String> =
@@ -368,6 +386,9 @@ private fun parseHttpDate(value: String?): Long? =
 
 private fun parseIssuedAt(endpointsJson: String): Long =
     Instant.parse(JSONObject(endpointsJson).getString("issued_at")).toEpochMilli()
+
+private fun parseExpiresAt(endpointsJson: String): Long =
+    Instant.parse(JSONObject(endpointsJson).getString("expires_at")).toEpochMilli()
 
 private fun discoveryNowMs(httpsDateMs: Long?): Long =
     discoveryValidationNowMs(

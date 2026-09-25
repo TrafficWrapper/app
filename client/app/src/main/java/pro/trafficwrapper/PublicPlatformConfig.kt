@@ -344,10 +344,14 @@ object PublicPlatformConfigParser {
         return config
     }
 
+    /**
+     * Stable per-device worker order. The seed is deviceId+workerId only: it deliberately does not
+     * include the config seq, so a re-issued bundle (new seq, same workers) does not reshuffle
+     * every client onto different workers.
+     */
     fun deterministicWorkerOrder(
         workers: List<PublicWorkerConfig>,
         deviceId: String,
-        configSeq: Long,
     ): List<PublicWorkerConfig> =
         workers
             .filter { it.weight > 0 && it.routes.any(PublicRouteConfig::enabled) }
@@ -356,7 +360,7 @@ object PublicPlatformConfigParser {
             .values
             .flatMap { samePriority ->
                 samePriority.sortedBy { worker ->
-                    weightedRankKey("$deviceId:$configSeq:${worker.workerId}", worker.weight)
+                    weightedRankKey("$deviceId:${worker.workerId}", worker.weight)
                 }
             }
 
@@ -364,7 +368,7 @@ object PublicPlatformConfigParser {
         config: PublicClientConfig,
         deviceId: String,
     ): List<PublicResolvedRoute> =
-        deterministicWorkerOrder(config.workers, deviceId, config.seq)
+        deterministicWorkerOrder(config.workers, deviceId)
             .flatMap { worker ->
                 worker.routes
                     .filter { it.enabled }
@@ -821,6 +825,26 @@ internal fun resolveUpdatePubkeyPin(
 }
 
 /**
+ * Rollback floor for a client config signed by [configPubkeyPin]: the stored maxSeenConfigSeq
+ * only applies to the platform (config key) it was recorded for. A blank stored pin means no
+ * platform yet (or legacy state) and keeps the stored floor.
+ */
+internal fun StoredPublicPlatformState.configSeqFloorFor(configPubkeyPin: String): Long {
+    val stored = this.configPubkeyPin.trim()
+    return if (stored.isEmpty() || stored == configPubkeyPin.trim()) maxSeenConfigSeq else 0L
+}
+
+/**
+ * Rollback floor for an update manifest signed by [updatePubkeyPin]: maxSeenUpdateSeq only applies
+ * to the update key recorded in maxSeenUpdateSeqPin (blank = legacy/unknown owner, keeps the floor).
+ * After any change of the update key pin (platform switch, signed key rotation) checks start from 0.
+ */
+internal fun StoredPublicPlatformState.updateSeqFloorFor(updatePubkeyPin: String): Long {
+    val owner = maxSeenUpdateSeqPin.trim()
+    return if (owner.isEmpty() || owner == updatePubkeyPin.trim()) maxSeenUpdateSeq else 0L
+}
+
+/**
  * Merges freshly enrolled credentials into the current stored state inside
  * SecureIdentityStore.updatePublicPlatformState: monotonic counters and trusted time never go
  * backwards, and the update key pin is recomputed against the current state.
@@ -832,14 +856,22 @@ internal fun mergeEnrolledPublicPlatformState(
     signedConfigUpdatePubkey: String,
     bootstrap: PublicBootstrapConfig,
 ): StoredPublicPlatformState {
-    if (configSeq < current.maxSeenConfigSeq) {
+    // The rollback floor belongs to the config key it was seen under: a user-confirmed switch to
+    // another platform (different config_pubkey_pin) starts from 0 instead of failing as a rollback.
+    val configSeqFloor = current.configSeqFloorFor(enrolled.configPubkeyPin)
+    if (configSeq < configSeqFloor) {
         throw PublicConfigVerificationException("client config rollback")
     }
+    val updatePubkeyPin = resolveUpdatePubkeyPin(signedConfigUpdatePubkey, current, bootstrap)
     val keepCurrentTime = current.trustedWallTimeMs >= enrolled.trustedWallTimeMs
     return enrolled.copy(
-        updatePubkeyPin = resolveUpdatePubkeyPin(signedConfigUpdatePubkey, current, bootstrap),
-        maxSeenConfigSeq = maxOf(current.maxSeenConfigSeq, enrolled.maxSeenConfigSeq, configSeq),
-        maxSeenUpdateSeq = maxOf(current.maxSeenUpdateSeq, enrolled.maxSeenUpdateSeq),
+        updatePubkeyPin = updatePubkeyPin,
+        maxSeenConfigSeq = maxOf(configSeqFloor, enrolled.maxSeenConfigSeq, configSeq),
+        maxSeenUpdateSeq = maxOf(
+            current.updateSeqFloorFor(updatePubkeyPin),
+            enrolled.updateSeqFloorFor(updatePubkeyPin),
+        ),
+        maxSeenUpdateSeqPin = updatePubkeyPin,
         trustedWallTimeMs = if (keepCurrentTime) current.trustedWallTimeMs else enrolled.trustedWallTimeMs,
         trustedElapsedRealtimeMs = if (keepCurrentTime) {
             current.trustedElapsedRealtimeMs

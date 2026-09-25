@@ -4,10 +4,12 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.Base64
 
 class PublicPlatformConfigTest {
@@ -230,6 +232,164 @@ class PublicPlatformConfigTest {
     }
 
     @Test
+    fun mergeEnrolledStateAfterConfirmedPlatformSwitchStartsCountersFromZero() {
+        // APP-M3: platform A reached seq 240; platform B (different config key) is at seq 3.
+        val bootstrap = PublicPlatformConfigParser.parseBootstrap(bootstrapJson("2035-01-01T00:00:00Z"), nowMs = 0)
+        val platformA = StoredPublicPlatformState(
+            configPubkeyPin = "RWQplatformA",
+            updatePubkeyPin = "RWQupdateA",
+            maxSeenConfigSeq = 240,
+            maxSeenUpdateSeq = 50,
+            maxSeenUpdateSeqPin = "RWQupdateA",
+            deviceID = "old",
+        )
+        // What the enrollment path computes against the previous state.
+        assertEquals(0L, platformA.configSeqFloorFor(PUBLIC_KEY))
+        val config = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = envelope(clientConfig(seq = 3), signature = "sig"),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = platformA.configSeqFloorFor(PUBLIC_KEY),
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        val updatePin = resolveUpdatePubkeyPin("RWQupdateB", platformA, bootstrap)
+        val enrolled = StoredPublicPlatformState(
+            configPubkeyPin = PUBLIC_KEY,
+            updatePubkeyPin = updatePin,
+            maxSeenConfigSeq = maxOf(platformA.configSeqFloorFor(PUBLIC_KEY), config.seq),
+            maxSeenUpdateSeq = platformA.updateSeqFloorFor(updatePin),
+            maxSeenUpdateSeqPin = updatePin,
+            deviceID = "new",
+        )
+
+        val merged = mergeEnrolledPublicPlatformState(platformA, enrolled, config.seq, "RWQupdateB", bootstrap)
+        assertEquals("new", merged.deviceID)
+        assertEquals(PUBLIC_KEY, merged.configPubkeyPin)
+        assertEquals("RWQupdateB", merged.updatePubkeyPin)
+        assertEquals(3L, merged.maxSeenConfigSeq)
+        assertEquals(0L, merged.maxSeenUpdateSeq)
+        assertEquals("RWQupdateB", merged.maxSeenUpdateSeqPin)
+
+        // Same platform: the floor still applies and a lower seq is a rollback.
+        val sameAsB = merged.copy(maxSeenConfigSeq = 9)
+        assertThrows(PublicConfigVerificationException::class.java) {
+            mergeEnrolledPublicPlatformState(sameAsB, enrolled, 3, "RWQupdateB", bootstrap)
+        }
+        assertThrows(PublicConfigVerificationException::class.java) {
+            PublicPlatformConfigParser.verifyAndParseClientConfig(
+                envelopeRaw = envelope(clientConfig(seq = 3), signature = "sig"),
+                expectedPublicKey = PUBLIC_KEY,
+                maxSeenSeq = sameAsB.configSeqFloorFor(PUBLIC_KEY),
+                verifier = fakeVerifier(ok = true),
+                nowMs = 0,
+            )
+        }
+    }
+
+    @Test
+    fun updateSeqFloorIsBoundToUpdatePubkeyPin() {
+        val state = StoredPublicPlatformState(
+            configPubkeyPin = PUBLIC_KEY,
+            updatePubkeyPin = "RWQupdateA",
+            maxSeenUpdateSeq = 50,
+            maxSeenUpdateSeqPin = "RWQupdateA",
+        )
+        assertEquals(50L, state.updateSeqFloorFor("RWQupdateA"))
+        assertEquals(0L, state.updateSeqFloorFor("RWQupdateB"))
+        // Unknown owner (blank) keeps the floor: never weaker than before.
+        assertEquals(50L, state.copy(maxSeenUpdateSeqPin = "").updateSeqFloorFor("RWQupdateB"))
+        // A signed key rotation on the same platform (config poll only changes updatePubkeyPin)
+        // leaves the owner behind, so the new key starts from 0.
+        val rotated = state.copy(updatePubkeyPin = "RWQupdateB")
+        assertEquals(0L, rotated.updateSeqFloorFor(rotated.updatePubkeyPin))
+        // Config floor: blank stored pin keeps the floor, other platform resets it.
+        val cfg = StoredPublicPlatformState(configPubkeyPin = "RWQa", maxSeenConfigSeq = 7)
+        assertEquals(7L, cfg.configSeqFloorFor("RWQa"))
+        assertEquals(0L, cfg.configSeqFloorFor("RWQb"))
+        assertEquals(7L, cfg.copy(configPubkeyPin = "").configSeqFloorFor("RWQb"))
+    }
+
+    @Test
+    fun mergeEnrolledStateResetsUpdateFloorWhenSignedUpdateKeyRotates() {
+        val bootstrap = PublicPlatformConfigParser.parseBootstrap(bootstrapJson("2035-01-01T00:00:00Z"), nowMs = 0)
+        val current = StoredPublicPlatformState(
+            configPubkeyPin = PUBLIC_KEY,
+            updatePubkeyPin = "RWQupdateA",
+            maxSeenConfigSeq = 5,
+            maxSeenUpdateSeq = 50,
+            maxSeenUpdateSeqPin = "RWQupdateA",
+        )
+        val enrolled = StoredPublicPlatformState(
+            configPubkeyPin = PUBLIC_KEY,
+            updatePubkeyPin = "RWQupdateA",
+            maxSeenConfigSeq = 6,
+            maxSeenUpdateSeq = 50,
+            maxSeenUpdateSeqPin = "RWQupdateA",
+        )
+        val kept = mergeEnrolledPublicPlatformState(current, enrolled, 6, "RWQupdateA", bootstrap)
+        assertEquals(50L, kept.maxSeenUpdateSeq)
+        val rotated = mergeEnrolledPublicPlatformState(current, enrolled, 6, "RWQupdateB", bootstrap)
+        assertEquals("RWQupdateB", rotated.updatePubkeyPin)
+        assertEquals(0L, rotated.maxSeenUpdateSeq)
+        assertEquals("RWQupdateB", rotated.maxSeenUpdateSeqPin)
+        assertEquals(6L, rotated.maxSeenConfigSeq)
+    }
+
+    @Test
+    fun clientConfigSeqContractAcceptsLargeJumpsAndEqualSeq() {
+        // client-config-v1 seq contract: only seq < maxSeen is a rollback. A migration jump
+        // (+1_000_000 or an operator floor) is accepted; an equal seq is accepted by verification
+        // so the poll can ignore it (seq <= maxSeen) without raising an error.
+        fun verify(seq: Long, maxSeen: Long) =
+            PublicPlatformConfigParser.verifyAndParseClientConfig(
+                envelopeRaw = envelope(clientConfig(seq), signature = "sig"),
+                expectedPublicKey = PUBLIC_KEY,
+                maxSeenSeq = maxSeen,
+                verifier = fakeVerifier(ok = true),
+                nowMs = 0,
+            )
+        val jumped = 240L + 1_000_000L
+        assertEquals(jumped, verify(jumped, maxSeen = 240).seq)
+        assertEquals(jumped, verify(jumped, maxSeen = jumped).seq)
+        assertEquals(jumped + 1, verify(jumped + 1, maxSeen = jumped).seq)
+        val huge = 4_000_000_000_000_000_000L
+        assertEquals(huge, verify(huge, maxSeen = jumped).seq)
+        assertThrows(PublicConfigVerificationException::class.java) { verify(jumped - 1, maxSeen = jumped) }
+        assertThrows(PublicConfigVerificationException::class.java) { verify(240, maxSeen = jumped) }
+    }
+
+    @Test
+    fun clientConfigContractAcceptsEmptyWorkersArray() {
+        // ORC-L35 contract: the orchestrator sends workers: [] instead of null.
+        val config = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = envelope(
+                """{"schema":1,"ns":"client-config-v1","seq":1000005,"issued_at":"2030-01-01T00:00:00Z","expires_at":"2035-01-01T00:00:00Z","workers":[]}""",
+                signature = "sig",
+            ),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 5,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        assertTrue(config.workers.isEmpty())
+        assertTrue(PublicPlatformConfigParser.deterministicRouteOrder(config, "device-a").isEmpty())
+    }
+
+    @Test
+    fun workerOrderDoesNotChangeWhenOnlySeqChanges() {
+        // APP-L26: a re-issued bundle (new seq, same workers) must not reshuffle clients.
+        val base = parseConfig(clientConfigWithWorkers())
+        val reissued = base.copy(seq = base.seq + 1_000_000)
+        repeat(200) { index ->
+            val deviceId = "device-$index"
+            assertEquals(
+                PublicPlatformConfigParser.deterministicRouteOrder(base, deviceId),
+                PublicPlatformConfigParser.deterministicRouteOrder(reissued, deviceId),
+            )
+        }
+    }
+
+    @Test
     fun discoveryValidationTimeNeverRewindsBelowLocalClock() {
         assertEquals(5_000L, discoveryValidationNowMs(mirrorDateMs = 1_000L, localNowMs = 5_000L))
         assertEquals(9_000L, discoveryValidationNowMs(mirrorDateMs = 9_000L, localNowMs = 5_000L))
@@ -317,8 +477,8 @@ class PublicPlatformConfigTest {
             nowMs = 0,
         ).workers
 
-        val first = PublicPlatformConfigParser.deterministicWorkerOrder(workers, "device-a", 11)
-        val second = PublicPlatformConfigParser.deterministicWorkerOrder(workers, "device-a", 11)
+        val first = PublicPlatformConfigParser.deterministicWorkerOrder(workers, "device-a")
+        val second = PublicPlatformConfigParser.deterministicWorkerOrder(workers, "device-a")
         assertEquals(first, second)
         assertTrue(first.all { it.priority == 0 })
     }
@@ -336,7 +496,7 @@ class PublicPlatformConfigTest {
         var highWeightFirst = 0
         repeat(5_000) { index ->
             val first = PublicPlatformConfigParser
-                .deterministicWorkerOrder(workers, "device-$index", 17)
+                .deterministicWorkerOrder(workers, "device-$index")
                 .first()
             if (first.workerId == "heavy") highWeightFirst++
         }
@@ -563,18 +723,118 @@ class PublicPlatformConfigTest {
             socksListen = "127.0.0.1:18080",
         )
 
+        // Worker-supplied params.discovery_urls are not a sink source (APP-M20).
         assertEquals(
             listOf(
                 "http://awg-gw:8080/tw",
-                "https://worker.example/discovery",
                 "https://orch.dev/discovery",
             ),
             sinks.map { it.baseUrl },
         )
         assertEquals("127.0.0.1:18080", sinks[0].socksListen)
         assertEquals("", sinks[1].socksListen)
-        assertEquals("", sinks[2].socksListen)
         assertTrue(sinks.none { it.baseUrl.contains("netcloud", ignoreCase = true) })
+        assertTrue(sinks.none { it.baseUrl.contains("worker.example", ignoreCase = true) })
+    }
+
+    @Test
+    fun discoverySinksIgnoreWorkerDiscoveryUrlParams() {
+        val configJson = JSONObject(discoveryClientConfig())
+        val params = configJson.getJSONArray("workers").getJSONObject(0)
+            .getJSONArray("routes").getJSONObject(0).getJSONObject("params")
+        params.put("discovery_url", "https://attacker.example/d")
+        params.put("discovery_urls", org.json.JSONArray(listOf("https://attacker2.example/d", "http://attacker3.local/tw")))
+        val parsed = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = JSONObject()
+                .put("config_json", configJson.toString())
+                .put("minisig", "sig")
+                .toString(),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 0,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        val sinks = discoverySinks(
+            stored = StoredPublicPlatformState(
+                bootstrapRaw = bootstrapJson("2035-01-01T00:00:00Z"),
+                configPubkeyPin = PUBLIC_KEY,
+            ),
+            config = parsed,
+            socksListen = "127.0.0.1:18080",
+            nowMs = Instant.parse("2031-01-01T00:00:00Z").toEpochMilli(),
+        )
+
+        assertEquals(listOf("route-config-0", "orchestrator-direct"), sinks.map { it.name })
+        assertTrue(sinks.none { it.baseUrl.contains("attacker") })
+    }
+
+    @Test
+    fun discoveryNextSinksAndRescuePointersExpireWithSignedContainer() {
+        val parsed = PublicPlatformConfigParser.verifyAndParseClientConfig(
+            envelopeRaw = JSONObject()
+                .put("config_json", discoveryClientConfigWithRescue())
+                .put("minisig", "sig")
+                .toString(),
+            expectedPublicKey = PUBLIC_KEY,
+            maxSeenSeq = 0,
+            verifier = fakeVerifier(ok = true),
+            nowMs = 0,
+        )
+        val stored = StoredPublicPlatformState(
+            bootstrapRaw = bootstrapJson("2035-01-01T00:00:00Z"),
+            configPubkeyPin = PUBLIC_KEY,
+        )
+        val feedExpiresAt = Instant.parse("2031-01-01T00:00:00Z").toEpochMilli()
+        val rendezvous = StoredRendezvousState(
+            discoverySinks = listOf("https://next.example/discovery"),
+            discoverySinksSeq = 5,
+            discoverySinksExpiresAtMs = feedExpiresAt,
+        )
+        fun names(nowIso: String, state: StoredRendezvousState = rendezvous) = discoverySinks(
+            stored = stored,
+            config = parsed,
+            socksListen = "127.0.0.1:18080",
+            rendezvousState = state,
+            nowMs = Instant.parse(nowIso).toEpochMilli(),
+        ).map { it.name }
+
+        // Feed and client bundle (expires 2035) both valid.
+        assertTrue(names("2030-06-01T00:00:00Z").containsAll(listOf("signed-next-0", "rescue-pointer-0")))
+        // Feed expired: its next_sinks are gone, the bundle's rescue pointer stays.
+        val afterFeed = names("2031-01-01T00:00:00Z")
+        assertFalse(afterFeed.contains("signed-next-0"))
+        assertTrue(afterFeed.contains("rescue-pointer-0"))
+        // Client bundle expired too: rescue pointer gone; tunnel config_url and orchestrator remain.
+        val afterBundle = names("2035-01-01T00:00:00Z")
+        assertEquals(listOf("route-config-0", "orchestrator-direct"), afterBundle)
+        // Legacy persisted sinks without a recorded expiry stay usable until replaced.
+        assertTrue(
+            names("2034-01-01T00:00:00Z", StoredRendezvousState(discoverySinks = listOf("https://next.example/discovery")))
+                .contains("signed-next-0"),
+        )
+    }
+
+    @Test
+    fun rendezvousSinksFromNewerFeedAreAuthoritative() {
+        val current = StoredRendezvousState(
+            discoverySinks = listOf("https://old.example/discovery"),
+            discoverySinksSeq = 7,
+            discoverySinksExpiresAtMs = 1_000,
+        )
+        // Higher seq replaces, even with an empty list (operator withdrew the sink).
+        assertEquals(Triple(emptyList<String>(), 8L, 2_000L), mergeRendezvousSinks(current, 8, emptyList(), 2_000))
+        assertEquals(
+            Triple(listOf("https://new.example/discovery"), 8L, 2_000L),
+            mergeRendezvousSinks(current, 8, listOf("https://new.example/discovery"), 2_000),
+        )
+        // Same seq (re-fetched feed) keeps the stored list.
+        assertEquals(
+            Triple(listOf("https://old.example/discovery"), 7L, 1_000L),
+            mergeRendezvousSinks(current, 7, emptyList(), 1_500),
+        )
+        // Legacy state without seq/expiry is always replaced by a verified feed.
+        val legacy = StoredRendezvousState(discoverySinks = listOf("https://old.example/discovery"))
+        assertEquals(Triple(emptyList<String>(), 3L, 2_000L), mergeRendezvousSinks(legacy, 3, emptyList(), 2_000))
     }
 
     @Test
