@@ -41,6 +41,9 @@ internal fun applyConfirmedPublicReauth(context: Context, reason: String) {
     if (!DeploymentConfig.IS_PUBLIC_PLATFORM) return
     val appContext = context.applicationContext
     TransportRuntime.auth = reauthRequiredAuthState(TransportRuntime.auth)
+    // APP-M14: kept on disk, so a restore or config apply does not show the device as approved
+    // again; cleared by the next enrollment the orchestrator answers with an approval.
+    persistPublicReauthRequired(appContext, required = true)
     TransportRuntime.state = TransportRuntime.state.copy(
         handshakeEstablished = false,
         tunnelStable = false,

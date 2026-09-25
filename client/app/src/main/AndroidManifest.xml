@@ -12,6 +12,11 @@
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="tg" />
         </intent>
+        <!-- Split-tunnel app picker lists launchable apps (package visibility, API 30+). -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
     </queries>
 
     <uses-permission android:name="android.permission.INTERNET" />
@@ -54,6 +59,11 @@
                 <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
+        <!-- Only this app's own battery-hint notification can reach the hint (not exported). -->
+        <activity-alias
+            android:name=".BatteryHintActivity"
+            android:exported="false"
+            android:targetActivity=".MainActivity" />
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"

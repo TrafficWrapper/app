@@ -185,6 +185,14 @@ data class StoredPublicPlatformState(
      */
     val realityFlowPending: String = "",
     val realityFlowPendingKnown: Boolean = false,
+    /**
+     * A bootstrap the user imported, confirmed or refreshed that is not enrolled yet (APP-M12);
+     * [bootstrapRaw] stays the bootstrap of the last successful enrollment. Sealed like the rest
+     * of the state: no plain SharedPreferences copy is kept (APP-L20).
+     */
+    val pendingBootstrapRaw: String = "",
+    /** The orchestrator confirmed that this device needs approval again (APP-M14). */
+    val reauthRequired: Boolean = false,
 )
 
 internal fun publicPlatformStateToJson(state: StoredPublicPlatformState): JSONObject =
@@ -213,6 +221,8 @@ internal fun publicPlatformStateToJson(state: StoredPublicPlatformState): JSONOb
         .put(PPS_ENROLL_VERSION_CODE, state.enrollVersionCode)
         .put(PPS_REALITY_FLOW_PENDING, state.realityFlowPending)
         .put(PPS_REALITY_FLOW_PENDING_KNOWN, state.realityFlowPendingKnown)
+        .put(PPS_PENDING_BOOTSTRAP_RAW, state.pendingBootstrapRaw)
+        .put(PPS_REAUTH_REQUIRED, state.reauthRequired)
 
 /** Reads a stored public platform state; fields missing in older JSON keep their defaults. */
 internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatformState {
@@ -249,6 +259,8 @@ internal fun publicPlatformStateFromJson(root: JSONObject): StoredPublicPlatform
         enrollVersionCode = root.optLong(PPS_ENROLL_VERSION_CODE, 0),
         realityFlowPending = root.optString(PPS_REALITY_FLOW_PENDING),
         realityFlowPendingKnown = root.optBoolean(PPS_REALITY_FLOW_PENDING_KNOWN, false),
+        pendingBootstrapRaw = root.optString(PPS_PENDING_BOOTSTRAP_RAW),
+        reauthRequired = root.optBoolean(PPS_REAUTH_REQUIRED, false),
     )
 }
 
@@ -276,6 +288,8 @@ private const val PPS_REALITY_FLOW_KNOWN = "reality_flow_known"
 private const val PPS_ENROLL_VERSION_CODE = "enroll_version_code"
 private const val PPS_REALITY_FLOW_PENDING = "reality_flow_pending"
 private const val PPS_REALITY_FLOW_PENDING_KNOWN = "reality_flow_pending_known"
+private const val PPS_PENDING_BOOTSTRAP_RAW = "pending_bootstrap_raw"
+private const val PPS_REAUTH_REQUIRED = "reauth_required"
 
 data class StoredPublicAWGKeyPair(
     val privateKey: String,
