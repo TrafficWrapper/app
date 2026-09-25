@@ -10,7 +10,6 @@ import android.util.Base64
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
-import java.security.GeneralSecurityException
 import java.security.KeyStore
 import java.security.KeyPairGenerator
 import java.security.PrivateKey
@@ -350,6 +349,39 @@ internal fun resolvePublicAWGKeyPair(
     )
 }
 
+/** Why a sealed value could not be opened. */
+internal enum class SealedOpenFailure {
+    /** Sealed with another wrapping key (AEAD tag mismatch): the state is unreadable for good. */
+    FOREIGN_KEY,
+
+    /** The stored envelope itself is broken (not JSON, bad base64, bad IV). */
+    MALFORMED,
+
+    /** Anything else (Keystore/StrongBox busy or failing): retry, never reset. */
+    TRANSIENT,
+}
+
+internal fun classifySealedOpenFailure(error: Throwable): SealedOpenFailure {
+    var current: Throwable? = error
+    var depth = 0
+    while (current != null && depth < 8) {
+        if (current is javax.crypto.AEADBadTagException) return SealedOpenFailure.FOREIGN_KEY
+        if (current is android.security.keystore.KeyPermanentlyInvalidatedException) return SealedOpenFailure.FOREIGN_KEY
+        current = current.cause
+        depth++
+    }
+    return when (error) {
+        is org.json.JSONException,
+        is IllegalArgumentException,
+        is java.security.InvalidAlgorithmParameterException,
+        -> SealedOpenFailure.MALFORMED
+        else -> SealedOpenFailure.TRANSIENT
+    }
+}
+
+/** A sealed value exists but cannot be opened right now; the stored state is left untouched. */
+class SealedStateUnavailableException(message: String, cause: Throwable?) : IllegalStateException(message, cause)
+
 class SecureIdentityStore(context: Context) {
     private val appContext = context.applicationContext
     private val prefs: SharedPreferences =
@@ -431,7 +463,7 @@ class SecureIdentityStore(context: Context) {
         }
     }
 
-    fun signDeviceEnrollment(canonicalPayload: String): String {
+    fun signDeviceEnrollment(canonicalPayload: String): String = synchronized(LOCK) {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
         keyStore.load(null)
         val privateKey = keyStore.getKey(KEY_DEVICE_IDENTITY_ALIAS, null) as? PrivateKey
@@ -439,10 +471,11 @@ class SecureIdentityStore(context: Context) {
         val signature = Signature.getInstance(ECDSA_SHA256)
         signature.initSign(privateKey)
         signature.update(canonicalPayload.toByteArray(Charsets.UTF_8))
-        return Base64.encodeToString(signature.sign(), Base64.NO_WRAP)
+        Base64.encodeToString(signature.sign(), Base64.NO_WRAP)
     }
 
-    fun signTelemetry(canonical: String): String {
+    /** Serialized with every other Keystore/StrongBox use of the process (StrongBox is single-slot). */
+    fun signTelemetry(canonical: String): String = synchronized(LOCK) {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
         keyStore.load(null)
         val privateKey = keyStore.getKey(KEY_DEVICE_IDENTITY_ALIAS, null) as? PrivateKey
@@ -450,7 +483,7 @@ class SecureIdentityStore(context: Context) {
         val signature = Signature.getInstance(ECDSA_SHA256)
         signature.initSign(privateKey)
         signature.update(canonical.toByteArray(Charsets.UTF_8))
-        return Base64.encodeToString(signature.sign(), Base64.NO_WRAP)
+        Base64.encodeToString(signature.sign(), Base64.NO_WRAP)
     }
 
     fun deviceIdentityPublicKey(): String =
@@ -780,21 +813,39 @@ class SecureIdentityStore(context: Context) {
     }
 
     /**
-     * Opens a sealed value, logging instead of silently swallowing failures. A failure here
-     * almost always means the Keystore wrapping key is missing or different from the one that
-     * sealed the value (for example after a device-to-device transfer restored the prefs but not
-     * the non-exportable Keystore key), in which case callers fall back to a fresh state.
+     * Opens a sealed value. Returns null only when the value can never be opened: it was sealed
+     * with another (foreign or lost) wrapping key (AEAD tag mismatch) or it is malformed; callers
+     * then fall back to a fresh state. Any other failure (a transient Keystore/StrongBox error) is
+     * retried and then thrown as [SealedStateUnavailableException], so real state is never
+     * replaced because of a hiccup.
      */
-    private fun openOrNull(sealed: String, key: SecretKey, label: String): String? =
-        try {
-            open(sealed, key)
-        } catch (error: GeneralSecurityException) {
-            Log.e(TAG, "failed to decrypt $label: wrapping key missing or foreign; state will be reset", error)
-            null
-        } catch (error: Exception) {
-            Log.e(TAG, "failed to open sealed $label", error)
-            null
+    private fun openOrNull(sealed: String, key: SecretKey, label: String): String? {
+        var lastError: Throwable? = null
+        repeat(SEALED_OPEN_ATTEMPTS) { attempt ->
+            try {
+                return open(sealed, key)
+            } catch (error: Exception) {
+                when (classifySealedOpenFailure(error)) {
+                    SealedOpenFailure.FOREIGN_KEY -> {
+                        Log.e(TAG, "failed to decrypt $label: wrapping key missing or foreign; state will be reset", error)
+                        return null
+                    }
+                    SealedOpenFailure.MALFORMED -> {
+                        Log.e(TAG, "sealed $label is malformed; state will be reset", error)
+                        return null
+                    }
+                    SealedOpenFailure.TRANSIENT -> {
+                        lastError = error
+                        Log.w(TAG, "transient failure opening $label (attempt ${attempt + 1}): ${error.javaClass.simpleName}")
+                        if (attempt + 1 < SEALED_OPEN_ATTEMPTS) {
+                            Thread.sleep(SEALED_OPEN_RETRY_DELAY_MS * (attempt + 1))
+                        }
+                    }
+                }
+            }
         }
+        throw SealedStateUnavailableException("sealed $label is temporarily unavailable", lastError)
+    }
 
     private fun seal(plain: String, key: SecretKey): String {
         val cipher = Cipher.getInstance(AES_GCM)
@@ -849,6 +900,8 @@ class SecureIdentityStore(context: Context) {
         private const val EC_P256 = "secp256r1"
         private const val DEVICE_IDENTITY_TYPE = "ecdsa-p256-sha256"
         private const val GCM_TAG_BITS = 128
+        private const val SEALED_OPEN_ATTEMPTS = 3
+        private const val SEALED_OPEN_RETRY_DELAY_MS = 150L
         private const val SESSION_TOKEN_BYTES = 32
 
         private const val JSON_OK = "ok"
