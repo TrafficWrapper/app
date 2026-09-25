@@ -24,6 +24,15 @@ require_env TW_RELEASE_KEY_ALIAS
 require_env TW_RELEASE_STORE_PASSWORD
 require_env TW_RELEASE_KEY_PASSWORD
 require_env TW_PUBLIC_SIGNING_CERT_SHA256
+# Release builds must state their version explicitly: a hardcoded fallback here once
+# disagreed with the Gradle default and could publish an out-of-sequence versionCode.
+require_env TW_VERSION_CODE
+require_env TW_VERSION_NAME
+
+if [[ ! "${TW_VERSION_CODE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TW_VERSION_CODE must be a positive integer: ${TW_VERSION_CODE}" >&2
+  exit 2
+fi
 
 # The pin is compiled into BuildConfig and compared byte-for-byte with the digest of the APK
 # signing certificate, so accept the keytool form (colons, upper case) but always pass the
@@ -62,8 +71,8 @@ docker run --rm \
   -v "${GRADLE_CACHE}:/gradle-cache" \
   -e GRADLE_USER_HOME=/gradle-cache \
   -e TW_APPLICATION_ID="${TW_APPLICATION_ID:-org.trafficwrapper.app}" \
-  -e TW_VERSION_CODE="${TW_VERSION_CODE:-1001}" \
-  -e TW_VERSION_NAME="${TW_VERSION_NAME:-public-1.0.0}" \
+  -e TW_VERSION_CODE \
+  -e TW_VERSION_NAME \
   -e TW_PUBLIC_SIGNING_CERT_SHA256 \
   -w /workspace/client \
   "${IMAGE_NAME}" \
