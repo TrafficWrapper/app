@@ -83,7 +83,7 @@ private class LocalSocksSocket(
         val previousTimeout = soTimeout
         try {
             if (timeout > 0) soTimeout = timeout
-            socks5Connect(super.getInputStream(), super.getOutputStream(), targetHost, target.port, credentials())
+            socks5Connect(super.getInputStream(), super.getOutputStream(), targetHost, target.port, credentials(), peerPort = proxyPort)
         } catch (error: Throwable) {
             runCatching { close() }
             throw error
@@ -103,11 +103,12 @@ internal fun socks5Connect(
     host: String,
     port: Int,
     credentials: SocksCredentials?,
+    peerPort: Int = 0,
 ) {
     require(port in 1..65535) { "invalid port $port" }
     val hostBytes = host.toByteArray(Charsets.UTF_8)
     require(hostBytes.size in 1..255) { "invalid host length" }
-    Socks5Auth.negotiateClient(input, output, credentials)
+    Socks5Auth.negotiateClient(input, output, credentials, peerPort = peerPort)
     output.write(byteArrayOf(Socks5Auth.VERSION.toByte(), SOCKS_CMD_CONNECT, 0x00, SOCKS_ATYP_DOMAIN, hostBytes.size.toByte()))
     output.write(hostBytes)
     output.write(byteArrayOf(((port ushr 8) and 0xff).toByte(), (port and 0xff).toByte()))

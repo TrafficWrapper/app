@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="update_error_apk_identity">The update APK does not match the manifest (package or version)</string>
+    <string name="update_install_confirm_notification">Tap to confirm the update installation</string>
+</resources>

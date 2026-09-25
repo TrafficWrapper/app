@@ -3,8 +3,6 @@ package transport
 import (
 	"reflect"
 	"testing"
-
-	awgdialect "github.com/TrafficWrapper/app/core/awg/dialect"
 )
 
 // Contract tests for slot-aware discovery (X-M6): feed entries are matched to
@@ -28,7 +26,7 @@ func slotAWGEntry(priority int, workerID, egressIP, endpoint string) map[string]
 		"endpoint":          endpoint,
 		"egress_ip":         egressIP,
 		"server_public_key": testDiscoveredServerKey,
-		"awg_preset":        awgdialect.Compat(),
+		"awg_preset":        testWidePreset(),
 	}
 	if workerID != "" {
 		entry["worker_id"] = workerID
@@ -64,6 +62,11 @@ func provisionSlots(t *testing.T, awgRU, awg *publicRouteSpec) {
 	t.Helper()
 	setPendingProvision(t, "", "") // restores the previous state on cleanup
 	req := testPublicApplyRequest()
+	for _, route := range []*publicRouteSpec{awgRU, awg} {
+		if route != nil && len(route.AWGPreset) == 0 {
+			route.AWGPreset = testBasePresetRaw()
+		}
+	}
 	req.AWGRU, req.AWG = awgRU, awg
 	if _, err := applyPublicPlatformConfig(req); err != nil {
 		t.Fatal(err)

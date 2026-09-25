@@ -59,7 +59,7 @@
     <string name="update_notification_ready">Update APK downloaded and verified</string>
     <string name="local_proxy_auth_title">Local proxy password</string>
     <string name="local_proxy_auth_switch">Require a password for the local proxy</string>
-    <string name="local_proxy_auth_description">Other apps on the device cannot use or detect the tunnel without the username and password. Disabled by default.</string>
+    <string name="local_proxy_auth_description">Other apps on the device cannot use the tunnel through the local proxy without the username and password. This does not hide that a local proxy is running.</string>
     <string name="local_proxy_auth_username">Username</string>
     <string name="local_proxy_auth_password">Password</string>
     <string name="local_proxy_auth_regenerate">Generate a new password</string>

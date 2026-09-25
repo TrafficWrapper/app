@@ -29,7 +29,7 @@ if [[ ! -f "${TW_UPDATE_MANIFEST_KEY}" ]]; then
 fi
 
 APK_ABS="$(cd "$(dirname "${APK_PATH}")" && pwd)/$(basename "${APK_PATH}")"
-APK_REL="${APK_ABS#${REPO_ROOT}/}"
+APK_REL="${APK_ABS#"${REPO_ROOT}"/}"
 if [[ "${APK_REL}" == "${APK_ABS}" ]]; then
   echo "APK must be inside repo for aapt docker mount: ${APK_ABS}" >&2
   exit 2
@@ -56,6 +56,36 @@ if [[ -z "${VERSION_CODE}" || -z "${VERSION_NAME}" ]]; then
   exit 1
 fi
 
+PACKAGE_NAME="$(printf '%s\n' "${PACKAGE_LINE}" | sed -n "s/^name='\([^']*\)'.*/\1/p")"
+if [[ -n "${TW_APPLICATION_ID:-}" && "${PACKAGE_NAME}" != "${TW_APPLICATION_ID}" ]]; then
+  echo "APK package ${PACKAGE_NAME} does not match TW_APPLICATION_ID ${TW_APPLICATION_ID}" >&2
+  exit 1
+fi
+
+# The manifest pin must be the canonical digest of the certificate that actually signed the APK
+# (64 lower-case hex chars): a keytool-style value with colons would make every client reject it.
+normalize_cert_sha256() {
+  printf '%s' "$1" | tr -d ':[:space:]' | tr 'A-F' 'a-f'
+}
+SIGNING_CERT_SHA256="$(normalize_cert_sha256 "${TW_PUBLIC_SIGNING_CERT_SHA256}")"
+if [[ ! "${SIGNING_CERT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "TW_PUBLIC_SIGNING_CERT_SHA256 must be a SHA-256 digest (64 hex chars)" >&2
+  exit 2
+fi
+APK_CERT_SHA256="$(
+  docker run --rm \
+    -v "${REPO_ROOT}:/workspace:ro" \
+    -w /workspace \
+    "${ANDROID_IMAGE}" \
+    apksigner verify --print-certs "/workspace/${APK_REL}" \
+    | sed -n 's/^Signer #1 certificate SHA-256 digest: *//Ip' | head -1
+)"
+APK_CERT_SHA256="$(normalize_cert_sha256 "${APK_CERT_SHA256}")"
+if [[ "${APK_CERT_SHA256}" != "${SIGNING_CERT_SHA256}" ]]; then
+  echo "APK signing certificate SHA-256 '${APK_CERT_SHA256}' does not match TW_PUBLIC_SIGNING_CERT_SHA256 '${SIGNING_CERT_SHA256}'" >&2
+  exit 1
+fi
+
 APK_NAME="app-public-${VERSION_CODE}.apk"
 RELEASE_DIR="${OUT_DIR}/${VERSION_CODE}"
 mkdir -p "${RELEASE_DIR}"
@@ -75,7 +105,7 @@ SEQ="${TW_UPDATE_SEQ:-${VERSION_CODE}}"
 
 python3 - "${MANIFEST_PATH}" \
   "${SEQ}" "${VERSION_CODE}" "${VERSION_NAME}" "${APK_NAME}" "${APK_SIZE}" "${APK_SHA256}" \
-  "${TW_PUBLIC_SIGNING_CERT_SHA256}" "${MIN_VERSION}" "${MANDATORY}" "${NOTES}" "${ISSUED_AT}" "${EXPIRES_AT}" <<'PY'
+  "${SIGNING_CERT_SHA256}" "${MIN_VERSION}" "${MANDATORY}" "${NOTES}" "${ISSUED_AT}" "${EXPIRES_AT}" <<'PY'
 import json
 import sys
 

@@ -1,6 +1,6 @@
-FROM golang:1.24-bookworm AS go-toolchain
+FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS go-toolchain
 
-FROM eclipse-temurin:17-jdk-jammy
+FROM eclipse-temurin:17-jdk-jammy@sha256:51d32af96fb8a13ffbc96c719d7b05447a04ca69f314627d64050a64ecd13057
 
 ARG ANDROID_CMDLINE_TOOLS_ZIP=commandlinetools-linux-14742923_latest.zip
 ARG ANDROID_CMDLINE_TOOLS_SHA1=48833c34b761c10cb20bcd16582129395d121b27

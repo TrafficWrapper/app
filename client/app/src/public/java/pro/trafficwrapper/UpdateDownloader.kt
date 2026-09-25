@@ -11,6 +11,61 @@ import java.net.URI
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
+private val UPDATE_CACHE_FILE_PATTERN = Regex("""^app-release-(\d+)\.apk(\.part|\.etag)?$""")
+
+/**
+ * APP-L32: files of the update cache that can be deleted. APKs and partial downloads of versions
+ * that are already installed (<= [installedVersionCode]) are useless; partial downloads (.part /
+ * .etag) of any version other than the one being downloaded ([targetVersionCode]) are superseded.
+ */
+internal fun staleUpdateCacheFileNames(
+    names: Collection<String>,
+    installedVersionCode: Long,
+    targetVersionCode: Long? = null,
+): List<String> =
+    names.filter { name ->
+        val match = UPDATE_CACHE_FILE_PATTERN.matchEntire(name) ?: return@filter false
+        val versionCode = match.groupValues[1].toLongOrNull() ?: return@filter false
+        val partial = match.groupValues[2].isNotEmpty()
+        versionCode <= installedVersionCode ||
+            (partial && targetVersionCode != null && versionCode != targetVersionCode)
+    }
+
+internal fun pruneUpdateCache(dir: File, installedVersionCode: Long, targetVersionCode: Long? = null) {
+    val names = dir.list()?.toList() ?: return
+    staleUpdateCacheFileNames(names, installedVersionCode, targetVersionCode).forEach { name ->
+        if (!File(dir, name).delete()) {
+            Log.w("TWPublicUpdate", "public update cache cleanup could not delete $name")
+        }
+    }
+}
+
+/**
+ * APP-L33: a partial download is keyed by the APK identity pinned by the signed manifest
+ * (sha256 + size), not by the URL or ETag of the worker that served it, so failover to another
+ * worker resumes instead of starting over. The final SHA-256 check still guards the bytes.
+ */
+internal fun updatePartialMetadataText(sha256: String, apkSize: Long): String =
+    "sha256=${sha256.trim().lowercase()}\nsize=$apkSize\n"
+
+internal fun updatePartialMetadataMatches(metadataText: String?, sha256: String, apkSize: Long): Boolean {
+    if (metadataText.isNullOrBlank() || sha256.isBlank()) return false
+    val values = metadataText.lines().mapNotNull { line ->
+        val separator = line.indexOf('=')
+        if (separator <= 0) null else line.substring(0, separator) to line.substring(separator + 1).trim()
+    }.toMap()
+    return values["sha256"]?.equals(sha256.trim(), ignoreCase = true) == true &&
+        values["size"]?.toLongOrNull() == apkSize
+}
+
+/**
+ * APP-L31: a SHA-256 mismatch of a complete download is deterministic for this endpoint (it
+ * serves different bytes than the signed manifest pins), so retrying it only re-downloads the
+ * full APK; the caller moves on to the next endpoint instead.
+ */
+internal fun updateDownloadErrorIsTerminal(error: Throwable): Boolean =
+    error is UpdateVerificationException && error.textRes == R.string.update_error_apk_hash
+
 class UpdateDownloader(
     private val socksListen: String,
     private val baseUrl: String = UPDATE_AWG_BASE_URL,
@@ -28,6 +83,7 @@ class UpdateDownloader(
         onProgress: (downloadedBytes: Long, totalBytes: Long) -> Unit = { _, _ -> },
     ): File {
         outputDir.mkdirs()
+        runCatching { pruneUpdateCache(outputDir, BuildConfig.VERSION_CODE.toLong(), manifest.versionCode) }
         val finalFile = File(outputDir, "app-release-${manifest.versionCode}.apk")
         val partFile = File(outputDir, finalFile.name + ".part")
         val etagFile = File(outputDir, finalFile.name + ".etag")
@@ -47,9 +103,8 @@ class UpdateDownloader(
         var lastError: Throwable? = null
         for (attempt in 0 until MAX_DOWNLOAD_ATTEMPTS) {
             try {
-                val head = head(apkUrl)
-                preparePartial(partFile, etagFile, manifest, apkUrl, head.etag)
-                writePartialMetadata(etagFile, manifest, apkUrl, head.etag)
+                preparePartial(partFile, etagFile, manifest)
+                etagFile.writeText(updatePartialMetadataText(manifest.sha256, manifest.apkSize))
                 val resumeFrom = partFile.takeIf { it.exists() }?.length() ?: 0L
                 onProgress(resumeFrom, manifest.apkSize)
                 if (resumeFrom == manifest.apkSize) {
@@ -62,6 +117,7 @@ class UpdateDownloader(
                 throw UpdateVerificationException(R.string.update_error_download)
             } catch (error: Throwable) {
                 lastError = error
+                if (updateDownloadErrorIsTerminal(error)) throw error
                 if (attempt == MAX_DOWNLOAD_ATTEMPTS - 1) break
                 sleepBeforeRetry(attempt)
             }
@@ -140,6 +196,7 @@ class UpdateDownloader(
             etagFile.delete()
             throw UpdateVerificationException(R.string.update_error_download)
         }
+        etagFile.delete()
         onProgress(finalFile.length(), manifest.apkSize)
         return finalFile
     }
@@ -148,71 +205,16 @@ class UpdateDownloader(
         partFile: File,
         metadataFile: File,
         manifest: UpdateManifest,
-        apkUrl: String,
-        etag: String?,
     ) {
         if (!partFile.exists()) return
+        val metadata = if (metadataFile.exists()) runCatching { metadataFile.readText() }.getOrNull() else null
         if (
             partFile.length() > manifest.apkSize ||
-            !partialMetadataMatches(metadataFile, manifest, apkUrl, etag)
+            !updatePartialMetadataMatches(metadata, manifest.sha256, manifest.apkSize)
         ) {
             partFile.delete()
             metadataFile.delete()
         }
-    }
-
-    private fun partialMetadataMatches(
-        metadataFile: File,
-        manifest: UpdateManifest,
-        apkUrl: String,
-        etag: String?,
-    ): Boolean {
-        val metadata = readPartialMetadata(metadataFile) ?: return false
-        if (metadata.legacyEtagOnly) {
-            return etag != null && metadata.etag == etag
-        }
-        return metadata.apkUrl == apkUrl &&
-            metadata.sha256.equals(manifest.sha256, ignoreCase = true) &&
-            metadata.apkSize == manifest.apkSize &&
-            (etag == null || metadata.etag == etag)
-    }
-
-    private fun readPartialMetadata(metadataFile: File): PartialMetadata? {
-        if (!metadataFile.exists()) return null
-        val lines = runCatching { metadataFile.readLines() }.getOrNull() ?: return null
-        if (lines.size == 1 && !lines[0].contains("=")) {
-            return PartialMetadata(etag = lines[0], legacyEtagOnly = true)
-        }
-        val values = lines.mapNotNull { line ->
-            val separator = line.indexOf('=')
-            if (separator <= 0) {
-                null
-            } else {
-                line.substring(0, separator) to line.substring(separator + 1)
-            }
-        }.toMap()
-        return PartialMetadata(
-            apkUrl = values["url"],
-            sha256 = values["sha256"],
-            apkSize = values["size"]?.toLongOrNull(),
-            etag = values["etag"]?.ifBlank { null },
-        )
-    }
-
-    private fun writePartialMetadata(
-        metadataFile: File,
-        manifest: UpdateManifest,
-        apkUrl: String,
-        etag: String?,
-    ) {
-        metadataFile.writeText(
-            buildString {
-                append("url=").append(apkUrl).append('\n')
-                append("sha256=").append(manifest.sha256).append('\n')
-                append("size=").append(manifest.apkSize).append('\n')
-                append("etag=").append(etag.orEmpty()).append('\n')
-            },
-        )
     }
 
     private fun sleepBeforeRetry(attempt: Int) {
@@ -239,15 +241,6 @@ class UpdateDownloader(
                 .getOrNull()
                 ?.equals(expectedSha256.trim(), ignoreCase = true) == true
 
-    private fun head(url: String): HeadMetadata {
-        openHttp(url, "HEAD", maxBodyBytes = 0).use { response ->
-            if (!response.isSuccessful) {
-                throw UpdateVerificationException(R.string.update_error_download)
-            }
-            return HeadMetadata(response.headers["etag"])
-        }
-    }
-
     private fun updateUrl(fileName: String): String =
         baseUrl.trimEnd('/') + "/" + fileName
 
@@ -257,8 +250,6 @@ class UpdateDownloader(
         }
         return updateApkDownloadUrl(baseUrl, apkName, manifest.versionCode)
     }
-
-    private data class HeadMetadata(val etag: String?)
 
     private data class HttpResponse(
         val code: Int,
@@ -276,14 +267,6 @@ class UpdateDownloader(
             runCatching { socket?.close() }
         }
     }
-
-    private data class PartialMetadata(
-        val apkUrl: String? = null,
-        val sha256: String? = null,
-        val apkSize: Long? = null,
-        val etag: String? = null,
-        val legacyEtagOnly: Boolean = false,
-    )
 
     private companion object {
         private const val HTTP_OK = 200
@@ -393,6 +376,7 @@ class UpdateDownloader(
                 host = targetHost,
                 port = targetPort,
                 credentials = LocalSocksAuth.internal,
+                peerPort = proxyPort,
             )
             return socket
         } catch (error: Throwable) {

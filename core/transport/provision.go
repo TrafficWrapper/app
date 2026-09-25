@@ -99,8 +99,11 @@ type provisionAPIResult struct {
 	WGPrivateKeySent   bool                           `json:"wg_private_key_sent"`
 	WorkingKeysInGoRAM bool                           `json:"working_keys_in_go_ram,omitempty"`
 	AWGRUConfigStored  bool                           `json:"awg_ru_config_stored,omitempty"`
-	AWGKeyMismatch     bool                           `json:"awg_key_mismatch,omitempty"`
-	AWGRUKeyMismatch   bool                           `json:"awgru_key_mismatch,omitempty"`
+	// AWGRejected lists AWG configs not stored because their dialect is not
+	// a production dialect (the previous stored config is kept).
+	AWGRejected      []awgRouteRejection `json:"awg_rejected,omitempty"`
+	AWGKeyMismatch   bool                `json:"awg_key_mismatch,omitempty"`
+	AWGRUKeyMismatch bool                `json:"awgru_key_mismatch,omitempty"`
 }
 
 // GenerateIdentity returns a fresh Noise_IK identity keypair for the platform
@@ -239,6 +242,13 @@ func deviceEnroll(req deviceEnrollAPIRequest) (provisionAPIResult, error) {
 	if resp.Status != "approved" || resp.InternalIP == "" || resp.Endpoint == "" || resp.ServerPublicKey == "" || resp.PSK2 == "" {
 		return result, nil
 	}
+	return storeApprovedEnrollment(req, resp, result, wgPrivate, awgRUPrivate)
+}
+
+// storeApprovedEnrollment validates an approved enrollment response and keeps
+// its AWG configs in Go RAM. An AWG config whose dialect is not a production
+// dialect is skipped and reported instead of failing the enrollment.
+func storeApprovedEnrollment(req deviceEnrollAPIRequest, resp provisionclient.Response, result provisionAPIResult, wgPrivate, awgRUPrivate string) (provisionAPIResult, error) {
 	if err := checkExpectedServerKeys(req, resp); err != nil {
 		return err.result, err
 	}
@@ -257,17 +267,22 @@ func deviceEnroll(req deviceEnrollAPIRequest) (provisionAPIResult, error) {
 		DNSServers:      req.DNSServers,
 	}
 	configJSON, err := validatedConfigJSON(cfg)
-	if err != nil {
+	switch {
+	case err == nil:
+		pendingProvision.Lock()
+		pendingProvision.configJSON = configJSON
+		pendingProvision.configMeta = provisionedConfigMeta{}
+		pendingProvision.awgRUConfigJSON = ""
+		pendingProvision.awgRUConfigMeta = provisionedConfigMeta{}
+		pendingProvision.Unlock()
+		result.ConfigStored = true
+		result.WorkingKeysInGoRAM = true
+	case errors.Is(err, errNonProductionDialect):
+		log.Printf("transport: provisioned awg config skipped: %v", err)
+		result.AWGRejected = append(result.AWGRejected, awgRouteRejection{Route: "awg", Reason: err.Error()})
+	default:
 		return provisionAPIResult{}, err
 	}
-	pendingProvision.Lock()
-	pendingProvision.configJSON = configJSON
-	pendingProvision.configMeta = provisionedConfigMeta{}
-	pendingProvision.awgRUConfigJSON = ""
-	pendingProvision.awgRUConfigMeta = provisionedConfigMeta{}
-	pendingProvision.Unlock()
-	result.ConfigStored = true
-	result.WorkingKeysInGoRAM = true
 	if resp.AWGRU != nil && resp.AWGRU.InternalIP != "" && resp.AWGRU.Endpoint != "" && resp.AWGRU.ServerPublicKey != "" && resp.AWGRU.PSK2 != "" {
 		if awgRUPrivate == "" {
 			return provisionAPIResult{}, errors.New("approved awg-ru response requires request_keys")
@@ -284,14 +299,19 @@ func deviceEnroll(req deviceEnrollAPIRequest) (provisionAPIResult, error) {
 			DNSServers:      req.DNSServers,
 		}
 		configJSON, err := validatedConfigJSON(cfg)
-		if err != nil {
+		switch {
+		case err == nil:
+			pendingProvision.Lock()
+			pendingProvision.awgRUConfigJSON = configJSON
+			pendingProvision.awgRUConfigMeta = provisionedConfigMeta{}
+			pendingProvision.Unlock()
+			result.AWGRUConfigStored = true
+		case errors.Is(err, errNonProductionDialect):
+			log.Printf("transport: provisioned awg-ru config skipped: %v", err)
+			result.AWGRejected = append(result.AWGRejected, awgRouteRejection{Route: "awg_ru", Reason: err.Error()})
+		default:
 			return provisionAPIResult{}, err
 		}
-		pendingProvision.Lock()
-		pendingProvision.awgRUConfigJSON = configJSON
-		pendingProvision.awgRUConfigMeta = provisionedConfigMeta{}
-		pendingProvision.Unlock()
-		result.AWGRUConfigStored = true
 	}
 	return result, nil
 }

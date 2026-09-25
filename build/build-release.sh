@@ -24,6 +24,29 @@ require_env TW_RELEASE_KEY_ALIAS
 require_env TW_RELEASE_STORE_PASSWORD
 require_env TW_RELEASE_KEY_PASSWORD
 require_env TW_PUBLIC_SIGNING_CERT_SHA256
+# Release builds must state their version explicitly: a hardcoded fallback here once
+# disagreed with the Gradle default and could publish an out-of-sequence versionCode.
+require_env TW_VERSION_CODE
+require_env TW_VERSION_NAME
+
+if [[ ! "${TW_VERSION_CODE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TW_VERSION_CODE must be a positive integer: ${TW_VERSION_CODE}" >&2
+  exit 2
+fi
+
+# The pin is compiled into BuildConfig and compared byte-for-byte with the digest of the APK
+# signing certificate, so accept the keytool form (colons, upper case) but always pass the
+# canonical form (64 lower-case hex chars) to the build.
+normalize_cert_sha256() {
+  printf '%s' "$1" | tr -d ':[:space:]' | tr 'A-F' 'a-f'
+}
+
+TW_PUBLIC_SIGNING_CERT_SHA256="$(normalize_cert_sha256 "${TW_PUBLIC_SIGNING_CERT_SHA256}")"
+if [[ ! "${TW_PUBLIC_SIGNING_CERT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "TW_PUBLIC_SIGNING_CERT_SHA256 must be a SHA-256 digest (64 hex chars)" >&2
+  exit 2
+fi
+export TW_PUBLIC_SIGNING_CERT_SHA256
 
 if [[ ! -f "${TW_RELEASE_KEYSTORE}" ]]; then
   echo "release keystore not found: ${TW_RELEASE_KEYSTORE}" >&2
@@ -48,8 +71,8 @@ docker run --rm \
   -v "${GRADLE_CACHE}:/gradle-cache" \
   -e GRADLE_USER_HOME=/gradle-cache \
   -e TW_APPLICATION_ID="${TW_APPLICATION_ID:-org.trafficwrapper.app}" \
-  -e TW_VERSION_CODE="${TW_VERSION_CODE:-1001}" \
-  -e TW_VERSION_NAME="${TW_VERSION_NAME:-public-1.0.0}" \
+  -e TW_VERSION_CODE \
+  -e TW_VERSION_NAME \
   -e TW_PUBLIC_SIGNING_CERT_SHA256 \
   -w /workspace/client \
   "${IMAGE_NAME}" \
@@ -95,7 +118,20 @@ if [[ ! -f "${SIGNED_APK}" ]]; then
   exit 1
 fi
 
+ACTUAL_CERT_SHA256="$(
+  sed -n 's/^Signer #1 certificate SHA-256 digest: *//Ip' "${VERIFY_LOG}" | head -1
+)"
+ACTUAL_CERT_SHA256="$(normalize_cert_sha256 "${ACTUAL_CERT_SHA256}")"
+if [[ ! "${ACTUAL_CERT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "could not read the signing certificate digest from ${VERIFY_LOG}" >&2
+  exit 1
+fi
+if [[ "${ACTUAL_CERT_SHA256}" != "${TW_PUBLIC_SIGNING_CERT_SHA256}" ]]; then
+  echo "signing certificate SHA-256 ${ACTUAL_CERT_SHA256} does not match TW_PUBLIC_SIGNING_CERT_SHA256 ${TW_PUBLIC_SIGNING_CERT_SHA256}" >&2
+  echo "the built APK would reject its own self-updates; refusing to publish it" >&2
+  exit 1
+fi
+
 echo "release_apk=${SIGNED_APK}"
 ls -lh "${SIGNED_APK}"
-echo "certificate_sha256:"
-grep -i "Signer #1 certificate SHA-256 digest" "${VERIFY_LOG}" || true
+echo "certificate_sha256=${ACTUAL_CERT_SHA256}"

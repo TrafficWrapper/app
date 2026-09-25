@@ -108,16 +108,43 @@ func parseConfig(configJSON string) (normalizedConfig, error) {
 	if !prefix.Addr().Is4() {
 		return normalizedConfig{}, fmt.Errorf("internal_ip must be IPv4, got %s", cfg.InternalIP)
 	}
-	cfg.DNSServers = effectiveDNSServerStrings(cfg.DNSServers)
-	dns := make([]netip.Addr, 0, len(cfg.DNSServers))
-	for _, value := range cfg.DNSServers {
+	dnsStrings, dns, err := netstackDNSServers(cfg.DNSServers)
+	if err != nil {
+		return normalizedConfig{}, err
+	}
+	cfg.DNSServers = dnsStrings
+	return normalizedConfig{config: cfg, localAddr: prefix.Addr(), dnsServers: dns}, nil
+}
+
+// netstackDNSServers returns the DNS servers the IPv4-only netstack can
+// reach. Entries must be IP literals; IPv4-mapped IPv6 addresses are unmapped
+// and other IPv6 servers are dropped. When no IPv4 server remains, the
+// defaults are used rather than failing the config: a config that lists only
+// IPv6 resolvers was accepted before and must keep starting, it just could
+// never resolve names through them.
+func netstackDNSServers(values []string) ([]string, []netip.Addr, error) {
+	values = effectiveDNSServerStrings(values)
+	outStrings := make([]string, 0, len(values))
+	out := make([]netip.Addr, 0, len(values))
+	for _, value := range values {
 		addr, err := netip.ParseAddr(strings.TrimSpace(value))
 		if err != nil {
-			return normalizedConfig{}, fmt.Errorf("dns server %q: %w", value, err)
+			return nil, nil, fmt.Errorf("dns server %q: %w", value, err)
 		}
-		dns = append(dns, addr)
+		addr = addr.Unmap()
+		if !addr.Is4() {
+			continue
+		}
+		outStrings = append(outStrings, addr.String())
+		out = append(out, addr)
 	}
-	return normalizedConfig{config: cfg, localAddr: prefix.Addr(), dnsServers: dns}, nil
+	if len(out) == 0 {
+		for _, value := range defaultDNSServers {
+			out = append(out, netip.MustParseAddr(value))
+		}
+		outStrings = append(outStrings, defaultDNSServers...)
+	}
+	return outStrings, out, nil
 }
 
 func effectiveDNSServerStrings(values []string) []string {
@@ -134,7 +161,11 @@ func effectiveDNSServerStrings(values []string) []string {
 }
 
 func validatedConfigJSON(cfg config) (string, error) {
-	cfg.DNSServers = effectiveDNSServerStrings(cfg.DNSServers)
+	dnsServers, _, err := netstackDNSServers(cfg.DNSServers)
+	if err != nil {
+		return "", err
+	}
+	cfg.DNSServers = dnsServers
 	raw, err := json.Marshal(cfg)
 	if err != nil {
 		return "", err
@@ -177,8 +208,30 @@ func normalizeEndpoint(endpoint string) (string, error) {
 	return "", fmt.Errorf("endpoint host %q must be an IP literal; refusing system DNS lookup", host)
 }
 
+// validatePreset applies the production dialect policy to the AWG preset.
+// Every config reaching the core comes from the server (enrollment, signed
+// client config or rendezvous feed), and workers only ever issue production
+// dialects, so the Compat (plain WireGuard) profile is refused here instead
+// of producing a tunnel that could never complete a handshake.
+//
+// Failures wrap errNonProductionDialect so server-config callers can skip
+// the one AWG route instead of failing the whole apply.
 func validatePreset(p preset, mtu int) error {
-	return awgdialect.Validate(p, mtu)
+	if err := awgdialect.ValidateProduction(p, mtu); err != nil {
+		return fmt.Errorf("%w: %v", errNonProductionDialect, err)
+	}
+	return nil
+}
+
+// errNonProductionDialect marks an AWG dialect that is missing, the Compat
+// profile or outside the production bounds.
+var errNonProductionDialect = errors.New("awg dialect is not a production dialect")
+
+// awgRouteRejection reports an AWG route that was skipped because of its
+// dialect; the rest of the config is still applied.
+type awgRouteRejection struct {
+	Route  string `json:"route"`
+	Reason string `json:"reason"`
 }
 
 func base64KeyToHex(value string) (string, error) {

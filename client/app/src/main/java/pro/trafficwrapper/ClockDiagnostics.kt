@@ -3,7 +3,9 @@ package pro.trafficwrapper
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import android.content.Context
 import android.os.SystemClock
+import android.provider.Settings
 import kotlin.math.abs
 import kotlin.math.roundToLong
 
@@ -19,7 +21,89 @@ data class TrustedTimeResult(
     val sntpAvailable: Boolean,
 )
 
+/**
+ * Identifies the current boot so a persisted (wall, elapsedRealtime) anchor is never extrapolated
+ * across a reboot: elapsedRealtime restarts from zero, so an anchor from a previous boot would
+ * otherwise be read with a wrong monotonic delta whenever the new uptime exceeds the stored one.
+ * [bootCount] is Settings.Global.BOOT_COUNT (-1 when unavailable); [bootWallMs] is
+ * currentTimeMillis - elapsedRealtime, the fallback when the counter cannot be read.
+ */
+data class BootIdentity(
+    val bootCount: Int,
+    val bootWallMs: Long,
+)
+
+/** A trusted-time anchor: signed wall time observed at [elapsedRealtimeMs] during boot [boot]. */
+data class TrustedTimeAnchor(
+    val wallTimeMs: Long,
+    val elapsedRealtimeMs: Long,
+    val boot: BootIdentity,
+)
+
+/** Max distance between boot wall-clock estimates still treated as the same boot (no counter). */
+internal const val TRUSTED_TIME_BOOT_WALL_TOLERANCE_MS = 5 * 60 * 1000L
+
+/** How far a persisted trusted-time anchor may run ahead of max(system clock, signed time). */
+internal const val TRUSTED_TIME_MAX_LEAD_MS = 24 * 60 * 60 * 1000L
+
+internal fun sameBoot(stored: BootIdentity, current: BootIdentity): Boolean {
+    if (stored.bootWallMs <= 0L && stored.bootCount < 0) return false
+    if (stored.bootCount >= 0 && current.bootCount >= 0) return stored.bootCount == current.bootCount
+    if (stored.bootWallMs <= 0L || current.bootWallMs <= 0L) return false
+    return abs(stored.bootWallMs - current.bootWallMs) <= TRUSTED_TIME_BOOT_WALL_TOLERANCE_MS
+}
+
+/**
+ * Extrapolates a persisted anchor to "now" with the monotonic clock. Returns null when there is no
+ * anchor, when it belongs to another boot (APP-M23) or when the monotonic clock went backwards.
+ */
+internal fun anchoredTrustedNowMs(
+    anchor: TrustedTimeAnchor?,
+    currentBoot: BootIdentity,
+    currentElapsedRealtimeMs: Long,
+): Long? {
+    if (anchor == null || anchor.wallTimeMs <= 0L || anchor.elapsedRealtimeMs <= 0L) return null
+    if (!sameBoot(anchor.boot, currentBoot)) return null
+    if (currentElapsedRealtimeMs < anchor.elapsedRealtimeMs) return null
+    return anchor.wallTimeMs + (currentElapsedRealtimeMs - anchor.elapsedRealtimeMs)
+}
+
+/**
+ * The anchor to persist after a successfully verified signed document (update manifest,
+ * rendezvous bundle). Only signed time ([signedIssuedAtMs]) and the monotonic extrapolation of an
+ * earlier signed anchor ratchet it; time obtained only from unauthenticated SNTP is never
+ * persisted (APP-M6). The result is also capped at [TRUSTED_TIME_MAX_LEAD_MS] ahead of
+ * max(system clock, signed time), which heals anchors poisoned by older versions.
+ */
+internal fun nextTrustedTimeAnchor(
+    current: TrustedTimeAnchor?,
+    signedIssuedAtMs: Long,
+    currentBoot: BootIdentity,
+    currentElapsedRealtimeMs: Long,
+    systemNowMs: Long,
+): TrustedTimeAnchor {
+    val extrapolated = anchoredTrustedNowMs(current, currentBoot, currentElapsedRealtimeMs) ?: 0L
+    val candidate = maxOf(extrapolated, signedIssuedAtMs)
+    val ceiling = maxOf(systemNowMs, signedIssuedAtMs) + TRUSTED_TIME_MAX_LEAD_MS
+    return TrustedTimeAnchor(
+        wallTimeMs = minOf(candidate, ceiling),
+        elapsedRealtimeMs = currentElapsedRealtimeMs,
+        boot = currentBoot,
+    )
+}
+
 object ClockDiagnostics {
+    /** Identity of the current boot; see [BootIdentity]. */
+    fun currentBoot(context: Context): BootIdentity {
+        val bootCount = runCatching {
+            Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT)
+        }.getOrDefault(-1)
+        return BootIdentity(
+            bootCount = bootCount,
+            bootWallMs = System.currentTimeMillis() - SystemClock.elapsedRealtime(),
+        )
+    }
+
     fun check(fakeSkewSeconds: Long? = null): ClockCheckResult {
         val offsetMs = if (BuildConfig.DEBUG && fakeSkewSeconds != null) {
             fakeSkewSeconds * 1_000L

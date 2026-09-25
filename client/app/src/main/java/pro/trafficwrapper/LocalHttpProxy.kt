@@ -33,21 +33,25 @@ internal const val LOCAL_HTTP_PROXY_LISTEN = "$LOCAL_HTTP_PROXY_HOST:$LOCAL_HTTP
 /**
  * Loopback HTTP proxy (CONNECT + absolute-form requests) in front of the SOCKS router.
  *
- * [frontEndCredentials] returns the user-visible credentials when front-end authentication is
- * enabled; clients must then present `Proxy-Authorization: Basic ...`. [upstreamCredentials] are
- * the credentials used towards the SOCKS router (the process-internal ones).
+ * [authPolicy] decides which clients are accepted: with front-end credentials clients must present
+ * `Proxy-Authorization: Basic ...`; without them unauthenticated clients are accepted only when the
+ * policy allows it. Requests that are not accepted are closed without a reply (no 407 challenge),
+ * so the port does not advertise a password-protected proxy. [upstreamCredentials] are the
+ * credentials used towards the SOCKS router (the process-internal ones).
  */
 internal class LocalHttpProxy(
     private val host: String,
     private val port: Int,
     private val socksHost: String,
     private val socksPort: Int,
-    private val frontEndCredentials: () -> SocksCredentials?,
+    private val authPolicy: () -> LocalProxyAuthPolicy,
     private val upstreamCredentials: () -> SocksCredentials?,
 ) {
     private val active = AtomicBoolean(false)
     private val ioPool = Executors.newCachedThreadPool()
     private val sessions = Collections.synchronizedSet(mutableSetOf<Socket>())
+    /** Client socket -> fingerprint of the auth policy it was admitted under. */
+    private val admittedUnder = java.util.concurrent.ConcurrentHashMap<Socket, String>()
     private val nextSessionID = AtomicLong(1)
     private val activeSessionCount = AtomicInteger(0)
 
@@ -110,6 +114,19 @@ internal class LocalHttpProxy(
         runCatching { serverSocket?.close() }
     }
 
+    /**
+     * Closes client sessions admitted under an auth policy other than [fingerprint], for example
+     * after the proxy password was enabled or regenerated. Returns the number of closed sessions.
+     */
+    fun closeSessionsNotAdmittedUnder(fingerprint: String): Int {
+        val stale = admittedUnder.filterValues { it != fingerprint }.keys
+        var closed = 0
+        stale.forEach { socket ->
+            if (runCatching { socket.close() }.isSuccess) closed++
+        }
+        return closed
+    }
+
     /** Blocking (up to [HTTP_PROXY_STOP_DRAIN_TIMEOUT_MS]); never call on the main thread. */
     fun stop() {
         active.set(false)
@@ -127,7 +144,7 @@ internal class LocalHttpProxy(
         sessions.add(client)
         try {
             // The client socket is closed in finally, after an error response had a chance to be
-            // written (closing it inside use {} would drop 407/502 replies).
+            // written (closing it inside use {} would drop 4xx/502 replies).
             run {
                 val clientSocket = client
                 tuneSocket(clientSocket)
@@ -136,11 +153,18 @@ internal class LocalHttpProxy(
                 // ClientHello after CONNECT) stay in this stream and are relayed from it.
                 val input = BufferedInputStream(clientSocket.getInputStream(), HTTP_PROXY_BUFFER_BYTES)
                 val output = clientSocket.getOutputStream()
-                val request = parseHttpProxyRequest(readHttpHeader(input))
-                val required = frontEndCredentials()
-                if (required != null && !isHttpProxyAuthorized(request.proxyAuthorization, required)) {
-                    throw HttpProxyRequestException(407, "Proxy Authentication Required", "proxy authentication required")
+                val policy = authPolicy()
+                val request = try {
+                    parseHttpProxyRequest(readHttpHeader(input))
+                } catch (rejected: HttpProxyRequestException) {
+                    // Before authentication nothing is answered unless the proxy is open.
+                    if (!policy.allowNoAuth) throw HttpProxySilentCloseException()
+                    throw rejected
                 }
+                if (!isHttpProxyRequestAllowed(policy, request.proxyAuthorization)) {
+                    throw HttpProxySilentCloseException()
+                }
+                admittedUnder[clientSocket] = policy.fingerprint
                 if (BuildConfig.DEBUG) {
                     Log.d(LOG_TAG, "http_proxy session=$sessionID connect target=${request.targetHost}:${request.targetPort}")
                 }
@@ -169,6 +193,8 @@ internal class LocalHttpProxy(
                     }
                 }
             }
+        } catch (_: HttpProxySilentCloseException) {
+            Log.i(LOG_TAG, "http_proxy session=$sessionID closed: not authorized")
         } catch (rejected: HttpProxyRequestException) {
             Log.i(LOG_TAG, "http_proxy session=$sessionID rejected: ${rejected.statusCode}")
             runCatching { writeHttpError(client.getOutputStream(), rejected.statusCode, rejected.statusText) }
@@ -186,6 +212,7 @@ internal class LocalHttpProxy(
             }
             runCatching { client.close() }
             sessions.remove(client)
+            admittedUnder.remove(client)
         }
     }
 
@@ -332,15 +359,9 @@ internal class LocalHttpProxy(
 
     private fun writeHttpError(output: OutputStream, code: Int, status: String) {
         val body = "$code $status\n"
-        val authenticate = if (code == 407) {
-            "Proxy-Authenticate: Basic realm=\"$HTTP_PROXY_AUTH_REALM\"\r\n"
-        } else {
-            ""
-        }
         output.write(
             (
                 "HTTP/1.1 $code $status\r\n" +
-                    authenticate +
                     "Connection: close\r\nContent-Length: ${body.length}\r\n\r\n$body"
                 ).toByteArray(Charsets.US_ASCII),
         )
@@ -362,7 +383,14 @@ internal class LocalHttpProxy(
     }
 }
 
-internal const val HTTP_PROXY_AUTH_REALM = "TrafficWrapper"
+/** Unauthorized request: the connection is closed without a reply. */
+internal class HttpProxySilentCloseException : Exception("not authorized")
+
+/** Whether a request carrying [proxyAuthorization] may use the proxy under [policy]. */
+internal fun isHttpProxyRequestAllowed(policy: LocalProxyAuthPolicy, proxyAuthorization: String?): Boolean {
+    val required = policy.frontEnd ?: return policy.allowNoAuth
+    return isHttpProxyAuthorized(proxyAuthorization, required)
+}
 
 internal data class HttpProxyRequest(
     val connect: Boolean,
@@ -643,7 +671,7 @@ internal fun openLocalSocks5Connection(
         // server-first banner) must stay in the socket for the caller.
         val input = socket.getInputStream()
         val output = socket.getOutputStream()
-        Socks5Auth.negotiateClient(input, output, credentials)
+        Socks5Auth.negotiateClient(input, output, credentials, peerPort = proxyPort)
         socks5ConnectDomain(input, output, targetHost, targetPort)
         return socket
     } catch (error: Throwable) {

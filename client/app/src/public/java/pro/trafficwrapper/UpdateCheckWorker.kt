@@ -69,26 +69,17 @@ class UpdateCheckWorker(
                         availableState = availableState,
                     )
                 } else {
-                    TransportRuntime.updates = availableState
+                    TransportRuntime.updates = mergeBackgroundCheck(outcome, checkedAt)
                     showInstallStatusSafely(R.string.update_notification_available)
                 }
             }
 
             UpdateCheckStatus.LATEST -> {
-                TransportRuntime.updates = DistributionUiState(
-                    statusTextRes = R.string.update_status_latest,
-                    availableVersionName = outcome.manifest?.versionName.orEmpty(),
-                    availableVersionCode = outcome.manifest?.versionCode ?: 0,
-                    source = outcome.source?.name.orEmpty(),
-                    baseUrl = outcome.baseUrl,
-                    totalBytes = outcome.manifest?.apkSize ?: 0,
-                    changelog = outcome.manifest?.changelogRu.orEmpty(),
-                    lastCheckedAt = checkedAt,
-                )
+                TransportRuntime.updates = mergeBackgroundCheck(outcome, checkedAt)
             }
 
             UpdateCheckStatus.ERROR -> {
-                TransportRuntime.updates = backgroundUpdateErrorState(outcome, checkedAt)
+                TransportRuntime.updates = mergeBackgroundCheck(outcome, checkedAt)
                 Log.w(
                     LOG_TAG,
                     "background update check failed " +
@@ -171,6 +162,16 @@ class UpdateCheckWorker(
             }
         }
     }
+
+    /** Merge (not replace) so a running download/install, an APK and "Later" survive (APP-M22). */
+    private fun mergeBackgroundCheck(outcome: UpdateCheckOutcome, checkedAt: String): DistributionUiState =
+        mergeAutoUpdateCheckState(
+            current = TransportRuntime.updates,
+            outcome = outcome,
+            checkedAt = checkedAt,
+            offerSheet = false,
+            installedVersionCode = BuildConfig.VERSION_CODE.toLong(),
+        )
 
     private fun showInstallStatusSafely(textRes: Int) {
         try {

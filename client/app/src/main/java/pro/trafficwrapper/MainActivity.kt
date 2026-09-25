@@ -2189,6 +2189,17 @@ private fun LocalProxyAuthPanel(context: Context) {
         },
     )
     val current = credentials
+    if (!authOn) {
+        val vpnMode = BuildConfig.VPN_ENABLED && TransportLifecycleStore.vpnEnabled(appContext)
+        Text(
+            text = stringResource(
+                if (vpnMode) R.string.local_proxy_vpn_internal_only else R.string.local_proxy_no_auth_warning,
+            ),
+            modifier = Modifier.padding(top = 8.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+        )
+    }
     if (authOn && current != null) {
         CredentialRow(
             label = stringResource(R.string.local_proxy_auth_username),
