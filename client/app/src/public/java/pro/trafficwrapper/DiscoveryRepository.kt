@@ -53,16 +53,34 @@ class DiscoveryRepository(private val context: Context) {
         val rendezvousState = store.readRendezvousState()
         val sinks = discoverySinks(stored, config, socksListen, rendezvousState)
         if (sinks.isEmpty()) return null
-        ensureCoreConfig(stored, config, publicKey)
+        val slots = ensureCoreConfig(stored, config, publicKey)
+        val tunnelUp = discoveryTunnelUp(
+            authorized = TransportRuntime.auth.authorized,
+            handshakeEstablished = TransportRuntime.state.handshakeEstablished,
+            socksListen = socksListen,
+        )
 
         var lastError: Throwable? = null
+        var tunnelSinks = 0
+        var tunnelAnswered = false
         for (sink in sinks) {
-            val result = runCatching { fetchAndApply(store, stored, publicKey, sink) }
+            val tunnelSink = sink.socksListen.isNotBlank()
+            if (!tunnelSink && !directDiscoveryAllowed(tunnelUp, tunnelSinks, tunnelAnswered)) {
+                // X-M7: the tunnel works, so the control plane is not contacted off-tunnel.
+                Log.i(TAG, "public discovery: tunnel is up, skipping direct sinks")
+                break
+            }
+            val attempt = SinkAttempt()
+            val result = runCatching { fetchAndApply(store, stored, publicKey, sink, slots, attempt) }
                 .onFailure { error ->
                     lastError = error
                     Log.w(TAG, "public discovery failed via ${sink.name}", error)
                 }
                 .getOrNull()
+            if (tunnelSink) {
+                tunnelSinks++
+                tunnelAnswered = tunnelAnswered || attempt.answered
+            }
             if (result != null) {
                 Log.i(TAG, "public discovery applied seq=${result.seq} via ${sink.name}")
                 return result
@@ -77,16 +95,19 @@ class DiscoveryRepository(private val context: Context) {
         stored: StoredPublicPlatformState,
         publicKey: String,
         sink: DiscoverySink,
+        slots: PublicPlatformRouteSlots,
+        attempt: SinkAttempt,
     ): DiscoveryRefreshResult {
-        val jsonResponse = fetchDiscoveryJSON(sink, publicKey)
-        val minisig = jsonResponse.minisig
+        val jsonResponse = fetchDiscoveryJSON(sink, publicKey, attempt)
         val state = store.readRendezvousState()
-        val request = JSONObject()
-            .put("endpoints_json", jsonResponse.body)
-            .put("endpoints_json_minisig", minisig)
-            .put("public_key", publicKey)
-            .put("max_seen_seq", state.maxSeenRendezvousSeq)
-            .put("now", Instant.ofEpochMilli(discoveryNowMs(jsonResponse.dateHeaderMs)).toString())
+        val request = discoveryApplyRequest(
+            endpointsJson = jsonResponse.body,
+            minisig = jsonResponse.minisig,
+            publicKey = publicKey,
+            maxSeenSeq = state.maxSeenRendezvousSeq,
+            nowIso = Instant.ofEpochMilli(discoveryNowMs(jsonResponse.dateHeaderMs)).toString(),
+            slots = slots,
+        )
         val response = JSONObject(Transport.applyDiscoveredEndpoints(request.toString()))
         if (!response.optBoolean("ok", false)) {
             throw IllegalStateException(response.optString("error", "discovery apply failed"))
@@ -103,14 +124,15 @@ class DiscoveryRepository(private val context: Context) {
             // Go core already validated expires_at; next_sinks expire together with the feed.
             discoverySinksExpiresAtMs = parseExpiresAt(jsonResponse.body),
         )
-        response.optJSONObject("reality")?.optString("egress_ip")?.takeIf { it.isNotBlank() }?.let {
-            TransportRuntime.publicRealityEgressIp = it
-        }
-        val configJson = response.optString("config_json")
-        if (configJson.isNotBlank()) {
-            // Go core already installed the merged AWG config in pendingProvision.
+        // The core returns a REALITY entry only when it belongs to the slot's own worker (X-M6),
+        // so another worker's egress never becomes this slot's expected egress.
+        matchedRealityEgress(response, "reality")?.let { TransportRuntime.publicRealityEgressIp = it }
+        matchedRealityEgress(response, "reality2")?.let { TransportRuntime.publicReality2EgressIp = it }
+        val mergedSlots = response.optJSONArray("awg_merged_slots")
+        if (mergedSlots != null && mergedSlots.length() > 0) {
+            // Go core already installed the merged AWG config(s) in pendingProvision.
             // Keep stored client-config unchanged; discovery is additive runtime state.
-            Log.i(TAG, "public discovery merged awg config bytes=${configJson.length} device=${stored.deviceID}")
+            Log.i(TAG, "public discovery merged awg slots=$mergedSlots device=${stored.deviceID}")
         }
         return DiscoveryRefreshResult(applied = true, seq = seq, sinkName = sink.name)
     }
@@ -119,7 +141,7 @@ class DiscoveryRepository(private val context: Context) {
         stored: StoredPublicPlatformState,
         config: PublicClientConfig,
         rendezvousPublicKey: String,
-    ) {
+    ): PublicPlatformRouteSlots {
         val credentials = stored.toPublicPlatformCredentials()
         val slots = PublicPlatformConfigParser.routeSlots(config, stored.deviceID, credentials)
         val applyRequest = publicCoreApplyRequest(
@@ -135,14 +157,20 @@ class DiscoveryRepository(private val context: Context) {
         if (!response.optBoolean("ok", false)) {
             throw IllegalStateException(response.optString("error", "public core config restore failed"))
         }
+        return slots
     }
 
-    private fun fetchString(sink: DiscoverySink, fileName: String): FetchResponse {
+    /** Whether a sink returned any HTTP response (the path to it works). */
+    private class SinkAttempt {
+        var answered = false
+    }
+
+    private fun fetchString(sink: DiscoverySink, fileName: String, attempt: SinkAttempt): FetchResponse {
         val url = sink.baseUrl.trimEnd('/') + "/" + fileName
-        return fetchURL(sink, url)
+        return fetchURL(sink, url, attempt)
     }
 
-    private fun fetchURL(sink: DiscoverySink, url: String): FetchResponse {
+    private fun fetchURL(sink: DiscoverySink, url: String, attempt: SinkAttempt): FetchResponse {
         if (sink.socksListen.isBlank() && !url.startsWith(HTTPS_PREFIX, ignoreCase = true)) {
             throw IllegalArgumentException("direct discovery sink must be https")
         }
@@ -152,6 +180,7 @@ class DiscoveryRepository(private val context: Context) {
             .header("Cache-Control", "no-store")
             .build()
         clientFor(sink.socksListen).newCall(request).execute().use { response ->
+            attempt.answered = true
             if (!response.isSuccessful) {
                 throw IllegalStateException("discovery ${response.code}")
             }
@@ -170,17 +199,17 @@ class DiscoveryRepository(private val context: Context) {
         }
     }
 
-    private fun fetchDiscoveryJSON(sink: DiscoverySink, publicKey: String): DiscoveryPayload {
+    private fun fetchDiscoveryJSON(sink: DiscoverySink, publicKey: String, attempt: SinkAttempt): DiscoveryPayload {
         if (sink.pointerUrl.isBlank()) {
-            val json = fetchString(sink, ENDPOINTS_JSON)
+            val json = fetchString(sink, ENDPOINTS_JSON, attempt)
             return DiscoveryPayload(
                 body = json.body,
-                minisig = fetchString(sink, ENDPOINTS_MINISIG).body,
+                minisig = fetchString(sink, ENDPOINTS_MINISIG, attempt).body,
                 dateHeaderMs = json.dateHeaderMs,
             )
         }
-        val pointer = fetchURL(sink, sink.pointerUrl)
-        val pointerSig = fetchURL(sink, sink.pointerUrl.trimEnd('/') + ".minisig").body
+        val pointer = fetchURL(sink, sink.pointerUrl, attempt)
+        val pointerSig = fetchURL(sink, sink.pointerUrl.trimEnd('/') + ".minisig", attempt).body
         if (!verifyMinisign(pointer.body, pointerSig, publicKey)) {
             throw IllegalStateException("rescue pointer signature invalid")
         }
@@ -193,10 +222,10 @@ class DiscoveryRepository(private val context: Context) {
         ) {
             throw IllegalStateException("rescue pointer urls must be https")
         }
-        val json = fetchURL(sink, endpointsURL)
+        val json = fetchURL(sink, endpointsURL, attempt)
         return DiscoveryPayload(
             body = json.body,
-            minisig = fetchURL(sink, minisigURL).body,
+            minisig = fetchURL(sink, minisigURL, attempt).body,
             dateHeaderMs = json.dateHeaderMs ?: pointer.dateHeaderMs,
         )
     }
@@ -263,6 +292,61 @@ class DiscoveryRepository(private val context: Context) {
         }
     }
 }
+
+/** The tunnel carries traffic: authorized, handshake established and a SOCKS listener known. */
+internal fun discoveryTunnelUp(authorized: Boolean, handshakeEstablished: Boolean, socksListen: String): Boolean =
+    authorized && handshakeEstablished && socksListen.isNotBlank()
+
+/**
+ * X-M7: direct (NO_PROXY) sinks, the orchestrator included, are used only when the tunnel is down,
+ * or when it is up but every tunnel sink failed without any HTTP answer through it (the tunnel
+ * path is actually broken). A tunnel sink that answered (even 404 from a worker that does not
+ * serve the feed yet) proves the tunnel works, so the control plane is not contacted off-tunnel.
+ */
+internal fun directDiscoveryAllowed(tunnelUp: Boolean, tunnelSinksTried: Int, tunnelSinkAnswered: Boolean): Boolean =
+    !tunnelUp || (tunnelSinksTried > 0 && !tunnelSinkAnswered)
+
+/**
+ * Transport.applyDiscoveredEndpoints request. reality_slot / reality2_slot identify the workers of
+ * the REALITY slots so the core returns only their own entries (X-M6); a slot without a worker id
+ * and egress is omitted.
+ */
+internal fun discoveryApplyRequest(
+    endpointsJson: String,
+    minisig: String,
+    publicKey: String,
+    maxSeenSeq: Long,
+    nowIso: String,
+    slots: PublicPlatformRouteSlots,
+): JSONObject {
+    val request = JSONObject()
+        .put("endpoints_json", endpointsJson)
+        .put("endpoints_json_minisig", minisig)
+        .put("public_key", publicKey)
+        .put("max_seen_seq", maxSeenSeq)
+        .put("now", nowIso)
+    discoverySlotIdentity(slots.realityWorkerId, slots.realityExpectedEgressIp)?.let {
+        request.put("reality_slot", it)
+    }
+    discoverySlotIdentity(slots.reality2WorkerId, slots.reality2ExpectedEgressIp)?.let {
+        request.put("reality2_slot", it)
+    }
+    return request
+}
+
+private fun discoverySlotIdentity(workerId: String, egressIp: String): JSONObject? {
+    val worker = workerId.trim()
+    val egress = egressIp.trim()
+    if (worker.isEmpty() && egress.isEmpty()) return null
+    return JSONObject().apply {
+        if (worker.isNotEmpty()) put("worker_id", worker)
+        if (egress.isNotEmpty()) put("egress_ip", egress)
+    }
+}
+
+/** Egress of the REALITY entry the core matched to [slot] ("reality" / "reality2"), or null. */
+internal fun matchedRealityEgress(response: JSONObject, slot: String): String? =
+    response.optJSONObject(slot)?.optString("egress_ip")?.trim()?.takeIf { it.isNotEmpty() }
 
 /**
  * Discovery sinks come only from operator-signed fields (APP-M20): the tunnel config_url of each

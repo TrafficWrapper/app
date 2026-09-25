@@ -1001,7 +1001,7 @@ class PublicPlatformConfigTest {
         assertEquals(8443, xhttp.port)
         assertEquals("stream-up", xhttp.xhttpMode)
         assertEquals("/xh", xhttp.xhttpPath)
-        assertEquals("", xhttp.xhttpHost)
+        assertEquals("cdn.example", xhttp.xhttpHost)
         assertEquals("", xhttp.flow)
         assertEquals("c1", xhttp.shortId)
         assertTrue(xhttp.isComplete())
@@ -1059,8 +1059,53 @@ class PublicPlatformConfigTest {
             variants.map { it.key },
         )
         assertEquals("stream-up", variants[1].config.xhttpMode)
-        assertEquals("", variants[1].config.xhttpHost)
+        assertEquals("cdn.example", variants[1].config.xhttpHost)
         assertEquals("2001:db8::5", variants[2].config.address)
+    }
+
+    @Test
+    fun realityProfileXhttpHostIsOwnAndNeverInheritedFromPrimary() {
+        // X-L11: the host comes only from the profile's nested xhttp; flat xhttp_* keys of the
+        // primary route must not leak into an alternative without a host.
+        val route = PublicRouteConfig(
+            type = "reality",
+            enabled = true,
+            address = "w.example",
+            port = 443,
+            expectedEgressIp = "",
+            dialectId = "",
+            params = JSONObject()
+                .put("public_key", "pk")
+                .put("short_id", "sid")
+                .put("server_name", "sni.example")
+                .put("network", "tcp")
+                .put("xhttp_host", "primary-host.example")
+                .put("xhttp_path", "/primary")
+                .put(
+                    "reality_profiles",
+                    org.json.JSONArray()
+                        .put(
+                            JSONObject().put("name", "xh-host").put("port", 8443).put("network", "xhttp")
+                                .put("xhttp", JSONObject().put("path", "/a").put("host", " cdn.example ")),
+                        )
+                        .put(
+                            JSONObject().put("name", "xh-nohost").put("port", 8444).put("network", "xhttp")
+                                .put("xhttp", JSONObject().put("path", "/b")),
+                        ),
+                ),
+        )
+        val worker = PublicWorkerConfig("w", "W", 0, 100, listOf(route))
+        val variants = RouteVariants.expandRealityVariants(
+            PublicResolvedRoute(worker, route),
+            fallbacks = emptyList(),
+            credentials = credentials(),
+        )
+        val withHost = variants.first { it.key == "w|xh-host|xhttp|v4|" }.config
+        assertEquals("cdn.example", withHost.xhttpHost)
+        assertEquals("/a", withHost.xhttpPath)
+        val withoutHost = variants.first { it.key == "w|xh-nohost|xhttp|v4|" }.config
+        assertEquals("", withoutHost.xhttpHost)
+        assertEquals("/b", withoutHost.xhttpPath)
     }
 
     @Test

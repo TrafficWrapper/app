@@ -191,6 +191,48 @@ internal fun recordTrackedSocketProgress(
     return !tracked.isHealthProbe
 }
 
+/** Third-party echo used only when neither the signed bundle nor the build configures one. */
+internal const val FALLBACK_EGRESS_PROBE_URL = "https://api.ipify.org"
+
+/**
+ * Egress echo URLs in order (APP-M17): the signed bundle's egress_probe_urls, else the build's
+ * DeploymentConfig.OUTBOUND_URL, and api.ipify.org only when nothing is configured.
+ */
+internal fun egressProbeUrls(bundleUrls: List<String>, deploymentUrl: String): List<String> {
+    val fromBundle = bundleUrls.map(String::trim).filter(String::isNotEmpty)
+    if (fromBundle.isNotEmpty()) return fromBundle
+    val fromBuild = deploymentUrl.trim()
+    return listOf(fromBuild.ifEmpty { FALLBACK_EGRESS_PROBE_URL })
+}
+
+/**
+ * Egress IP from an echo response: the source IP as plain text or JSON {"egress_ip": "..."}.
+ * Anything that is not an IP literal yields "".
+ */
+internal fun parseEgressProbeResponse(body: String): String {
+    val trimmed = body.trim()
+    val candidate = if (trimmed.startsWith("{")) {
+        runCatching { JSONObject(trimmed).optString("egress_ip") }.getOrDefault("").trim()
+    } else {
+        trimmed
+    }
+    return candidate.takeIf(::isIpLiteral).orEmpty()
+}
+
+private val IPV4_LITERAL = Regex("""^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$""")
+private val IPV6_LITERAL_CHARS = Regex("""^[0-9A-Fa-f:.]+$""")
+
+/** Literal check without any DNS lookup (IPv6 is only parsed once it has literal-only chars). */
+internal fun isIpLiteral(value: String): Boolean {
+    if (value.isEmpty() || value.length > 45) return false
+    if (IPV4_LITERAL.matches(value)) return true
+    if (!value.contains(':') || !IPV6_LITERAL_CHARS.matches(value)) return false
+    return runCatching { InetAddress.getByName(value) != null }.getOrDefault(false)
+}
+
+internal fun isHealthProbeDestination(destination: String, outboundUrls: List<String>): Boolean =
+    outboundUrls.any { isHealthProbeDestination(destination, it) }
+
 internal fun isHealthProbeDestination(destination: String, outboundUrl: String): Boolean {
     val uri = runCatching { URI(outboundUrl) }.getOrNull() ?: return false
     val expectedHost = uri.host?.trim()?.takeIf { it.isNotBlank() } ?: return false
@@ -4909,13 +4951,24 @@ class AutoTransportService : Service() {
     private fun fetchOutboundIp(socksListen: String, timeoutMs: Int): String {
         val address = socksListen.substringBefore(":")
         val port = socksListen.substringAfter(":", ROUTER_PORT.toString()).toInt()
-        return httpGetViaLocalSocks(
-            proxyHost = address,
-            proxyPort = port,
-            url = OUTBOUND_URL,
-            timeoutMs = timeoutMs,
-            credentials = LocalSocksAuth.internal,
-        ).trim()
+        var lastError: Throwable? = null
+        // At most two echo services per probe keep the probe latency bounded.
+        for (url in OUTBOUND_URLS.take(2)) {
+            val ip = runCatching {
+                parseEgressProbeResponse(
+                    httpGetViaLocalSocks(
+                        proxyHost = address,
+                        proxyPort = port,
+                        url = url,
+                        timeoutMs = timeoutMs,
+                        credentials = LocalSocksAuth.internal,
+                    ),
+                )
+            }.onFailure { lastError = it }.getOrDefault("")
+            if (ip.isNotEmpty()) return ip
+        }
+        lastError?.let { throw it }
+        return ""
     }
 
     private fun checkClock(): ClockCheckResult =
@@ -5475,7 +5528,7 @@ class AutoTransportService : Service() {
                     val selected = upstreamProvider()
                     tracked.upstreamPort = selected.port
                     tracked.upstreamGeneration = selected.generation
-                    tracked.isHealthProbe = isHealthProbeDestination(request.destination, OUTBOUND_URL)
+                    tracked.isHealthProbe = isHealthProbeDestination(request.destination, OUTBOUND_URLS)
                     val counters = countersFor(selected, request.destination)
                     if (BuildConfig.DEBUG) {
                         Log.d(
@@ -5732,7 +5785,7 @@ class AutoTransportService : Service() {
         }
 
         private fun countersFor(upstream: Upstream, destination: String): RouteCounters? {
-            if (isHealthProbeDestination(destination, OUTBOUND_URL)) return null
+            if (isHealthProbeDestination(destination, OUTBOUND_URLS)) return null
             return when (upstream.port) {
                 REALITY_PORT -> RouteCounters(rx = realityRxCounter, tx = realityTxCounter)
                 REALITY2_PORT -> RouteCounters(rx = reality2RxCounter, tx = reality2TxCounter)
@@ -5824,7 +5877,11 @@ class AutoTransportService : Service() {
 
         private val EXPECTED_REALITY_IP: String get() = DEFAULT_REALITY_EGRESS_IP
         private val EXPECTED_REALITY2_IP: String get() = DEFAULT_REALITY2_EGRESS_IP
-        private val OUTBOUND_URL: String get() = DeploymentConfig.OUTBOUND_URL.ifBlank { "https://api.ipify.org" }
+        private val OUTBOUND_URLS: List<String>
+            get() = egressProbeUrls(
+                TransportRuntime.publicPlatformConfig?.egressProbeUrls.orEmpty(),
+                DeploymentConfig.OUTBOUND_URL,
+            )
 
         private const val REALITY_INACTIVE_PROBE_INTERVAL_MS = 75_000L
         private const val REALITY_LOCAL_RX_FRESH_MS = 30_000L

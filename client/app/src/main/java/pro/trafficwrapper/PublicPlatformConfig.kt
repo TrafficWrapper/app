@@ -56,6 +56,11 @@ data class PublicClientConfig(
     val dnsServers: List<String>,
     val limits: JSONObject?,
     val workers: List<PublicWorkerConfig>,
+    /**
+     * Operator egress echo services (optional top-level egress_probe_urls): queried through the
+     * tunnel to check a route's egress IP. Empty when absent or malformed.
+     */
+    val egressProbeUrls: List<String> = emptyList(),
 )
 
 data class PublicWorkerConfig(
@@ -229,13 +234,15 @@ internal fun publicCoreApplyRequest(
     if (awgProfiles != null && awgProfiles.length() > 0) {
         request.put("awg_profiles", awgProfiles)
     }
-    slots.awgRu?.let { request.put("awg_ru", publicAwgRouteRequest(it, awgRuFamily)) }
-    slots.awg?.let { request.put("awg", publicAwgRouteRequest(it, awgFamily)) }
+    slots.awgRu?.let { request.put("awg_ru", publicAwgRouteRequest(it, awgRuFamily, slots.awgRuWorkerId)) }
+    slots.awg?.let { request.put("awg", publicAwgRouteRequest(it, awgFamily, slots.awgWorkerId)) }
     return request
 }
 
-private fun publicAwgRouteRequest(route: PublicRouteConfig, family: String): JSONObject {
+private fun publicAwgRouteRequest(route: PublicRouteConfig, family: String, workerId: String): JSONObject {
     val json = PublicPlatformConfigParser.awgRouteJson(route)
+    // Lets the core match rendezvous feed entries to this slot's worker (X-M6).
+    if (workerId.isNotBlank()) json.put("worker_id", workerId)
     val normalized = family.trim().lowercase()
     if (normalized == IpFamily.V6.wire && route.params.optString("endpoint_v6").isNotBlank()) {
         json.put("ip_family", IpFamily.V6.wire)
@@ -261,6 +268,11 @@ data class PublicPlatformRouteSlots(
     val awgExpectedEgressIp: String = "",
     val reality2ExpectedEgressIp: String = "",
     val realityExpectedEgressIp: String = "",
+    /** Client-bundle worker of each slot ("" when the slot is empty). */
+    val awgRuWorkerId: String = "",
+    val awgWorkerId: String = "",
+    val reality2WorkerId: String = "",
+    val realityWorkerId: String = "",
     val orderedRoutes: List<PublicResolvedRoute> = emptyList(),
     val routePriorities: Map<String, Int> = emptyMap(),
     val routeRegions: Map<String, String> = emptyMap(),
@@ -419,6 +431,10 @@ object PublicPlatformConfigParser {
             awgExpectedEgressIp = secondaryAwg?.expectedEgressIp.orEmpty(),
             realityExpectedEgressIp = primaryReality?.expectedEgressIp.orEmpty(),
             reality2ExpectedEgressIp = secondaryReality?.expectedEgressIp.orEmpty(),
+            awgRuWorkerId = primaryAwgResolved?.worker?.workerId.orEmpty(),
+            awgWorkerId = secondaryAwgResolved?.worker?.workerId.orEmpty(),
+            realityWorkerId = primaryRealityResolved?.worker?.workerId.orEmpty(),
+            reality2WorkerId = secondaryRealityResolved?.worker?.workerId.orEmpty(),
             orderedRoutes = ordered,
             routePriorities = publicRoutePriorities(
                 ordered = ordered,
@@ -519,7 +535,29 @@ object PublicPlatformConfigParser {
             dnsServers = root.optJSONArray(JSON_DNS_SERVERS).toStringList(),
             limits = root.optJSONObject(JSON_LIMITS),
             workers = root.getJSONArray(JSON_WORKERS).toWorkers(),
+            egressProbeUrls = parseEgressProbeUrls(root.opt(JSON_EGRESS_PROBE_URLS)),
         )
+
+    /**
+     * Tolerant parse of egress_probe_urls: anything but an array yields no URLs; non-string,
+     * non-http(s), host-less or oversized entries are skipped; duplicates dropped; at most
+     * [MAX_EGRESS_PROBE_URLS] kept in order.
+     */
+    internal fun parseEgressProbeUrls(value: Any?): List<String> {
+        val array = value as? JSONArray ?: return emptyList()
+        val out = linkedSetOf<String>()
+        for (index in 0 until array.length()) {
+            val raw = (array.opt(index) as? String)?.trim().orEmpty()
+            if (raw.isEmpty() || raw.length > MAX_EGRESS_PROBE_URL_LENGTH) continue
+            val uri = runCatching { java.net.URI(raw) }.getOrNull() ?: continue
+            val scheme = uri.scheme?.lowercase().orEmpty()
+            if (scheme != "https" && scheme != "http") continue
+            if (uri.host.isNullOrBlank() || uri.rawUserInfo != null) continue
+            out += raw
+            if (out.size >= MAX_EGRESS_PROBE_URLS) break
+        }
+        return out.toList()
+    }
 
     private fun JSONArray.toWorkers(): List<PublicWorkerConfig> =
         List(length()) { index ->
@@ -718,6 +756,9 @@ object PublicPlatformConfigParser {
     private const val JSON_UPDATE_PUBKEY = "update_pubkey"
     private const val JSON_DISCOVERY_PUBKEY = "discovery_pubkey"
     private const val JSON_DISCOVERY_RESCUE_POINTERS = "discovery_rescue_pointers"
+    private const val JSON_EGRESS_PROBE_URLS = "egress_probe_urls"
+    private const val MAX_EGRESS_PROBE_URLS = 8
+    private const val MAX_EGRESS_PROBE_URL_LENGTH = 512
     private const val JSON_DNS_SERVERS = "dns_servers"
     private const val JSON_SEED_WORKERS = "seed_workers"
     private const val JSON_BOOTSTRAP_TOKEN = "bootstrap_token"

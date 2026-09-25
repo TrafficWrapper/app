@@ -63,6 +63,44 @@ type applyDiscoveredRequest struct {
 	Now                  string `json:"now,omitempty"`
 	MaxSeenSeq           int64  `json:"max_seen_seq,omitempty"`
 	BaseConfigJSON       string `json:"base_config_json,omitempty"`
+	// BaseSlot identifies the worker behind base_config_json. Optional: a
+	// caller-supplied base without it keeps the legacy top-priority merge.
+	BaseSlot *discoverySlotIdentity `json:"base_slot,omitempty"`
+	// RealitySlot / Reality2Slot identify the workers of the REALITY slots.
+	// A REALITY feed entry is returned only when it matches one of them, so
+	// another worker's egress never becomes a slot's expected egress (X-M6).
+	RealitySlot  *discoverySlotIdentity `json:"reality_slot,omitempty"`
+	Reality2Slot *discoverySlotIdentity `json:"reality2_slot,omitempty"`
+}
+
+// discoverySlotIdentity is what a route slot knows about its worker: the
+// client-bundle worker id and the expected egress IP (either may be empty).
+type discoverySlotIdentity struct {
+	WorkerID string `json:"worker_id,omitempty"`
+	EgressIP string `json:"egress_ip,omitempty"`
+}
+
+// matches reports whether a feed entry belongs to the slot's worker: by
+// worker_id when both sides carry one, otherwise by an equal egress IP.
+func (s discoverySlotIdentity) matches(workerID, egressIP string) bool {
+	slotWorker, entryWorker := strings.TrimSpace(s.WorkerID), strings.TrimSpace(workerID)
+	if slotWorker != "" && entryWorker != "" {
+		return slotWorker == entryWorker
+	}
+	slotEgress, ok := canonicalIP(s.EgressIP)
+	if !ok {
+		return false
+	}
+	entryEgress, ok := canonicalIP(egressIP)
+	return ok && slotEgress == entryEgress
+}
+
+func canonicalIP(value string) (netip.Addr, bool) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return addr.Unmap(), true
 }
 
 type discoveredBundle struct {
@@ -81,6 +119,7 @@ type discoveredEndpoints struct {
 
 type discoveredAWGEndpoint struct {
 	Priority        int    `json:"priority"`
+	WorkerID        string `json:"worker_id,omitempty"`
 	Endpoint        string `json:"endpoint"`
 	EgressIP        string `json:"egress_ip,omitempty"`
 	ServerPublicKey string `json:"server_public_key"`
@@ -89,6 +128,7 @@ type discoveredAWGEndpoint struct {
 
 type discoveredRealityEndpoint struct {
 	Priority    int    `json:"priority"`
+	WorkerID    string `json:"worker_id,omitempty"`
 	Transport   string `json:"transport,omitempty"`
 	Address     string `json:"address,omitempty"`
 	EgressIP    string `json:"egress_ip,omitempty"`
@@ -112,9 +152,15 @@ type applyDiscoveredResult struct {
 	// AWGMergeSkipped is set when the stored AWG config targets a non-base
 	// worker profile or an IPv6 endpoint: the bundle's base IPv4 endpoint
 	// would break it, so config_json is returned unchanged.
-	AWGMergeSkipped bool                       `json:"awg_merge_skipped,omitempty"`
-	EgressIP        string                     `json:"egress_ip,omitempty"`
-	Reality         *discoveredRealityEndpoint `json:"reality,omitempty"`
+	AWGMergeSkipped bool `json:"awg_merge_skipped,omitempty"`
+	// AWGMergedSlots lists the stored slots ("awg_ru", "awg") whose config
+	// was replaced by the entry of the same worker.
+	AWGMergedSlots []string `json:"awg_merged_slots,omitempty"`
+	// EgressIP / Reality belong to the entry matching reality_slot; Reality2
+	// to the one matching reality2_slot. Absent when nothing matched.
+	EgressIP string                     `json:"egress_ip,omitempty"`
+	Reality  *discoveredRealityEndpoint `json:"reality,omitempty"`
+	Reality2 *discoveredRealityEndpoint `json:"reality2,omitempty"`
 }
 
 func ApplyDiscoveredEndpoints(requestJSON string) string {
@@ -170,57 +216,181 @@ func applyDiscoveredEndpoints(requestJSON string) (applyDiscoveredResult, error)
 	if err := validateDiscoveredBundle(bundle, max(storedMaxSeq, req.MaxSeenSeq), now); err != nil {
 		return applyDiscoveredResult{}, err
 	}
-	awg, err := selectAWGEndpoint(bundle.Endpoints.AWG)
-	if err != nil {
-		return applyDiscoveredResult{}, err
+	// Every client version needs at least one AWG entry (reduced and full feeds).
+	if len(bundle.Endpoints.AWG) == 0 {
+		return applyDiscoveredResult{}, errors.New("no awg endpoints in bundle")
 	}
-	reality := selectRealityEndpoint(bundle.Endpoints.Reality)
-	var mergedJSON string
-	mergeSkipped := false
+	result := applyDiscoveredResult{OK: true, Seq: bundle.Seq}
 	if req.BaseConfigJSON != "" {
 		// Caller-supplied base: a pure function of the request. The shared
 		// provisioned config is neither read nor overwritten. Without stored
 		// metadata only the endpoint family can be checked.
-		meta := provisionedConfigMeta{v6: configEndpointIsIPv6(req.BaseConfigJSON)}
-		mergedJSON, mergeSkipped, err = mergeDiscoveredAWGConfigFor(req.BaseConfigJSON, meta, awg)
+		var awg discoveredAWGEndpoint
+		matched := true
+		if req.BaseSlot != nil {
+			awg, matched, err = matchDiscoveredAWGEndpoint(bundle.Endpoints.AWG, *req.BaseSlot)
+		} else {
+			awg, err = selectAWGEndpoint(bundle.Endpoints.AWG)
+		}
+		if err != nil {
+			return applyDiscoveredResult{}, err
+		}
+		mergedJSON, mergeSkipped := req.BaseConfigJSON, !matched
+		if matched {
+			meta := provisionedConfigMeta{v6: configEndpointIsIPv6(req.BaseConfigJSON)}
+			mergedJSON, mergeSkipped, err = mergeDiscoveredAWGConfigFor(req.BaseConfigJSON, meta, awg)
+		} else if _, err = parseConfig(req.BaseConfigJSON); err != nil {
+			err = fmt.Errorf("base config: %w", err)
+		}
 		if err == nil {
 			err = recordDiscoveredSeq(pubkey, bundle.Seq)
 		}
 		if err != nil {
 			return applyDiscoveredResult{}, err
 		}
+		result.ConfigJSON, result.AWGMergeSkipped = mergedJSON, mergeSkipped
 	} else {
 		// Read, merge and write back in one critical section so a concurrent
 		// ApplyPublicPlatformConfig / ApplyDiscoveredEndpoints cannot be lost.
 		pendingProvision.Lock()
-		if pendingProvision.configJSON == "" {
-			pendingProvision.Unlock()
-			return applyDiscoveredResult{}, errors.New("provisioned config is missing")
-		}
-		mergedJSON, mergeSkipped, err = mergeDiscoveredAWGConfigFor(pendingProvision.configJSON, pendingProvision.configMeta, awg)
+		merged, err := mergeDiscoveredIntoProvisionedSlots(bundle.Endpoints.AWG)
 		if err == nil {
 			err = recordDiscoveredSeq(pubkey, bundle.Seq)
 		}
 		if err == nil {
-			pendingProvision.configJSON = mergedJSON
+			merged.store()
 		}
 		pendingProvision.Unlock()
 		if err != nil {
 			return applyDiscoveredResult{}, err
 		}
+		result.ConfigJSON = merged.configJSON()
+		result.AWGMergeSkipped = merged.skipped
+		result.AWGMergedSlots = merged.slots
 	}
-	result := applyDiscoveredResult{
-		OK:         true,
-		Seq:        bundle.Seq,
-		ConfigJSON: mergedJSON,
-
-		AWGMergeSkipped: mergeSkipped,
+	if req.RealitySlot != nil {
+		if reality := matchDiscoveredRealityEndpoint(bundle.Endpoints.Reality, *req.RealitySlot); reality != nil {
+			result.Reality = reality
+			result.EgressIP = reality.EgressIP
+		}
 	}
-	if reality != nil {
-		result.Reality = reality
-		result.EgressIP = reality.EgressIP
+	if req.Reality2Slot != nil {
+		result.Reality2 = matchDiscoveredRealityEndpoint(bundle.Endpoints.Reality, *req.Reality2Slot)
 	}
 	return result, nil
+}
+
+// provisionedSlotMerge is the outcome of merging a feed into the stored AWG
+// slots; it is computed and stored under pendingProvision's lock.
+type provisionedSlotMerge struct {
+	awgRU, awg       string
+	awgRUSet, awgSet bool
+	skipped          bool
+	slots            []string
+}
+
+// mergeDiscoveredIntoProvisionedSlots matches feed entries to the stored
+// AWG_RU (primary) and AWG (secondary) slots by their worker and merges each
+// match into its own slot. A slot without a matching entry is left alone:
+// the top-priority entry of another worker is never forced into it.
+// Caller holds pendingProvision's lock.
+func mergeDiscoveredIntoProvisionedSlots(entries []discoveredAWGEndpoint) (provisionedSlotMerge, error) {
+	out := provisionedSlotMerge{awgRU: pendingProvision.awgRUConfigJSON, awg: pendingProvision.configJSON}
+	if out.awg == "" && out.awgRU == "" {
+		return provisionedSlotMerge{}, errors.New("provisioned config is missing")
+	}
+	type slot struct {
+		name   string
+		config string
+		meta   provisionedConfigMeta
+		dst    *string
+		set    *bool
+	}
+	for _, s := range []slot{
+		{"awg_ru", pendingProvision.awgRUConfigJSON, pendingProvision.awgRUConfigMeta, &out.awgRU, &out.awgRUSet},
+		{"awg", pendingProvision.configJSON, pendingProvision.configMeta, &out.awg, &out.awgSet},
+	} {
+		if s.config == "" {
+			continue
+		}
+		awg, matched, err := matchDiscoveredAWGEndpoint(entries, s.meta.slot)
+		if err != nil {
+			return provisionedSlotMerge{}, fmt.Errorf("%s: %w", s.name, err)
+		}
+		if !matched {
+			continue
+		}
+		merged, skipped, err := mergeDiscoveredAWGConfigFor(s.config, s.meta, awg)
+		if err != nil {
+			return provisionedSlotMerge{}, fmt.Errorf("%s: %w", s.name, err)
+		}
+		if skipped {
+			out.skipped = true
+			continue
+		}
+		*s.dst, *s.set = merged, true
+		out.slots = append(out.slots, s.name)
+	}
+	return out, nil
+}
+
+// store writes merged slots back. Caller holds pendingProvision's lock.
+func (m provisionedSlotMerge) store() {
+	if m.awgRUSet {
+		pendingProvision.awgRUConfigJSON = m.awgRU
+	}
+	if m.awgSet {
+		pendingProvision.configJSON = m.awg
+	}
+}
+
+// configJSON is the config reported to the caller (diagnostics): a merged
+// slot (primary first), otherwise the stored secondary, then primary, as-is.
+func (m provisionedSlotMerge) configJSON() string {
+	switch {
+	case m.awgRUSet:
+		return m.awgRU
+	case m.awgSet, m.awg != "":
+		return m.awg
+	default:
+		return m.awgRU
+	}
+}
+
+// matchDiscoveredAWGEndpoint returns the top-priority entry of the slot's
+// worker. A slot with no identity matches nothing. The matched entry must be
+// complete; unrelated entries are not validated here.
+func matchDiscoveredAWGEndpoint(entries []discoveredAWGEndpoint, slot discoverySlotIdentity) (discoveredAWGEndpoint, bool, error) {
+	var candidates []discoveredAWGEndpoint
+	for _, entry := range entries {
+		if slot.matches(entry.WorkerID, entry.EgressIP) {
+			candidates = append(candidates, entry)
+		}
+	}
+	if len(candidates) == 0 {
+		return discoveredAWGEndpoint{}, false, nil
+	}
+	selected, err := selectAWGEndpoint(candidates)
+	if err != nil {
+		return discoveredAWGEndpoint{}, false, err
+	}
+	return selected, true, nil
+}
+
+// matchDiscoveredRealityEndpoint returns the top-priority REALITY entry of the
+// slot's worker with a valid egress IP, or nil. An empty list (reduced feed)
+// never matches, so the expected egress stays untouched.
+func matchDiscoveredRealityEndpoint(entries []discoveredRealityEndpoint, slot discoverySlotIdentity) *discoveredRealityEndpoint {
+	var candidates []discoveredRealityEndpoint
+	for _, entry := range entries {
+		if _, ok := canonicalIP(entry.EgressIP); !ok {
+			continue
+		}
+		if slot.matches(entry.WorkerID, entry.EgressIP) {
+			candidates = append(candidates, entry)
+		}
+	}
+	return selectRealityEndpoint(candidates)
 }
 
 // SetRendezvousPublicKey pins the minisign public key that authenticates

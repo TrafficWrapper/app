@@ -198,7 +198,8 @@ object RouteVariants {
         if (port <= 0) return null
         val network = profile.optString("network").trim().lowercase().ifBlank { "tcp" }
         val params = JSONObject(primary.params.toString())
-        listOf("xhttp", "flow", "flows", "reality_profiles", "address_v6", "profile", "vision")
+        // Flat xhttp_* keys of the primary route must not leak into the alternative either.
+        (listOf("xhttp", "flow", "flows", "reality_profiles", "address_v6", "profile", "vision") + FLAT_XHTTP_KEYS)
             .forEach { params.remove(it) }
         params.put("network", network)
         params.put("flow", "")
@@ -216,12 +217,13 @@ object RouteVariants {
         }
         if (network == "xhttp") {
             val xhttp = profile.optJSONObject("xhttp") ?: JSONObject()
-            params.put(
-                "xhttp",
-                JSONObject()
-                    .put("path", xhttp.optString("path").trim())
-                    .put("mode", xhttp.optString("mode").trim()),
-            )
+            val nested = JSONObject()
+                .put("path", xhttp.optString("path").trim())
+                .put("mode", xhttp.optString("mode").trim())
+            // X-L11: the worker's XHTTP inbound checks Host; the orchestrator sends it only when it
+            // differs from server_name, so it has to reach the outbound.
+            xhttp.optString("host").trim().takeIf { it.isNotEmpty() }?.let { nested.put("host", it) }
+            params.put("xhttp", nested)
         }
         val address = profile.optString("address").trim().ifBlank { primary.address }
         val config = PublicPlatformConfigParser.realityUiConfig(address, port, params, credentials)
@@ -235,10 +237,16 @@ object RouteVariants {
 
     private fun RealityUiConfig.normalizedAlternative(): RealityUiConfig =
         if (network.equals("xhttp", ignoreCase = true)) {
-            copy(xhttpMode = xhttpMode.ifBlank { XHTTP_DEFAULT_MODE }, xhttpHost = "")
+            // A non-empty xhttp host is kept (X-L11); an empty one stays empty.
+            copy(xhttpMode = xhttpMode.ifBlank { XHTTP_DEFAULT_MODE })
         } else {
             this
         }
+
+    private val FLAT_XHTTP_KEYS = listOf(
+        "xhttp_host", "xhttpHost", "xhttp_path", "xhttpPath",
+        "xhttp_mode", "xhttpMode", "xhttp_extra", "xhttpExtra",
+    )
 }
 
 /**
