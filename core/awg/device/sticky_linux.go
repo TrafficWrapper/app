@@ -146,7 +146,7 @@ func (device *Device) routineRouteListener(_ conn.Bind, netlinkSock int, netlink
 						}
 						if nativeEP.DstIP().Is6() || nativeEP.SrcIfidx() == 0 {
 							peer.endpoint.Unlock()
-							break
+							continue
 						}
 						nlmsg := struct {
 							hdr     unix.NlMsghdr
