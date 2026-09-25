@@ -110,7 +110,7 @@ func TestVpnBridgeSOCKS5ConnectAuthenticates(t *testing.T) {
 		if _, err := io.ReadFull(conn, methods); err != nil {
 			return
 		}
-		if err := socksServerAuthenticate(conn, methods); err != nil {
+		if err := testSOCKSServerRouterProof(conn, methods, testInternalPassword(t)); err != nil {
 			return
 		}
 		authed.Store(true)

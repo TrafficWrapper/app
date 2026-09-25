@@ -703,6 +703,19 @@ func vpnBridgeCopyUDP(dst, src net.Conn, tracker *connIdleTracker, counter *atom
 	}
 }
 
+var vpnBridgeUntrustedRouterLogAt atomic.Int64
+
+// vpnBridgeReportUntrustedRouter logs, rate limited, that the router address
+// is held by a listener that failed the router proof.
+func vpnBridgeReportUntrustedRouter(proxyAddr string) {
+	now := time.Now().UnixNano()
+	last := vpnBridgeUntrustedRouterLogAt.Load()
+	if now-last < int64(10*time.Second) || !vpnBridgeUntrustedRouterLogAt.CompareAndSwap(last, now) {
+		return
+	}
+	log.Printf("transport: vpn bridge: router_listener_untrusted addr=%s", proxyAddr)
+}
+
 func vpnBridgeSOCKS5Connect(ctx context.Context, proxyAddr, target string, track func(net.Conn) func()) (net.Conn, func(), error) {
 	host, port, err := vpnBridgeSplitHostPort(target)
 	if err != nil {
@@ -731,7 +744,13 @@ func vpnBridgeSOCKS5Connect(ctx context.Context, proxyAddr, target string, track
 		deadline = ctxDeadline
 	}
 	_ = conn.SetDeadline(deadline)
-	if err := socksClientAuthenticate(conn); err != nil {
+	// proxyAddr is the front-end router on a fixed loopback port that another
+	// app may hold: the listener proves itself first and never gets the
+	// internal credentials.
+	if err := socksClientAuthenticateRouter(conn); err != nil {
+		if errors.Is(err, errUntrustedSOCKSRouter) {
+			vpnBridgeReportUntrustedRouter(proxyAddr)
+		}
 		return fail(err)
 	}
 	if _, err := conn.Write(req); err != nil {
