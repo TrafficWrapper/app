@@ -456,6 +456,7 @@ func TestApplyDiscoveredEndpointsSkipsMergeForProfileOrIPv6Config(t *testing.T) 
 		pinTestSigner(t, signer)
 		stored := setPendingProvision(t, testBaseConfig(t), "")
 		pendingProvision.Lock()
+		meta.slot = testSlotMeta().slot // same worker as the feed entry
 		pendingProvision.configMeta = meta
 		pendingProvision.Unlock()
 		bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")

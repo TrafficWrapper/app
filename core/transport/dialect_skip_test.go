@@ -155,7 +155,11 @@ func TestApplyDiscoveredEndpointsWithoutUsableAWGKeepsConfig(t *testing.T) {
 	pinTestSigner(t, signer)
 	base := testBaseConfig(t)
 	bundle := testBundleWithAWGPresets(t, nil, awgdialect.Compat())
-	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(signer.request(t, bundle, base, 9, "2026-06-13T12:00:00Z")))
+	message := mustJSON(t, bundle)
+	// reality_slot names the REALITY slot's worker so its entry is returned (X-M6).
+	req := requestJSON(t, signer.publicKey, message, signer.sign(message), base, 9, "2026-06-13T12:00:00Z",
+		map[string]any{"reality_slot": map[string]any{"worker_id": testWorkerID}})
+	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))
 	if !result.OK {
 		t.Fatalf("feed rejected: %s", result.Error)
 	}

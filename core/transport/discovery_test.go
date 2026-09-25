@@ -24,7 +24,9 @@ func TestApplyDiscoveredEndpointsMergesAWGWithStoredSecrets(t *testing.T) {
 	pinTestSigner(t, signer)
 	base := testBaseConfig(t)
 	bundle := testBundle(t, 10, "2026-06-13T10:00:00Z", "2026-06-13T22:00:00Z")
-	req := signer.request(t, bundle, base, 9, "2026-06-13T12:00:00Z")
+	message := mustJSON(t, bundle)
+	req := requestJSON(t, signer.publicKey, message, signer.sign(message), base, 9, "2026-06-13T12:00:00Z",
+		map[string]any{"reality_slot": map[string]any{"worker_id": testWorkerID}})
 
 	result := decodeApplyResult(t, ApplyDiscoveredEndpoints(req))
 	if !result.OK {
@@ -439,16 +441,29 @@ func (s testSigner) request(t *testing.T, bundle map[string]any, baseConfig stri
 	return requestJSON(t, s.publicKey, message, s.sign(message), baseConfig, maxSeen, now)
 }
 
-func requestJSON(t *testing.T, publicKey, endpointsJSON, signature, baseConfig string, maxSeen int64, now string) string {
+// requestWith is request plus extra top-level request fields (slot identities).
+func (s testSigner) requestWith(t *testing.T, bundle map[string]any, baseConfig string, now string, extra map[string]any) string {
 	t.Helper()
-	raw, err := json.Marshal(map[string]any{
+	message := mustJSON(t, bundle)
+	return requestJSON(t, s.publicKey, message, s.sign(message), baseConfig, 0, now, extra)
+}
+
+func requestJSON(t *testing.T, publicKey, endpointsJSON, signature, baseConfig string, maxSeen int64, now string, extra ...map[string]any) string {
+	t.Helper()
+	fields := map[string]any{
 		"endpoints_json":         endpointsJSON,
 		"endpoints_json_minisig": signature,
 		"public_key":             publicKey,
 		"base_config_json":       baseConfig,
 		"max_seen_seq":           maxSeen,
 		"now":                    now,
-	})
+	}
+	for _, more := range extra {
+		for key, value := range more {
+			fields[key] = value
+		}
+	}
+	raw, err := json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,6 +491,7 @@ func testBundle(t *testing.T, seq int64, issuedAt string, expiresAt string) map[
 			"awg": []any{
 				map[string]any{
 					"priority":          0,
+					"worker_id":         testWorkerID,
 					"endpoint":          "worker.example:51821",
 					"egress_ip":         "198.51.100.50",
 					"server_public_key": testDiscoveredServerKey,
@@ -485,6 +501,7 @@ func testBundle(t *testing.T, seq int64, issuedAt string, expiresAt string) map[
 			"reality": []any{
 				map[string]any{
 					"priority":    0,
+					"worker_id":   testWorkerID,
 					"transport":   "xray-vless-reality-vision",
 					"address":     "tw.example.test",
 					"egress_ip":   "203.0.113.77",
@@ -580,7 +597,7 @@ func setPendingProvision(t *testing.T, configJSON, awgRUConfigJSON string) strin
 	oldConfig, oldAWGRU := pendingProvision.configJSON, pendingProvision.awgRUConfigJSON
 	oldMeta, oldAWGRUMeta := pendingProvision.configMeta, pendingProvision.awgRUConfigMeta
 	pendingProvision.configJSON, pendingProvision.awgRUConfigJSON = configJSON, awgRUConfigJSON
-	pendingProvision.configMeta, pendingProvision.awgRUConfigMeta = provisionedConfigMeta{}, provisionedConfigMeta{}
+	pendingProvision.configMeta, pendingProvision.awgRUConfigMeta = testSlotMeta(), testSlotMeta()
 	pendingProvision.Unlock()
 	t.Cleanup(func() {
 		pendingProvision.Lock()
@@ -606,7 +623,7 @@ func testPublicApplyRequest() publicApplyAPIRequest {
 		InternalIP:      "10.13.13.42/32",
 		PSK2:            testKey(3),
 		ServerAWGPublic: testKey(2),
-		AWG:             &publicRouteSpec{Endpoint: "203.0.113.10:51821", AWGPreset: testBasePresetRaw()},
+		AWG:             &publicRouteSpec{Endpoint: "203.0.113.10:51821", AWGPreset: testBasePresetRaw(), WorkerID: testWorkerID},
 	}
 }
 
@@ -725,4 +742,12 @@ func TestApplyDiscoveredEndpointsAcceptsReducedFeed(t *testing.T) {
 	if result.Reality != nil || result.EgressIP != "" {
 		t.Fatalf("reduced feed must not produce a reality endpoint: %+v", result)
 	}
+}
+
+// testWorkerID is the worker behind the fixture feed entries and the stored
+// test slots, so the slot-aware merge (X-M6) targets them.
+const testWorkerID = "w-1"
+
+func testSlotMeta() provisionedConfigMeta {
+	return provisionedConfigMeta{slot: discoverySlotIdentity{WorkerID: testWorkerID}}
 }

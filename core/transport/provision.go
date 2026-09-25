@@ -29,10 +29,11 @@ var pendingProvision struct {
 }
 
 // provisionedConfigMeta records the worker AWG profile ("" / "awg" for the
-// base inbound) and whether the endpoint is IPv6.
+// base inbound), whether the endpoint is IPv6 and which worker owns the slot.
 type provisionedConfigMeta struct {
 	profile string
 	v6      bool
+	slot    discoverySlotIdentity
 }
 
 // acceptsDiscoveryMerge reports whether a rendezvous base-AWG endpoint may

@@ -220,6 +220,9 @@ type publicRouteSpec struct {
 	IPFamily   string `json:"ip_family,omitempty"`
 	// DNS overrides dns_servers for this route when it has non-blank values.
 	DNS []string `json:"dns,omitempty"`
+	// WorkerID is the client-bundle worker that owns this slot. Optional; it
+	// lets rendezvous discovery match feed entries to the right slot (X-M6).
+	WorkerID string `json:"worker_id,omitempty"`
 }
 
 // PublicDeviceEnroll performs public-platform device enrollment over the
@@ -677,7 +680,11 @@ func publicAWGConfigJSON(route *publicRouteSpec, req publicApplyAPIRequest, sock
 	if err != nil {
 		return "", provisionedConfigMeta{}, err
 	}
-	return raw, provisionedConfigMeta{profile: profile, v6: v6}, nil
+	return raw, provisionedConfigMeta{
+		profile: profile,
+		v6:      v6,
+		slot:    discoverySlotIdentity{WorkerID: strings.TrimSpace(route.WorkerID), EgressIP: route.egressIP()},
+	}, nil
 }
 
 // errAWGProfileCredentialsMissing: a route names a non-base AWG profile the
