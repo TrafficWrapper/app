@@ -8,10 +8,10 @@ require (
 	aead.dev/minisign v0.3.0
 	github.com/amnezia-vpn/amneziawg-go v0.2.13-0.20250623202557-6a7c878409f3 // pinned commit 6a7c878409f32dc39a82bc597766c81304ab9840
 	github.com/flynn/noise v1.1.0
-	golang.org/x/crypto v0.57.0
+	golang.org/x/crypto v0.58.0
 	golang.org/x/mobile v0.0.0-20250520180527-a1d90793fc63
-	golang.org/x/net v0.59.0
-	golang.org/x/sys v0.48.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sys v0.49.0
 	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
 )
 
